@@ -2,8 +2,8 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 export default defineConfig({
-  // Root path: served from the puroductive.jhydro.in custom domain, not a
-  // github.io/<repo>/ subpath.
-  base: "/",
+  // Back to the github.io/<repo>/ subpath until the puroductive.jhydro.in
+  // DNS record is in place — see the custom-domain branch/commit for that.
+  base: "/puroductive/",
   plugins: [react()],
 });
