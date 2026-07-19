@@ -5,7 +5,7 @@ import {
   Play, PhoneMissed, RotateCcw, UserCheck, CalendarClock, History, ScrollText,
   Ban, Flame, CalendarDays, BarChart3, Bell, Download, LogIn, LogOut, Plane,
   TrendingUp, TrendingDown, Sun, Building2, Pencil, Tag, MapPin, Video,
-  CalendarPlus, Briefcase,
+  CalendarPlus, Briefcase, Menu,
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient.js";
 import * as db from "./lib/db.js";
@@ -425,6 +425,20 @@ export function downloadProjectDoc(compiled, filename) {
 /* Companies, projects, members, tasks, calendar exceptions and work sessions
  * are now loaded live from Supabase (see lib/db.js) — no seed data here. */
 
+/* Reactive viewport check — each component that needs it calls this directly
+ * rather than threading an isMobile prop down through the tree. */
+function useIsMobile(breakpoint = 820) {
+  const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.innerWidth <= breakpoint);
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${breakpoint}px)`);
+    const onChange = () => setIsMobile(mq.matches);
+    onChange();
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [breakpoint]);
+  return isMobile;
+}
+
 /* ------------------------------ GLOBAL STYLES ----------------------------- */
 const GlobalStyle = () => (
   <style>{`
@@ -603,6 +617,7 @@ const IconBtn = ({ children, onClick, label, danger }) => (
 /* Modal: dismissible by default; the Strict Supervisor uses locked={true} —
  * no close button, no ESC, no backdrop click. */
 const Modal = ({ title, subtitle, onClose, children, wide, locked, tone }) => {
+  const isMobile = useIsMobile();
   useEffect(() => {
     if (locked) return;
     const h = (e) => e.key === "Escape" && onClose?.();
@@ -611,15 +626,15 @@ const Modal = ({ title, subtitle, onClose, children, wide, locked, tone }) => {
   }, [onClose, locked]);
   return (
     <div onClick={locked ? undefined : onClose} style={{
-      position: "fixed", inset: 0, zIndex: 60, display: "flex", alignItems: "center",
-      justifyContent: "center", padding: 20,
+      position: "fixed", inset: 0, zIndex: 60, display: "flex", alignItems: isMobile ? "flex-end" : "center",
+      justifyContent: "center", padding: isMobile ? 0 : 20,
       background: locked ? "rgba(22,24,29,0.55)" : "rgba(22,24,29,0.32)", backdropFilter: "blur(6px)",
     }}>
       <div className="pd-pop-in pd-scroll" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" style={{
-        width: "100%", maxWidth: wide ? 660 : 520, maxHeight: "90vh", overflowY: "auto",
-        borderRadius: 22, background: "#FFFFFF",
+        width: "100%", maxWidth: isMobile ? "100%" : wide ? 660 : 520, maxHeight: isMobile ? "92vh" : "90vh", overflowY: "auto",
+        borderRadius: isMobile ? "22px 22px 0 0" : 22, background: "#FFFFFF",
         border: tone === "danger" ? "1px solid #F3CFC6" : `1px solid ${T.line}`,
-        boxShadow: T.shadowLg, padding: 28,
+        boxShadow: T.shadowLg, padding: isMobile ? 18 : 28,
       }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20 }}>
           <div>
@@ -731,7 +746,7 @@ const ReassignModal = ({ task, members, companies, onConfirm, onClose }) => {
             })}
           </div>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14 }}>
           <div><Label>Reason</Label>
             <input style={inputStyle} value={reason} onChange={(e) => setReason(e.target.value)}
               placeholder={`e.g. "Vendor missed call ×${task.retryCount || 1}"`} /></div>
@@ -825,6 +840,8 @@ export default function PuroductiveApp({ session }) {
   const [alertsOn, setAlertsOn] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const isMobile = useIsMobile();
 
   const toast = (msg, kind = "ok") => {
     const id = uid();
@@ -1143,86 +1160,114 @@ export default function PuroductiveApp({ session }) {
     );
   }
 
+  const goTo = (key) => { setView(key); setOpenProjectId(null); if (isMobile) setSidebarOpen(false); };
+
   return (
-    <div style={{ minHeight: "100vh", background: T.bg, color: T.ink, fontFamily: T.fontBody, display: "flex" }}>
+    <div style={{ minHeight: "100vh", background: T.bg, color: T.ink, fontFamily: T.fontBody,
+      display: "flex", flexDirection: isMobile ? "column" : "row" }}>
       <GlobalStyle />
       <ToastHost toasts={toasts} />
 
-      {/* ------------------------------ SIDEBAR ---------------------------- */}
-      <aside style={{
-        position: "sticky", top: 0, height: "100vh", width: 232, flexShrink: 0, zIndex: 10,
-        display: "flex", flexDirection: "column", padding: "26px 16px",
-        borderRight: `1px solid ${T.line}`, background: "#FFFFFF",
-      }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 11, padding: "0 8px", marginBottom: 30 }}>
-          <Mesh mesh={THEME_PRESETS[0].mesh} style={{
-            width: 36, height: 36, borderRadius: 11, display: "grid", placeItems: "center",
-            boxShadow: "0 4px 14px -4px rgba(124,181,24,0.55)", border: "1px solid rgba(36,51,5,0.1)",
-          }}>
-            <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 17, color: "#243305", display: "grid", placeItems: "center", height: "100%" }}>P</span>
-          </Mesh>
-          <div>
-            <div style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 16, letterSpacing: "-0.02em" }}>Puroductive</div>
-            <div style={{ fontSize: 10, color: T.ink3, letterSpacing: "0.14em", textTransform: "uppercase", marginTop: 1 }}>Workspace OS</div>
+      {/* --------------------------- MOBILE TOP BAR ------------------------- */}
+      {isMobile && (
+        <header style={{
+          position: "sticky", top: 0, zIndex: 25, display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "12px 16px", background: "#FFFFFF", borderBottom: `1px solid ${T.line}`,
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+            <Mesh mesh={THEME_PRESETS[0].mesh} style={{ width: 28, height: 28, borderRadius: 8, display: "grid", placeItems: "center", border: "1px solid rgba(36,51,5,0.1)" }}>
+              <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 13, color: "#243305", display: "grid", placeItems: "center", height: "100%" }}>P</span>
+            </Mesh>
+            <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 14.5, letterSpacing: "-0.02em" }}>Puroductive</span>
           </div>
-        </div>
+          <IconBtn label="Open menu" onClick={() => setSidebarOpen(true)}><Menu size={17} /></IconBtn>
+        </header>
+      )}
 
-        <nav style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-          {NAV.map(({ key, label, icon: Icon }) => {
-            const active = view === key;
-            return (
-              <button key={key} onClick={() => { setView(key); setOpenProjectId(null); }} className="pd-press" style={{
-                position: "relative", overflow: "hidden",
-                display: "flex", alignItems: "center", gap: 11, minHeight: 42, padding: "0 12px",
-                borderRadius: 11, cursor: "pointer", textAlign: "left",
-                fontSize: 13.5, fontWeight: active ? 600 : 450,
-                color: active ? "#243305" : T.ink2,
-                border: active ? "1px solid rgba(36,51,5,0.1)" : "1px solid transparent",
-                boxShadow: active ? "0 2px 8px -2px rgba(124,181,24,0.4)" : "none",
-                ...(active ? meshBackground(["#EFFCC9", "#D6F47A", "#BCE95C"]) : { background: "transparent" }),
+      {/* ------------------------------ SIDEBAR ---------------------------- */}
+      {isMobile && sidebarOpen && (
+        <div onClick={() => setSidebarOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 29, background: "rgba(22,24,29,0.4)" }} />
+      )}
+      {(!isMobile || sidebarOpen) && (
+        <aside className="pd-scroll" style={{
+          position: isMobile ? "fixed" : "sticky", top: 0, left: 0, height: "100vh", width: 232, flexShrink: 0,
+          zIndex: 30, overflowY: "auto",
+          display: "flex", flexDirection: "column", padding: "26px 16px",
+          borderRight: `1px solid ${T.line}`, background: "#FFFFFF",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 11, padding: "0 8px", marginBottom: 30 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 11 }}>
+              <Mesh mesh={THEME_PRESETS[0].mesh} style={{
+                width: 36, height: 36, borderRadius: 11, display: "grid", placeItems: "center",
+                boxShadow: "0 4px 14px -4px rgba(124,181,24,0.55)", border: "1px solid rgba(36,51,5,0.1)",
               }}>
-                {active && <GrainOverlay opacity={0.2} radius={11} />}
-                <Icon size={16.5} style={{ position: "relative", color: active ? "#3F6212" : T.ink3 }} />
-                <span style={{ position: "relative" }}>{label}</span>
-              </button>
-            );
-          })}
-        </nav>
+                <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 17, color: "#243305", display: "grid", placeItems: "center", height: "100%" }}>P</span>
+              </Mesh>
+              <div>
+                <div style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 16, letterSpacing: "-0.02em" }}>Puroductive</div>
+                <div style={{ fontSize: 10, color: T.ink3, letterSpacing: "0.14em", textTransform: "uppercase", marginTop: 1 }}>Workspace OS</div>
+              </div>
+            </div>
+            {isMobile && <IconBtn label="Close menu" onClick={() => setSidebarOpen(false)}><X size={15} /></IconBtn>}
+          </div>
 
-        <div style={{ marginTop: 28 }}>
-          <Label>Scope</Label>
-          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-            {[{ id: "all", name: "All companies", theme: THEME_PRESETS[0] }, ...companies].map((c) => {
-              const on = activeCompanyId === c.id;
+          <nav style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {NAV.map(({ key, label, icon: Icon }) => {
+              const active = view === key;
               return (
-                <button key={c.id} onClick={() => setActiveCompanyId(c.id)} className="pd-press" style={{
-                  display: "flex", alignItems: "center", gap: 9, minHeight: 36, padding: "0 11px",
-                  borderRadius: 10, cursor: "pointer", textAlign: "left", fontSize: 12.5,
-                  fontWeight: on ? 600 : 450, color: on ? T.ink : T.ink3,
-                  background: on ? T.bg : "transparent",
-                  border: `1px solid ${on ? T.line : "transparent"}`,
+                <button key={key} onClick={() => goTo(key)} className="pd-press" style={{
+                  position: "relative", overflow: "hidden",
+                  display: "flex", alignItems: "center", gap: 11, minHeight: 42, padding: "0 12px",
+                  borderRadius: 11, cursor: "pointer", textAlign: "left",
+                  fontSize: 13.5, fontWeight: active ? 600 : 450,
+                  color: active ? "#243305" : T.ink2,
+                  border: active ? "1px solid rgba(36,51,5,0.1)" : "1px solid transparent",
+                  boxShadow: active ? "0 2px 8px -2px rgba(124,181,24,0.4)" : "none",
+                  ...(active ? meshBackground(["#EFFCC9", "#D6F47A", "#BCE95C"]) : { background: "transparent" }),
                 }}>
-                  <CircleDot size={11} style={{ color: c.theme.primary, flexShrink: 0 }} />
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
+                  {active && <GrainOverlay opacity={0.2} radius={11} />}
+                  <Icon size={16.5} style={{ position: "relative", color: active ? "#3F6212" : T.ink3 }} />
+                  <span style={{ position: "relative" }}>{label}</span>
                 </button>
               );
             })}
+          </nav>
+
+          <div style={{ marginTop: 28 }}>
+            <Label>Scope</Label>
+            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+              {[{ id: "all", name: "All companies", theme: THEME_PRESETS[0] }, ...companies].map((c) => {
+                const on = activeCompanyId === c.id;
+                return (
+                  <button key={c.id} onClick={() => { setActiveCompanyId(c.id); if (isMobile) setSidebarOpen(false); }} className="pd-press" style={{
+                    display: "flex", alignItems: "center", gap: 9, minHeight: 36, padding: "0 11px",
+                    borderRadius: 10, cursor: "pointer", textAlign: "left", fontSize: 12.5,
+                    fontWeight: on ? 600 : 450, color: on ? T.ink : T.ink3,
+                    background: on ? T.bg : "transparent",
+                    border: `1px solid ${on ? T.line : "transparent"}`,
+                  }}>
+                    <CircleDot size={11} style={{ color: c.theme.primary, flexShrink: 0 }} />
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
-        </div>
 
-        <OpenHandoffsPanel handoffs={engine.handoffs} tasks={engine.tasks} members={members} />
+          <OpenHandoffsPanel handoffs={engine.handoffs} tasks={engine.tasks} members={members} />
 
-        <div style={{ marginTop: 10, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
-          padding: "10px 12px", borderRadius: 12, border: `1px solid ${T.lineSoft}`, background: T.cardSoft }}>
-          <span style={{ fontSize: 11, color: T.ink3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {session?.user?.email}
-          </span>
-          <IconBtn label="Sign out" onClick={() => supabase.auth.signOut()}><LogOut size={13.5} /></IconBtn>
-        </div>
-      </aside>
+          <div style={{ marginTop: 10, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
+            padding: "10px 12px", borderRadius: 12, border: `1px solid ${T.lineSoft}`, background: T.cardSoft }}>
+            <span style={{ fontSize: 11, color: T.ink3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {session?.user?.email}
+            </span>
+            <IconBtn label="Sign out" onClick={() => supabase.auth.signOut()}><LogOut size={13.5} /></IconBtn>
+          </div>
+        </aside>
+      )}
 
       {/* ------------------------------- MAIN ------------------------------ */}
-      <main className="pd-scroll" style={{ flex: 1, padding: "34px 40px 60px", maxWidth: 1220, margin: "0 auto", width: "100%" }}>
+      <main className="pd-scroll" style={{ flex: 1, padding: isMobile ? "20px 16px 48px" : "34px 40px 60px", maxWidth: 1220, margin: "0 auto", width: "100%" }}>
         {view === "dashboard" && (
           <Dashboard {...{ companies, projects, members, engine, theme }}
             openProject={(id) => { setOpenProjectId(id); setView("projects"); }} />
@@ -1470,6 +1515,7 @@ const ProjectsList = ({ projects, companies, engine, onOpen, onCreate }) => (
 
 /* ============================ PROJECT DETAIL ============================== */
 const ProjectDetail = ({ project, companies, members, engine, onBack, tryTransition, attemptDelete, onReassign, onReschedule, onAddTask, onExport }) => {
+  const isMobile = useIsMobile();
   const c = companies.find((x) => x.id === project.companyId);
   const theme = c?.theme ?? THEME_PRESETS[0];
   const tasks = engine.tasks.filter((t) => t.projectId === project.id);
@@ -1493,7 +1539,7 @@ const ProjectDetail = ({ project, companies, members, engine, onBack, tryTransit
           <Btn onClick={onAddTask}><Plus size={15} /> Add task</Btn>
         </div>} />
 
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(260px, 300px) 1fr", gap: 20, alignItems: "start" }}>
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "minmax(260px, 300px) 1fr", gap: 20, alignItems: "start" }}>
         {/* LEFT — the sand stack + permanent record */}
         <div style={{ display: "grid", gap: 16 }}>
           <Card style={{ padding: 20 }}>
@@ -1618,7 +1664,7 @@ const TaskForm = ({ projectId, members, onSave, onClose }) => {
       <div style={{ display: "grid", gap: 18 }}>
         <div><Label>Title</Label>
           <input style={inputStyle} value={f.title} onChange={(e) => setF({ ...f, title: e.target.value })} placeholder="e.g. Call vendor for quotation" /></div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 90px", gap: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(90px, 1fr))", gap: 12 }}>
           <div><Label>Assignee</Label>
             <select style={inputStyle} value={f.assigneeId} onChange={(e) => setF({ ...f, assigneeId: e.target.value })}>
               <option value="">Unassigned</option>
@@ -1656,7 +1702,7 @@ const ProjectForm = ({ data, companies, defaultCompanyId, onSave, onClose }) => 
       <div style={{ display: "grid", gap: 18 }}>
         <div><Label>Project name</Label>
           <input style={inputStyle} value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14 }}>
           <div><Label>Company</Label>
             <select style={inputStyle} value={f.companyId} onChange={(e) => setF({ ...f, companyId: e.target.value })}>
               {companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
@@ -1668,7 +1714,7 @@ const ProjectForm = ({ data, companies, defaultCompanyId, onSave, onClose }) => 
               <option value="ongoing">Ongoing (has baseline)</option>
             </select></div>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14 }}>
           <div><Label>Deadline {locked && "· locked"}</Label>
             <input type="date" style={{ ...inputStyle, opacity: locked ? 0.5 : 1 }} disabled={locked}
               value={f.deadline} onChange={(e) => setF({ ...f, deadline: e.target.value })} /></div>
@@ -1764,7 +1810,7 @@ const CompanyForm = ({ data, onSave, onClose }) => {
       <div style={{ display: "grid", gap: 18 }}>
         <div><Label>Company name</Label>
           <input style={inputStyle} value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14 }}>
           <div><Label>Industry</Label>
             <input style={inputStyle} value={f.industry} onChange={(e) => setF({ ...f, industry: e.target.value })} /></div>
           <div><Label>Location</Label>
@@ -1911,7 +1957,7 @@ const MemberForm = ({ data, companies, groups, onSave, onClose }) => {
         <div><Label>Roles (comma-separated)</Label>
           <input style={inputStyle} value={rolesText} onChange={(e) => setRolesText(e.target.value)}
             placeholder="e.g. CNC Machining, Fabrication" /></div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14 }}>
           <div><Label>Phone</Label>
             <input style={inputStyle} value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} /></div>
           <div><Label>Email</Label>
@@ -2038,6 +2084,7 @@ const EVENT_TYPE_META = {
 
 const CalendarView = ({ exceptions, toggleException, sessions, activeSession, clockIn, clockOut, tasks, alertsOn, enableAlerts,
   events, projects, companies, members, onAddEvent, onEditEvent, onDeleteEvent, onOpenDay, onOpenProject }) => {
+  const isMobile = useIsMobile();
   const stats = computeMonthlyStats({ sessions, tasks, exceptions }, 0);
   const { start, end, label } = monthWindow(0);
   const today = ymdOf(new Date());
@@ -2102,7 +2149,7 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
       </div>
 
       {/* Month grid */}
-      <Card style={{ padding: 24, marginBottom: 20 }}>
+      <Card style={{ padding: isMobile ? 12 : 24, marginBottom: 20 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
           <h2 style={{ margin: 0, fontFamily: T.fontDisplay, fontSize: 17, fontWeight: 600, letterSpacing: "-0.02em" }}>{label}</h2>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -2111,10 +2158,10 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
             <Chip bg={EVENT_TYPE_META.meeting.bg} color={EVENT_TYPE_META.meeting.color}><Video size={10} /> Meeting/Visit</Chip>
           </div>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: isMobile ? 3 : 6 }}>
           {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => (
-            <div key={d} style={{ textAlign: "center", fontSize: 10.5, fontWeight: 600, letterSpacing: "0.08em",
-              textTransform: "uppercase", color: T.ink3, padding: "4px 0" }}>{d}</div>
+            <div key={d} style={{ textAlign: "center", fontSize: isMobile ? 9 : 10.5, fontWeight: 600, letterSpacing: "0.05em",
+              textTransform: "uppercase", color: T.ink3, padding: "4px 0" }}>{isMobile ? d.slice(0, 1) : d}</div>
           ))}
           {Array.from({ length: lead }).map((_, i) => <div key={"b" + i} />)}
           {days.map((d) => {
@@ -2130,8 +2177,8 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
               <button key={ymd} onClick={() => onOpenDay(ymd)} className="pd-press"
                 title={ex ? `${ex.type}${ex.label ? " · " + ex.label : ""}` : "Tap to view schedule"}
                 style={{
-                  position: "relative", overflow: "hidden", minHeight: 66, borderRadius: 12,
-                  cursor: "pointer", textAlign: "left", padding: "8px 9px",
+                  position: "relative", overflow: "hidden", minHeight: isMobile ? 44 : 66, borderRadius: isMobile ? 8 : 12,
+                  cursor: "pointer", textAlign: "left", padding: isMobile ? "5px 4px" : "8px 9px",
                   border: `1px solid ${isToday ? T.limeDeep : T.line}`,
                   boxShadow: isToday ? "0 0 0 3px rgba(124,181,24,0.18)" : "none",
                   opacity: sunday && !ex && !dayEvents.length && !dayTasks.length && !dayDeadlines.length ? 0.45 : 1,
@@ -2230,7 +2277,7 @@ const CalendarEventForm = ({ data, defaultDate, companies, projects, members, on
         <div><Label>Title</Label>
           <input style={inputStyle} value={f.title} onChange={(e) => setF({ ...f, title: e.target.value })}
             placeholder="e.g. Site visit — Shree Jagdamba floor" /></div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 12 }}>
           <div><Label>Type</Label>
             <select style={inputStyle} value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })}>
               <option value="meeting">Meeting</option>
@@ -2242,13 +2289,13 @@ const CalendarEventForm = ({ data, defaultDate, companies, projects, members, on
           <div><Label>Location</Label>
             <input style={inputStyle} value={f.location} onChange={(e) => setF({ ...f, location: e.target.value })} /></div>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14 }}>
           <div><Label>Start time</Label>
             <input type="time" style={inputStyle} value={f.startTime} onChange={(e) => setF({ ...f, startTime: e.target.value })} /></div>
           <div><Label>End time</Label>
             <input type="time" style={inputStyle} value={f.endTime} onChange={(e) => setF({ ...f, endTime: e.target.value })} /></div>
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14 }}>
           <div><Label>Company (optional)</Label>
             <select style={inputStyle} value={f.companyId} onChange={(e) => setF({ ...f, companyId: e.target.value, projectId: "" })}>
               <option value="">—</option>

@@ -14,24 +14,36 @@ React + Vite, backed by Supabase (Postgres + Auth).
 
 ## One-time Supabase setup
 
-1. In your Supabase project's SQL editor, run [`supabase/rls.sql`](supabase/rls.sql).
-   This enables Row Level Security on every table and adds a policy so only
-   **signed-in** users can read/write — this app has no per-user data
-   partitioning, it's a single private workspace behind a login screen, not a
-   multi-tenant product.
-2. Run [`supabase/schema_v2.sql`](supabase/schema_v2.sql) — adds team-member
+Run these SQL files **in order** in your Supabase project's SQL editor:
+
+1. [`supabase/rls.sql`](supabase/rls.sql) — enables Row Level Security on
+   every table.
+2. [`supabase/schema_v2.sql`](supabase/schema_v2.sql) — adds team-member
    groups and the calendar events table used by the Companies/Team/Calendar
    management screens.
-3. Optionally run [`supabase/seed.sql`](supabase/seed.sql) to pre-populate the
-   two example companies and four team members. Companies, team members and
-   member groups all have full add/edit/delete screens in the UI now, so this
-   is just a head start — skip it and add your own from the Companies and
-   Team pages instead.
-4. In Supabase → Authentication → Providers, make sure Email is enabled. By
+3. [`supabase/schema_v3.sql`](supabase/schema_v3.sql) — turns this into a
+   real multi-tenant app: every table gets an `owner_id` column and RLS is
+   rewritten so **each signed-in user only ever sees their own data**.
+   Anyone you share the deployed link with gets their own private, empty
+   workspace on signup — nothing is shared and nothing is erased. **Open the
+   file and replace `YOUR-LOGIN-EMAIL@example.com` with the email you
+   personally sign into Puroductive with before running it** — that's whose
+   account your existing companies/projects/tasks get assigned to.
+   ([`supabase/seed.sql`](supabase/seed.sql) predates per-user ownership and
+   will fail with a "null value in column owner_id" error if run after this
+   — it's obsolete now that Companies/Team have full add screens in the UI.)
+4. In Supabase → Authentication → URL Configuration, set **Site URL** to
+   your deployed URL (e.g. `https://mi1918.github.io/puroductive/`) and add
+   it to **Redirect URLs**. This is what was sending confirmation-email links
+   to `localhost` instead of the live site — Supabase redirects there by
+   default regardless of what the app requests unless this is set. If you
+   also develop locally, add `http://localhost:5173/puroductive/` (or
+   whatever port Vite prints) to Redirect URLs too.
+5. In Supabase → Authentication → Providers, make sure Email is enabled. By
    default Supabase requires email confirmation on sign-up; either confirm via
    the email you receive, or turn "Confirm email" off in Authentication →
    Settings for faster local testing.
-5. Grab your Project URL and anon/public key from Project Settings → API.
+6. Grab your Project URL and anon/public key from Project Settings → API.
 
 ## Local setup
 
@@ -77,7 +89,8 @@ src/
 supabase/
   rls.sql                — Row Level Security setup (run once)
   schema_v2.sql           — member groups + calendar events tables (run once)
-  seed.sql               — optional starter companies/team members
+  schema_v3.sql           — per-user ownership + RLS rewrite (run once)
+  seed.sql               — legacy starter data, predates per-user ownership
 baseline backup/
   ARCHITECTURE.md        — the original local-first core design this UI's
                            engines were ported from (context/history only)

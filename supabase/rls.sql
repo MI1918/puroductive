@@ -1,11 +1,12 @@
--- Row Level Security for Puroductive.
+-- Row Level Security for Puroductive — baseline step.
 --
--- This is a single-tenant tool (one person/team managing multiple companies),
--- not a multi-tenant SaaS — the schema has no per-row "owner" column. The
--- login screen exists to keep the workspace private, not to partition data
--- between different users. So the rule here is simple: any row is fully
--- readable/writable by any *signed-in* user, and completely inaccessible to
--- anonymous requests.
+-- This is the first of three setup scripts (see README.md): it just enables
+-- RLS on every table and blocks anonymous access, with every signed-in user
+-- sharing full access to every row. supabase/schema_v3.sql runs after this
+-- (and after schema_v2.sql) and replaces the policy this file creates with
+-- real per-user ownership, so each person who signs in only sees their own
+-- data. Run this one first regardless — schema_v3.sql depends on RLS already
+-- being enabled.
 --
 -- Run this once in the Supabase SQL editor (Project -> SQL Editor -> New query)
 -- after your tables already exist.
