@@ -17,9 +17,9 @@ begin
   for t in
     select unnest(array[
       'meta', 'companies', 'phase_templates', 'team_members', 'member_company_links',
-      'projects', 'project_phases', 'tasks', 'task_transitions', 'handoffs',
+      'member_groups', 'projects', 'project_phases', 'tasks', 'task_transitions', 'handoffs',
       'reflections', 'attachments', 'daily_notes', 'work_sessions',
-      'calendar_exceptions', 'sync_log'
+      'calendar_exceptions', 'calendar_events', 'sync_log'
     ])
   loop
     execute format('alter table public.%I enable row level security;', t);

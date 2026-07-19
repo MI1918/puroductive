@@ -19,17 +19,19 @@ React + Vite, backed by Supabase (Postgres + Auth).
    **signed-in** users can read/write — this app has no per-user data
    partitioning, it's a single private workspace behind a login screen, not a
    multi-tenant product.
-2. Optionally run [`supabase/seed.sql`](supabase/seed.sql) to pre-populate the
-   two example companies and four team members. **There is no "add company" or
-   "add team member" screen in the UI** — that was never built, even in the
-   original prototype. If you need different companies/people, either edit
-   `seed.sql` before running it, or add/edit rows directly in the Supabase
-   Table Editor after the fact.
-3. In Supabase → Authentication → Providers, make sure Email is enabled. By
+2. Run [`supabase/schema_v2.sql`](supabase/schema_v2.sql) — adds team-member
+   groups and the calendar events table used by the Companies/Team/Calendar
+   management screens.
+3. Optionally run [`supabase/seed.sql`](supabase/seed.sql) to pre-populate the
+   two example companies and four team members. Companies, team members and
+   member groups all have full add/edit/delete screens in the UI now, so this
+   is just a head start — skip it and add your own from the Companies and
+   Team pages instead.
+4. In Supabase → Authentication → Providers, make sure Email is enabled. By
    default Supabase requires email confirmation on sign-up; either confirm via
    the email you receive, or turn "Confirm email" off in Authentication →
    Settings for faster local testing.
-4. Grab your Project URL and anon/public key from Project Settings → API.
+5. Grab your Project URL and anon/public key from Project Settings → API.
 
 ## Local setup
 
@@ -48,9 +50,9 @@ Then open the printed local URL, sign up for an account, and sign in.
 
 ## What's wired to Supabase vs. what isn't
 
-Tables actually read/written by the UI: `companies` (read-only), `team_members`
-+ `member_company_links` (read-only), `projects`, `tasks`, `task_transitions`,
-`handoffs`, `reflections`, `calendar_exceptions`, `work_sessions`.
+Tables actually read/written by the UI: `companies`, `team_members`
++ `member_company_links`, `member_groups`, `projects`, `tasks`, `task_transitions`,
+`handoffs`, `reflections`, `calendar_exceptions`, `calendar_events`, `work_sessions`.
 
 Present in the schema but **not** used by this UI (no screen exercises them):
 `phase_templates`, `project_phases`, `attachments`, `daily_notes`, `sync_log`,
@@ -74,6 +76,7 @@ src/
   lib/ids.js             — uid/timestamp/device-id helpers
 supabase/
   rls.sql                — Row Level Security setup (run once)
+  schema_v2.sql           — member groups + calendar events tables (run once)
   seed.sql               — optional starter companies/team members
 baseline backup/
   ARCHITECTURE.md        — the original local-first core design this UI's

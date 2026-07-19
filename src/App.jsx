@@ -4,7 +4,8 @@ import {
   AlertTriangle, ShieldCheck, Globe, ChevronRight, ChevronLeft, CircleDot,
   Play, PhoneMissed, RotateCcw, UserCheck, CalendarClock, History, ScrollText,
   Ban, Flame, CalendarDays, BarChart3, Bell, Download, LogIn, LogOut, Plane,
-  TrendingUp, TrendingDown, Sun,
+  TrendingUp, TrendingDown, Sun, Building2, Pencil, Tag, MapPin, Video,
+  CalendarPlus, Briefcase,
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient.js";
 import * as db from "./lib/db.js";
@@ -294,6 +295,41 @@ export function computeMonthlyStats({ sessions, tasks, exceptions }, offset = 0)
     buckets[Math.min(4, Math.floor((new Date(t.completedAt).getDate() - 1) / 7))] += t.weight;
   }
   return { label, hours, tasksDone: done.length, weightDone, late, workingDays, lossDays, lossFactor, velocity, buckets };
+}
+
+/* Open (non-completed) tasks whose deadline falls on this YYYY-MM-DD. */
+export function tasksDueOn(tasks, ymd) {
+  return tasks.filter((t) => t.deadline === ymd && t.state !== "completed");
+}
+/* Active projects whose deadline falls on this YYYY-MM-DD. */
+export function projectDeadlinesOn(projects, ymd) {
+  return projects.filter((p) => p.deadline === ymd && p.status === "active");
+}
+/* Merges manual events + open task deadlines + active project deadlines into
+ * one date-sorted agenda, for both the day-grid dots and the Upcoming panel. */
+export function buildAgenda({ events, tasks, projects }, days = 14) {
+  const today = ymdOf(new Date());
+  const horizon = ymdOf(new Date(Date.now() + days * 864e5));
+  const inWindow = (ymd) => ymd >= today && ymd <= horizon;
+  const items = [];
+  for (const e of events) {
+    if (inWindow(e.date)) items.push({ kind: "event", date: e.date, id: e.id, ref: e });
+  }
+  for (const t of tasks) {
+    if (t.deadline && t.state !== "completed" && inWindow(t.deadline)) items.push({ kind: "task", date: t.deadline, id: t.id, ref: t });
+  }
+  for (const p of projects) {
+    if (p.deadline && p.status === "active" && inWindow(p.deadline)) items.push({ kind: "project", date: p.deadline, id: p.id, ref: p });
+  }
+  items.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  return items;
+}
+export function relativeDayLabel(ymd) {
+  const today = ymdOf(new Date());
+  if (ymd === today) return "Today";
+  if (ymd === ymdOf(new Date(Date.now() + 864e5))) return "Tomorrow";
+  const days = Math.round((new Date(ymd) - new Date(today)) / 864e5);
+  return days > 0 ? `In ${days} days` : `${-days} days ago`;
 }
 
 /* ============================================================================
@@ -774,6 +810,8 @@ export default function PuroductiveApp({ session }) {
   const [companies, setCompanies] = useState([]);
   const [projects, setProjects] = useState([]);
   const [members, setMembers] = useState([]);
+  const [groups, setGroups] = useState([]);
+  const [events, setEvents] = useState([]);
   const [engine, dispatch] = useReducer(engineReducer, {
     tasks: [], transitions: [], reflections: [], handoffs: [], interventions: [],
   });
@@ -807,9 +845,11 @@ export default function PuroductiveApp({ session }) {
       if (cancelled) return;
       setCompanies(data.companies);
       setMembers(data.members);
+      setGroups(data.groups);
       setProjects(data.projects);
       setExceptions(data.exceptions);
       setSessions(data.sessions);
+      setEvents(data.events);
       seenTaskIds.current = new Set(data.tasks.map((t) => t.id));
       seenTransitionIds.current = new Set(data.transitions.map((t) => t.id));
       seenReflectionIds.current = new Set(data.reflections.map((r) => r.id));
@@ -992,6 +1032,82 @@ export default function PuroductiveApp({ session }) {
   /* Task inserts are picked up by the engine.tasks persistence watcher above. */
   const addTask = (task) => { dispatch({ type: "ADD_TASK", task }); setModal(null); };
 
+  /* ------------------------- companies CRUD ------------------------------- */
+  const saveCompany = (data) => {
+    if (data.id) {
+      setCompanies((cs) => cs.map((c) => (c.id === data.id ? { ...c, ...data } : c)));
+      db.updateCompany(data).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    } else {
+      const company = { ...data, id: "c-" + uid() };
+      setCompanies((cs) => [...cs, company]);
+      db.insertCompany(company).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    }
+    setModal(null);
+    toast(data.id ? "Company updated" : "Company added");
+  };
+  const deleteCompany = (company) => {
+    setCompanies((cs) => cs.filter((c) => c.id !== company.id));
+    db.softDeleteCompany(company.id).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    if (activeCompanyId === company.id) setActiveCompanyId("all");
+    toast(`${company.name} removed`);
+  };
+
+  /* --------------------------- team members CRUD --------------------------- */
+  const saveMember = (data, companyIds) => {
+    const isEdit = !!data.id;
+    const member = { ...data, id: data.id || "m-" + uid(), companyIds };
+    const write = isEdit ? db.updateMember(member) : db.insertMember(member);
+    if (isEdit) setMembers((ms) => ms.map((m) => (m.id === member.id ? member : m)));
+    else setMembers((ms) => [...ms, member]);
+    write.then(() => db.setMemberCompanies(member.id, companyIds))
+      .catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    setModal(null);
+    toast(isEdit ? "Team member updated" : "Team member added");
+  };
+  const deleteMember = (member) => {
+    setMembers((ms) => ms.filter((m) => m.id !== member.id));
+    db.softDeleteMember(member.id).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    toast(`${member.name} removed`);
+  };
+
+  /* ------------------------------ groups CRUD ------------------------------ */
+  const saveGroup = (data) => {
+    if (data.id) {
+      setGroups((gs) => gs.map((g) => (g.id === data.id ? { ...g, ...data } : g)));
+      db.updateGroup(data).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    } else {
+      const group = { ...data, id: "g-" + uid(), sortOrder: groups.length };
+      setGroups((gs) => [...gs, group]);
+      db.insertGroup(group).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    }
+  };
+  const deleteGroup = (group) => {
+    const affected = members.filter((m) => m.groupId === group.id);
+    setGroups((gs) => gs.filter((g) => g.id !== group.id));
+    setMembers((ms) => ms.map((m) => (m.groupId === group.id ? { ...m, groupId: null } : m)));
+    db.softDeleteGroup(group.id).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    affected.forEach((m) => db.updateMember({ ...m, groupId: null }).catch((e) => toast(`Sync failed: ${e.message}`, "error")));
+  };
+
+  /* --------------------------- calendar events CRUD ------------------------- */
+  const saveEvent = (data) => {
+    if (data.id) {
+      setEvents((es) => es.map((e) => (e.id === data.id ? { ...e, ...data } : e)));
+      db.updateEvent(data).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    } else {
+      const event = { ...data, id: "ev-" + uid() };
+      setEvents((es) => [...es, event]);
+      db.insertEvent(event).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    }
+    setModal(null);
+    toast(data.id ? "Event updated" : "Event added");
+  };
+  const deleteEvent = (event) => {
+    setEvents((es) => es.filter((e) => e.id !== event.id));
+    db.softDeleteEvent(event.id).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    toast("Event removed");
+  };
+
   const intervention = engine.interventions[0];
   const interventionTask = intervention && engine.tasks.find((t) => t.id === intervention.taskId);
   const scopedProjects = projects.filter((p) => activeCompanyId === "all" || p.companyId === activeCompanyId);
@@ -1002,6 +1118,7 @@ export default function PuroductiveApp({ session }) {
 
   const NAV = [
     { key: "dashboard", label: "Dashboard", icon: LayoutGrid },
+    { key: "companies", label: "Companies", icon: Building2 },
     { key: "projects", label: "Projects", icon: FolderKanban },
     { key: "team", label: "Team", icon: Users },
     { key: "calendar", label: "Calendar", icon: CalendarDays },
@@ -1110,6 +1227,12 @@ export default function PuroductiveApp({ session }) {
           <Dashboard {...{ companies, projects, members, engine, theme }}
             openProject={(id) => { setOpenProjectId(id); setView("projects"); }} />
         )}
+        {view === "companies" && (
+          <CompaniesView companies={companies} projects={projects} members={members}
+            onAdd={() => setModal({ kind: "company", data: null })}
+            onEdit={(c) => setModal({ kind: "company", data: c })}
+            onDelete={deleteCompany} />
+        )}
         {view === "projects" && !openProject && (
           <ProjectsList projects={scopedProjects} companies={companies} engine={engine}
             onOpen={(p) => setOpenProjectId(p.id)}
@@ -1125,12 +1248,22 @@ export default function PuroductiveApp({ session }) {
             onExport={() => exportProject(openProject)} />
         )}
         {view === "team" && (
-          <TeamView members={members} companies={companies} engine={engine} />
+          <TeamView members={members} companies={companies} groups={groups} engine={engine}
+            onAddMember={() => setModal({ kind: "member", data: null })}
+            onEditMember={(m) => setModal({ kind: "member", data: m })}
+            onDeleteMember={deleteMember}
+            onManageGroups={() => setModal({ kind: "groupsManage" })} />
         )}
         {view === "calendar" && (
           <CalendarView exceptions={exceptions} toggleException={toggleException}
             sessions={sessions} activeSession={activeSession} clockIn={clockIn} clockOut={clockOut}
-            tasks={engine.tasks} alertsOn={alertsOn} enableAlerts={enableAlerts} />
+            tasks={engine.tasks} alertsOn={alertsOn} enableAlerts={enableAlerts}
+            events={events} projects={projects} companies={companies} members={members}
+            onAddEvent={(date) => setModal({ kind: "event", data: null, date })}
+            onEditEvent={(ev) => setModal({ kind: "event", data: ev })}
+            onDeleteEvent={deleteEvent}
+            onOpenDay={(ymd) => setModal({ kind: "dayDetail", date: ymd })}
+            onOpenProject={(id) => { setOpenProjectId(id); setView("projects"); }} />
         )}
         {view === "reports" && (
           <ReportsView sessions={sessions} tasks={engine.tasks} exceptions={exceptions}
@@ -1168,6 +1301,29 @@ export default function PuroductiveApp({ session }) {
       {!interventionTask && modal?.kind === "project" && (
         <ProjectForm data={modal.data} companies={companies} defaultCompanyId={activeCompanyId}
           onSave={saveProject} onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "company" && (
+        <CompanyForm data={modal.data} onSave={saveCompany} onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "member" && (
+        <MemberForm data={modal.data} companies={companies} groups={groups}
+          onSave={saveMember} onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "groupsManage" && (
+        <GroupsManageModal groups={groups} onSave={saveGroup} onDelete={deleteGroup} onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "event" && (
+        <CalendarEventForm data={modal.data} defaultDate={modal.date} companies={companies} projects={projects} members={members}
+          onSave={saveEvent} onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "dayDetail" && (
+        <DayDetailModal date={modal.date} exceptions={exceptions} toggleException={toggleException}
+          events={events} tasks={engine.tasks} projects={projects} companies={companies} members={members}
+          onAddEvent={(date) => setModal({ kind: "event", data: null, date })}
+          onEditEvent={(ev) => setModal({ kind: "event", data: ev })}
+          onDeleteEvent={deleteEvent}
+          onOpenProject={(id) => { setOpenProjectId(id); setView("projects"); setModal(null); }}
+          onClose={() => setModal(null)} />
       )}
     </div>
   );
@@ -1542,65 +1698,326 @@ const ProjectForm = ({ data, companies, defaultCompanyId, onSave, onClose }) => 
   );
 };
 
-/* ================================= TEAM =================================== */
-const TeamView = ({ members, companies, engine }) => (
+/* =============================== COMPANIES ================================= */
+const CompaniesView = ({ companies, projects, members, onAdd, onEdit, onDelete }) => (
   <div className="pd-fade-in">
-    <PageHead kicker="Resource pool" title="Team"
-      sub="Delegation and follow-ups route through these people. Open handoffs are tracked until answered." />
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(330px, 1fr))", gap: 16 }}>
-      {members.map((m) => {
-        const firstCo = companies.find((c) => c.id === m.companyIds[0]);
-        const theme = firstCo?.theme ?? THEME_PRESETS[0];
-        const initials = m.name.split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase();
-        const myOpen = engine.handoffs.filter((h) => h.status === "pending" && h.toAssigneeId === m.id);
-        const myTasks = engine.tasks.filter((t) => t.assigneeId === m.id && t.state !== "completed");
-        return (
-          <Card key={m.id} className="pd-rise" style={{ padding: 24, display: "flex", flexDirection: "column", gap: 15 }}>
-            <div style={{ display: "flex", gap: 15, alignItems: "flex-start" }}>
-              <div style={{ position: "relative", flexShrink: 0 }}>
-                <Mesh mesh={theme.mesh} style={{ width: 56, height: 56, borderRadius: 17,
-                  border: "1px solid rgba(22,24,29,0.07)", boxShadow: T.shadowSm }}>
-                  <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 19, color: theme.ink,
-                    display: "grid", placeItems: "center", height: "100%" }}>{initials}</span>
-                </Mesh>
-                {m.defaultDelegate && (
-                  <div title="Default delegate" style={{ position: "absolute", bottom: -5, right: -5, width: 21, height: 21,
-                    borderRadius: 8, display: "grid", placeItems: "center", background: "#FFF",
-                    border: `1px solid ${theme.primary}55`, boxShadow: T.shadowSm }}>
-                    <ShieldCheck size={12} style={{ color: theme.primary }} /></div>
-                )}
-              </div>
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                  <h3 style={{ margin: 0, fontFamily: T.fontDisplay, fontSize: 17, fontWeight: 600, letterSpacing: "-0.015em" }}>{m.name}</h3>
-                  {m.external && <Chip><Globe size={10} /> External</Chip>}
-                </div>
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
-                  {m.roles.map((r) => <Chip key={r} accent={theme.primary}>{r}</Chip>)}
-                </div>
-              </div>
-            </div>
-            <div style={{ display: "grid", gap: 7, padding: "12px 14px", borderRadius: 13, background: T.cardSoft, border: `1px solid ${T.lineSoft}` }}>
-              <span className="pd-num" style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 12.5, color: T.ink2 }}>
-                <Phone size={12.5} style={{ color: T.ink3 }} /> {m.phone}</span>
-              <span style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 12.5, color: T.ink2 }}>
-                <Mail size={12.5} style={{ color: T.ink3 }} /> {m.email}</span>
-            </div>
-            {myOpen.length > 0 && (
-              <div style={{ padding: "10px 13px", borderRadius: 12, background: "#FDF3E3", border: "1px solid #F0DBB4",
-                fontSize: 11.5, fontWeight: 600, color: "#78350F" }}>
-                Has {m.name} completed the follow-up? · {myOpen.length} open handoff{myOpen.length > 1 ? "s" : ""}
-              </div>
-            )}
-            <div style={{ fontSize: 11.5, color: T.ink3, marginTop: "auto" }}>
-              {myTasks.length} open task{myTasks.length !== 1 ? "s" : ""} assigned
-            </div>
-          </Card>
-        );
-      })}
+    <PageHead kicker="Root entity" title="Companies"
+      sub="Every project and team member is scoped to a company. Add the businesses you run work through."
+      action={<Btn onClick={onAdd}><Plus size={15} /> Add company</Btn>} />
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 16 }}>
+      {companies.map((c) => (
+        <CompanyCard key={c.id} company={c}
+          projectCount={projects.filter((p) => p.companyId === c.id).length}
+          memberCount={members.filter((m) => m.companyIds.includes(c.id)).length}
+          onEdit={() => onEdit(c)} onDelete={() => onDelete(c)} />
+      ))}
+      {companies.length === 0 && <Empty text="No companies yet — add the first one." />}
     </div>
   </div>
 );
+
+const CompanyCard = ({ company: c, projectCount, memberCount, onEdit, onDelete }) => {
+  const [confirming, setConfirming] = useState(false);
+  return (
+    <Card className="pd-rise" style={{ padding: 22, display: "flex", flexDirection: "column", gap: 15 }}>
+      <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+        <Mesh mesh={c.theme.mesh} style={{ width: 48, height: 48, borderRadius: 14, flexShrink: 0,
+          border: "1px solid rgba(22,24,29,0.07)", boxShadow: T.shadowSm }}>
+          <div style={{ display: "grid", placeItems: "center", height: "100%" }}>
+            <Building2 size={20} style={{ color: c.theme.ink }} />
+          </div>
+        </Mesh>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <h3 style={{ margin: 0, fontFamily: T.fontDisplay, fontSize: 16, fontWeight: 600, letterSpacing: "-0.015em" }}>{c.name}</h3>
+          <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 3 }}>{c.industry || "—"}</div>
+          <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 1 }}>{c.location || "—"}</div>
+        </div>
+        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          <IconBtn label="Edit company" onClick={onEdit}><Pencil size={13} /></IconBtn>
+          <IconBtn label="Delete company" danger onClick={() => setConfirming(true)}><Trash2 size={13.5} /></IconBtn>
+        </div>
+      </div>
+      {confirming ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 12,
+          background: "#FDECEA", border: "1px solid #F5C6BE" }}>
+          <span style={{ flex: 1, fontSize: 11.5, color: "#7F1D1D" }}>Remove {c.name}? Projects/members keep their history.</span>
+          <Btn small ghost onClick={() => setConfirming(false)}>Cancel</Btn>
+          <Btn small danger onClick={onDelete}>Confirm</Btn>
+        </div>
+      ) : (
+        <div style={{ display: "flex", gap: 8 }}>
+          <Chip>{projectCount} project{projectCount !== 1 ? "s" : ""}</Chip>
+          <Chip>{memberCount} member{memberCount !== 1 ? "s" : ""}</Chip>
+        </div>
+      )}
+    </Card>
+  );
+};
+
+const CompanyForm = ({ data, onSave, onClose }) => {
+  const [f, setF] = useState(data
+    ? { ...data, industry: data.industry ?? "", location: data.location ?? "" }
+    : { name: "", industry: "", location: "", theme: THEME_PRESETS[0] });
+  return (
+    <Modal title={data ? "Edit company" : "Add company"} onClose={onClose}
+      subtitle="The theme sets this company's color everywhere it appears.">
+      <div style={{ display: "grid", gap: 18 }}>
+        <div><Label>Company name</Label>
+          <input style={inputStyle} value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div><Label>Industry</Label>
+            <input style={inputStyle} value={f.industry} onChange={(e) => setF({ ...f, industry: e.target.value })} /></div>
+          <div><Label>Location</Label>
+            <input style={inputStyle} value={f.location} onChange={(e) => setF({ ...f, location: e.target.value })} /></div>
+        </div>
+        <div>
+          <Label>Theme</Label>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {THEME_PRESETS.map((t) => {
+              const on = f.theme.key === t.key;
+              return (
+                <button key={t.key} onClick={() => setF({ ...f, theme: t })} className="pd-press" title={t.label} style={{
+                  cursor: "pointer", padding: 3, borderRadius: 14,
+                  border: `2px solid ${on ? t.primary : "transparent"}`, background: "none",
+                }}>
+                  <Mesh mesh={t.mesh} style={{ width: 40, height: 40, borderRadius: 11, border: "1px solid rgba(22,24,29,0.07)" }} />
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          <Btn ghost onClick={onClose}>Cancel</Btn>
+          <Btn disabled={!f.name.trim()} onClick={() => onSave(f)}><Check size={15} /> {data ? "Save" : "Add company"}</Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+/* ================================= TEAM =================================== */
+const TeamView = ({ members, companies, groups, engine, onAddMember, onEditMember, onDeleteMember, onManageGroups }) => {
+  const sortedGroups = [...groups].sort((a, b) => a.sortOrder - b.sortOrder);
+  const buckets = [
+    ...sortedGroups.map((g) => ({ id: g.id, label: g.name, members: members.filter((m) => m.groupId === g.id) })),
+    { id: null, label: "Ungrouped", members: members.filter((m) => !m.groupId || !groups.some((g) => g.id === m.groupId)) },
+  ].filter((b) => b.members.length > 0);
+  return (
+    <div className="pd-fade-in">
+      <PageHead kicker="Resource pool" title="Team"
+        sub="Delegation and follow-ups route through these people. Open handoffs are tracked until answered."
+        action={<div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <Btn ghost onClick={onManageGroups}><Tag size={14} /> Manage groups</Btn>
+          <Btn onClick={onAddMember}><Plus size={15} /> Add member</Btn>
+        </div>} />
+      {members.length === 0 && <Empty text="No team members yet — add the first one." />}
+      {buckets.map((b) => (
+        <div key={b.id ?? "ungrouped"} style={{ marginBottom: 28 }}>
+          <SectionHead title={`${b.label} · ${b.members.length}`} />
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(330px, 1fr))", gap: 16 }}>
+            {b.members.map((m) => (
+              <MemberCard key={m.id} m={m} companies={companies} engine={engine}
+                onEdit={() => onEditMember(m)} onDelete={() => onDeleteMember(m)} />
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+const MemberCard = ({ m, companies, engine, onEdit, onDelete }) => {
+  const [confirming, setConfirming] = useState(false);
+  const firstCo = companies.find((c) => c.id === m.companyIds[0]);
+  const theme = firstCo?.theme ?? THEME_PRESETS[0];
+  const initials = m.name.split(" ").map((w) => w[0]).slice(0, 2).join("").toUpperCase();
+  const myOpen = engine.handoffs.filter((h) => h.status === "pending" && h.toAssigneeId === m.id);
+  const myTasks = engine.tasks.filter((t) => t.assigneeId === m.id && t.state !== "completed");
+  return (
+    <Card className="pd-rise" style={{ padding: 24, display: "flex", flexDirection: "column", gap: 15 }}>
+      <div style={{ display: "flex", gap: 15, alignItems: "flex-start" }}>
+        <div style={{ position: "relative", flexShrink: 0 }}>
+          <Mesh mesh={theme.mesh} style={{ width: 56, height: 56, borderRadius: 17,
+            border: "1px solid rgba(22,24,29,0.07)", boxShadow: T.shadowSm }}>
+            <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 19, color: theme.ink,
+              display: "grid", placeItems: "center", height: "100%" }}>{initials}</span>
+          </Mesh>
+          {m.defaultDelegate && (
+            <div title="Default delegate" style={{ position: "absolute", bottom: -5, right: -5, width: 21, height: 21,
+              borderRadius: 8, display: "grid", placeItems: "center", background: "#FFF",
+              border: `1px solid ${theme.primary}55`, boxShadow: T.shadowSm }}>
+              <ShieldCheck size={12} style={{ color: theme.primary }} /></div>
+          )}
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <h3 style={{ margin: 0, fontFamily: T.fontDisplay, fontSize: 17, fontWeight: 600, letterSpacing: "-0.015em" }}>{m.name}</h3>
+            {m.external && <Chip><Globe size={10} /> External</Chip>}
+          </div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+            {m.roles.map((r) => <Chip key={r} accent={theme.primary}>{r}</Chip>)}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          <IconBtn label="Edit member" onClick={onEdit}><Pencil size={13} /></IconBtn>
+          <IconBtn label="Delete member" danger onClick={() => setConfirming(true)}><Trash2 size={13.5} /></IconBtn>
+        </div>
+      </div>
+      {confirming ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 12,
+          background: "#FDECEA", border: "1px solid #F5C6BE" }}>
+          <span style={{ flex: 1, fontSize: 11.5, color: "#7F1D1D" }}>Remove {m.name}? Past task history is kept.</span>
+          <Btn small ghost onClick={() => setConfirming(false)}>Cancel</Btn>
+          <Btn small danger onClick={onDelete}>Confirm</Btn>
+        </div>
+      ) : (
+        <>
+          <div style={{ display: "grid", gap: 7, padding: "12px 14px", borderRadius: 13, background: T.cardSoft, border: `1px solid ${T.lineSoft}` }}>
+            <span className="pd-num" style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 12.5, color: T.ink2 }}>
+              <Phone size={12.5} style={{ color: T.ink3 }} /> {m.phone}</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 12.5, color: T.ink2 }}>
+              <Mail size={12.5} style={{ color: T.ink3 }} /> {m.email}</span>
+          </div>
+          {myOpen.length > 0 && (
+            <div style={{ padding: "10px 13px", borderRadius: 12, background: "#FDF3E3", border: "1px solid #F0DBB4",
+              fontSize: 11.5, fontWeight: 600, color: "#78350F" }}>
+              Has {m.name} completed the follow-up? · {myOpen.length} open handoff{myOpen.length > 1 ? "s" : ""}
+            </div>
+          )}
+          <div style={{ fontSize: 11.5, color: T.ink3, marginTop: "auto" }}>
+            {myTasks.length} open task{myTasks.length !== 1 ? "s" : ""} assigned
+          </div>
+        </>
+      )}
+    </Card>
+  );
+};
+
+/* ------------------------------- MEMBER FORM ------------------------------- */
+const MemberForm = ({ data, companies, groups, onSave, onClose }) => {
+  const [f, setF] = useState(data ?? {
+    name: "", roles: [], phone: "", email: "", notes: "",
+    external: false, defaultDelegate: false, groupId: null,
+  });
+  const [rolesText, setRolesText] = useState((data?.roles ?? []).join(", "));
+  const [companyIds, setCompanyIds] = useState(data?.companyIds ?? []);
+  const toggleCompany = (id) => setCompanyIds((ids) => ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]);
+  return (
+    <Modal title={data ? "Edit team member" : "Add team member"} wide onClose={onClose}
+      subtitle="Global across companies — link them to whichever businesses they work with.">
+      <div style={{ display: "grid", gap: 18 }}>
+        <div><Label>Name</Label>
+          <input style={inputStyle} value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></div>
+        <div><Label>Roles (comma-separated)</Label>
+          <input style={inputStyle} value={rolesText} onChange={(e) => setRolesText(e.target.value)}
+            placeholder="e.g. CNC Machining, Fabrication" /></div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div><Label>Phone</Label>
+            <input style={inputStyle} value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} /></div>
+          <div><Label>Email</Label>
+            <input style={inputStyle} value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} /></div>
+        </div>
+        <div><Label>Group</Label>
+          <select style={inputStyle} value={f.groupId ?? ""} onChange={(e) => setF({ ...f, groupId: e.target.value || null })}>
+            <option value="">Ungrouped</option>
+            {groups.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+          </select></div>
+        <div>
+          <Label>Companies</Label>
+          <div style={{ display: "grid", gap: 8 }}>
+            {companies.map((c) => {
+              const on = companyIds.includes(c.id);
+              return (
+                <button key={c.id} type="button" onClick={() => toggleCompany(c.id)} className="pd-press" style={{
+                  display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderRadius: 11,
+                  cursor: "pointer", textAlign: "left",
+                  background: on ? "#F4FBE3" : "#FFFFFF", border: `1px solid ${on ? "#C9E88A" : T.line}`,
+                }}>
+                  <CircleDot size={11} style={{ color: c.theme.primary }} />
+                  <span style={{ flex: 1, fontSize: 12.5, color: T.ink }}>{c.name}</span>
+                  {on && <Check size={14} style={{ color: T.limeDeep }} />}
+                </button>
+              );
+            })}
+            {companies.length === 0 && <span style={{ fontSize: 11.5, color: T.ink3 }}>Add a company first.</span>}
+          </div>
+        </div>
+        <div><Label>Notes</Label>
+          <textarea rows={2} style={{ ...inputStyle, minHeight: 60, paddingTop: 11, resize: "vertical" }}
+            value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} /></div>
+        <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: T.ink2, cursor: "pointer" }}>
+            <input type="checkbox" checked={f.external} onChange={(e) => setF({ ...f, external: e.target.checked })} />
+            External / vendor
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: T.ink2, cursor: "pointer" }}>
+            <input type="checkbox" checked={f.defaultDelegate} onChange={(e) => setF({ ...f, defaultDelegate: e.target.checked })} />
+            Default delegate (handoff target)
+          </label>
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          <Btn ghost onClick={onClose}>Cancel</Btn>
+          <Btn disabled={!f.name.trim()} onClick={() => onSave(
+            { ...f, roles: rolesText.split(",").map((r) => r.trim()).filter(Boolean) },
+            companyIds,
+          )}><Check size={15} /> {data ? "Save" : "Add member"}</Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+/* ---------------------------- GROUPS MANAGEMENT ----------------------------- */
+const GroupsManageModal = ({ groups, onSave, onDelete, onClose }) => {
+  const [editingId, setEditingId] = useState(null);
+  const [editText, setEditText] = useState("");
+  const [newName, setNewName] = useState("");
+  const [confirmId, setConfirmId] = useState(null);
+  const startEdit = (g) => { setEditingId(g.id); setEditText(g.name); };
+  const commitEdit = (g) => { if (editText.trim()) onSave({ id: g.id, name: editText.trim() }); setEditingId(null); };
+  return (
+    <Modal title="Manage team groups" onClose={onClose} subtitle="Group your team into departments, crews, or vendors.">
+      <div style={{ display: "grid", gap: 10, marginBottom: 18 }}>
+        {[...groups].sort((a, b) => a.sortOrder - b.sortOrder).map((g) => (
+          <div key={g.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px",
+            borderRadius: 11, border: `1px solid ${T.line}`, background: "#FFFFFF" }}>
+            {editingId === g.id ? (
+              <input autoFocus style={{ ...inputStyle, minHeight: 34, flex: 1 }} value={editText}
+                onChange={(e) => setEditText(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && commitEdit(g)} />
+            ) : (
+              <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: T.ink }}>{g.name}</span>
+            )}
+            {confirmId === g.id ? (
+              <>
+                <Btn small ghost onClick={() => setConfirmId(null)}>Cancel</Btn>
+                <Btn small danger onClick={() => { onDelete(g); setConfirmId(null); }}>Confirm</Btn>
+              </>
+            ) : editingId === g.id ? (
+              <Btn small onClick={() => commitEdit(g)}><Check size={13} /> Save</Btn>
+            ) : (
+              <>
+                <IconBtn label="Rename group" onClick={() => startEdit(g)}><Pencil size={13} /></IconBtn>
+                <IconBtn label="Delete group" danger onClick={() => setConfirmId(g.id)}><Trash2 size={13} /></IconBtn>
+              </>
+            )}
+          </div>
+        ))}
+        {groups.length === 0 && <span style={{ fontSize: 11.5, color: T.ink3 }}>No groups yet.</span>}
+      </div>
+      <div style={{ display: "flex", gap: 10 }}>
+        <input style={inputStyle} value={newName} onChange={(e) => setNewName(e.target.value)}
+          placeholder="New group name" onKeyDown={(e) => { if (e.key === "Enter" && newName.trim()) { onSave({ name: newName.trim() }); setNewName(""); } }} />
+        <Btn disabled={!newName.trim()} onClick={() => { onSave({ name: newName.trim() }); setNewName(""); }}>
+          <Plus size={15} /> Add
+        </Btn>
+      </div>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 18 }}>
+        <Btn ghost onClick={onClose}>Done</Btn>
+      </div>
+    </Modal>
+  );
+};
 
 /* ============================================================================
  * CALENDAR WORKSPACE — clock-in/out, holiday & travel logging, alert controls
@@ -1613,7 +2030,14 @@ const ClockTicker = ({ since }) => {
   return <span className="pd-num">{p(Math.floor(s / 3600))}:{p(Math.floor((s % 3600) / 60))}:{p(s % 60)}</span>;
 };
 
-const CalendarView = ({ exceptions, toggleException, sessions, activeSession, clockIn, clockOut, tasks, alertsOn, enableAlerts }) => {
+const EVENT_TYPE_META = {
+  meeting: { label: "Meeting", icon: Video, color: "#0284C7", bg: "#EAF6FE" },
+  visit: { label: "Visit", icon: MapPin, color: "#B45309", bg: "#FDF3E3" },
+  other: { label: "Other", icon: CalendarClock, color: "#5A5F69", bg: "#F3F3EE" },
+};
+
+const CalendarView = ({ exceptions, toggleException, sessions, activeSession, clockIn, clockOut, tasks, alertsOn, enableAlerts,
+  events, projects, companies, members, onAddEvent, onEditEvent, onDeleteEvent, onOpenDay, onOpenProject }) => {
   const stats = computeMonthlyStats({ sessions, tasks, exceptions }, 0);
   const { start, end, label } = monthWindow(0);
   const today = ymdOf(new Date());
@@ -1622,12 +2046,17 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
   const lead = start.getDay(); // blank cells before day 1 (week starts Sunday)
   const monthSessions = sessions.filter((s) => new Date(s.loginAt) >= start && new Date(s.loginAt) < end);
   const exFor = (ymd) => exceptions.find((x) => x.date === ymd);
+  const todaysTasks = tasksDueOn(tasks, today);
+  const agenda = buildAgenda({ events, tasks, projects }, 14);
 
   return (
     <div className="pd-fade-in">
       <PageHead kicker="Time & interruption" title="Calendar"
-        sub="Tap a day to cycle it: working → holiday → travel. Lost days feed the productivity-loss factor."
-        action={<Btn ghost onClick={enableAlerts}><Bell size={14} /> {alertsOn ? "Alerts on · test chime" : "Enable native alerts"}</Btn>} />
+        sub="Tap a day to see its schedule — meetings, visits, task deadlines, and mark holiday/travel."
+        action={<div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <Btn ghost onClick={enableAlerts}><Bell size={14} /> {alertsOn ? "Alerts on · test chime" : "Enable native alerts"}</Btn>
+          <Btn onClick={() => onAddEvent(today)}><CalendarPlus size={14} /> Add event</Btn>
+        </div>} />
 
       {/* Clock + month stats strip */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14, marginBottom: 20 }}>
@@ -1653,15 +2082,33 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
           <div style={{ marginTop: 8, fontSize: 11, fontWeight: 500, letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3 }}>Productivity loss factor</div>
           <div className="pd-num" style={{ marginTop: 6, fontSize: 11.5, color: T.ink3 }}>{stats.lossDays} of {stats.workingDays} working days interrupted</div>
         </Card>
+        <Card style={{ padding: "20px 22px" }}>
+          <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3, marginBottom: 10 }}>Today's tasks</div>
+          {todaysTasks.length === 0
+            ? <div style={{ fontSize: 12, color: T.ink3 }}>Nothing due today.</div>
+            : <div style={{ display: "grid", gap: 6 }}>
+                {todaysTasks.slice(0, 4).map((t) => {
+                  const p = projects.find((x) => x.id === t.projectId);
+                  const m = members.find((x) => x.id === t.assigneeId);
+                  return (
+                    <div key={t.id} style={{ fontSize: 11.5, color: T.ink2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <strong style={{ color: T.ink }}>{t.title}</strong> · {p?.name ?? "—"}{m ? ` · ${m.name}` : ""}
+                    </div>
+                  );
+                })}
+                {todaysTasks.length > 4 && <div style={{ fontSize: 11, color: T.ink3 }}>+{todaysTasks.length - 4} more</div>}
+              </div>}
+        </Card>
       </div>
 
       {/* Month grid */}
-      <Card style={{ padding: 24 }}>
+      <Card style={{ padding: 24, marginBottom: 20 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
           <h2 style={{ margin: 0, fontFamily: T.fontDisplay, fontSize: 17, fontWeight: 600, letterSpacing: "-0.02em" }}>{label}</h2>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <Chip bg="#FDEED3" color="#4A2A03"><Sun size={10} /> Holiday</Chip>
             <Chip bg="#DDF3FE" color="#062F44"><Plane size={10} /> Travel</Chip>
+            <Chip bg={EVENT_TYPE_META.meeting.bg} color={EVENT_TYPE_META.meeting.color}><Video size={10} /> Meeting/Visit</Chip>
           </div>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
@@ -1676,15 +2123,18 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
             const isToday = ymd === today;
             const sunday = d.getDay() === 0;
             const worked = monthSessions.some((s) => ymdOf(new Date(s.loginAt)) === ymd);
+            const dayEvents = events.filter((e) => e.date === ymd);
+            const dayTasks = tasksDueOn(tasks, ymd);
+            const dayDeadlines = projectDeadlinesOn(projects, ymd);
             return (
-              <button key={ymd} onClick={() => !sunday && toggleException(ymd)} className="pd-press"
-                title={ex ? `${ex.type}${ex.label ? " · " + ex.label : ""}` : sunday ? "Sunday (off)" : "Tap to mark holiday/travel"}
+              <button key={ymd} onClick={() => onOpenDay(ymd)} className="pd-press"
+                title={ex ? `${ex.type}${ex.label ? " · " + ex.label : ""}` : "Tap to view schedule"}
                 style={{
-                  position: "relative", overflow: "hidden", minHeight: 62, borderRadius: 12,
-                  cursor: sunday ? "default" : "pointer", textAlign: "left", padding: "8px 9px",
+                  position: "relative", overflow: "hidden", minHeight: 66, borderRadius: 12,
+                  cursor: "pointer", textAlign: "left", padding: "8px 9px",
                   border: `1px solid ${isToday ? T.limeDeep : T.line}`,
                   boxShadow: isToday ? "0 0 0 3px rgba(124,181,24,0.18)" : "none",
-                  opacity: sunday ? 0.45 : 1,
+                  opacity: sunday && !ex && !dayEvents.length && !dayTasks.length && !dayDeadlines.length ? 0.45 : 1,
                   background: "#FFFFFF",
                   ...(ex ? meshBackground(ex.type === "holiday" ? ["#FDEED3", "#FBD38D", "#F6AD55"] : ["#DDF3FE", "#A5DFF9", "#67C3F0"]) : {}),
                 }}>
@@ -1695,6 +2145,11 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
                   </span>
                   {ex && (ex.type === "holiday" ? <Sun size={12} style={{ color: "#4A2A03" }} /> : <Plane size={12} style={{ color: "#062F44" }} />)}
                   {!ex && worked && <span style={{ width: 5, height: 5, borderRadius: 99, background: T.limeDeep }} title="Session logged" />}
+                  <div style={{ display: "flex", gap: 3, marginTop: "auto", flexWrap: "wrap" }}>
+                    {dayEvents.length > 0 && <span style={{ width: 5, height: 5, borderRadius: 99, background: "#0284C7" }} title={`${dayEvents.length} event(s)`} />}
+                    {dayTasks.length > 0 && <span style={{ width: 5, height: 5, borderRadius: 99, background: "#D97706" }} title={`${dayTasks.length} task(s) due`} />}
+                    {dayDeadlines.length > 0 && <span style={{ width: 5, height: 5, borderRadius: 99, background: "#B91C1C" }} title={`${dayDeadlines.length} project deadline(s)`} />}
+                  </div>
                 </div>
               </button>
             );
@@ -1705,7 +2160,224 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
           <span className="pd-num"> AlarmService</span> interface is backed by Capacitor LocalNotifications with the device sound library.
         </p>
       </Card>
+
+      {/* Upcoming agenda */}
+      <SectionHead title="Upcoming — next 14 days" />
+      <div style={{ display: "grid", gap: 8 }}>
+        {agenda.map((item) => {
+          if (item.kind === "event") {
+            const meta = EVENT_TYPE_META[item.ref.type] ?? EVENT_TYPE_META.other;
+            const Icon = meta.icon;
+            const c = companies.find((x) => x.id === item.ref.companyId);
+            return (
+              <Card key={"e" + item.id} style={{ padding: "13px 16px", display: "flex", alignItems: "center", gap: 14 }}>
+                <Chip bg={meta.bg} color={meta.color}><Icon size={11} /> {meta.label}</Chip>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{item.ref.title}</div>
+                  <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
+                    {item.ref.date}{item.ref.startTime ? ` · ${item.ref.startTime}` : ""}{c ? ` · ${c.name}` : ""}{item.ref.location ? ` · ${item.ref.location}` : ""}
+                  </div>
+                </div>
+                <span style={{ fontSize: 11, color: T.ink3, flexShrink: 0 }}>{relativeDayLabel(item.date)}</span>
+              </Card>
+            );
+          }
+          if (item.kind === "task") {
+            const p = projects.find((x) => x.id === item.ref.projectId);
+            return (
+              <Card key={"t" + item.id} style={{ padding: "13px 16px", display: "flex", alignItems: "center", gap: 14 }}>
+                <Chip bg="#FDF3E3" color="#B45309">Task due</Chip>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{item.ref.title}</div>
+                  <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>{item.date}{p ? ` · ${p.name}` : ""}</div>
+                </div>
+                <span style={{ fontSize: 11, color: T.ink3, flexShrink: 0 }}>{relativeDayLabel(item.date)}</span>
+              </Card>
+            );
+          }
+          const c = companies.find((x) => x.id === item.ref.companyId);
+          return (
+            <Card key={"p" + item.id} className="pd-rise" style={{ padding: "13px 16px", display: "flex", alignItems: "center", gap: 14, cursor: "pointer" }}
+              onClick={() => onOpenProject(item.ref.id)}>
+              <Chip bg="#FDECEA" color="#B91C1C"><Briefcase size={11} /> Project deadline</Chip>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{item.ref.name}</div>
+                <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>{item.date}{c ? ` · ${c.name}` : ""}</div>
+              </div>
+              <span style={{ fontSize: 11, color: T.ink3, flexShrink: 0 }}>{relativeDayLabel(item.date)}</span>
+            </Card>
+          );
+        })}
+        {agenda.length === 0 && <Empty text="Nothing scheduled in the next 14 days." />}
+      </div>
     </div>
+  );
+};
+
+/* --------------------------- CALENDAR EVENT FORM ---------------------------- */
+const CalendarEventForm = ({ data, defaultDate, companies, projects, members, onSave, onClose }) => {
+  const [f, setF] = useState(data ?? {
+    title: "", type: "meeting", date: defaultDate || todayIso(),
+    startTime: "", endTime: "", companyId: "", projectId: "", location: "", notes: "",
+  });
+  const [attendeeIds, setAttendeeIds] = useState(data?.attendeeIds ?? []);
+  const toggleAttendee = (id) => setAttendeeIds((ids) => ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]);
+  const projectOptions = projects.filter((p) => !f.companyId || p.companyId === f.companyId);
+  return (
+    <Modal title={data ? "Edit event" : "Add event"} wide onClose={onClose}
+      subtitle="Meetings, site visits, or anything else worth putting on the calendar.">
+      <div style={{ display: "grid", gap: 18 }}>
+        <div><Label>Title</Label>
+          <input style={inputStyle} value={f.title} onChange={(e) => setF({ ...f, title: e.target.value })}
+            placeholder="e.g. Site visit — Shree Jagdamba floor" /></div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+          <div><Label>Type</Label>
+            <select style={inputStyle} value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })}>
+              <option value="meeting">Meeting</option>
+              <option value="visit">Visit</option>
+              <option value="other">Other</option>
+            </select></div>
+          <div><Label>Date</Label>
+            <input type="date" style={inputStyle} value={f.date} onChange={(e) => setF({ ...f, date: e.target.value })} /></div>
+          <div><Label>Location</Label>
+            <input style={inputStyle} value={f.location} onChange={(e) => setF({ ...f, location: e.target.value })} /></div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div><Label>Start time</Label>
+            <input type="time" style={inputStyle} value={f.startTime} onChange={(e) => setF({ ...f, startTime: e.target.value })} /></div>
+          <div><Label>End time</Label>
+            <input type="time" style={inputStyle} value={f.endTime} onChange={(e) => setF({ ...f, endTime: e.target.value })} /></div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div><Label>Company (optional)</Label>
+            <select style={inputStyle} value={f.companyId} onChange={(e) => setF({ ...f, companyId: e.target.value, projectId: "" })}>
+              <option value="">—</option>
+              {companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select></div>
+          <div><Label>Project (optional)</Label>
+            <select style={inputStyle} value={f.projectId} onChange={(e) => setF({ ...f, projectId: e.target.value })}>
+              <option value="">—</option>
+              {projectOptions.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select></div>
+        </div>
+        <div>
+          <Label>Attendees</Label>
+          <div style={{ display: "grid", gap: 6, maxHeight: 160, overflowY: "auto" }} className="pd-scroll">
+            {members.map((m) => {
+              const on = attendeeIds.includes(m.id);
+              return (
+                <button key={m.id} type="button" onClick={() => toggleAttendee(m.id)} className="pd-press" style={{
+                  display: "flex", alignItems: "center", gap: 10, padding: "8px 11px", borderRadius: 10,
+                  cursor: "pointer", textAlign: "left",
+                  background: on ? "#F4FBE3" : "#FFFFFF", border: `1px solid ${on ? "#C9E88A" : T.line}`,
+                }}>
+                  <span style={{ flex: 1, fontSize: 12.5, color: T.ink }}>{m.name}</span>
+                  {on && <Check size={13} style={{ color: T.limeDeep }} />}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div><Label>Notes</Label>
+          <textarea rows={2} style={{ ...inputStyle, minHeight: 60, paddingTop: 11, resize: "vertical" }}
+            value={f.notes} onChange={(e) => setF({ ...f, notes: e.target.value })} /></div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          <Btn ghost onClick={onClose}>Cancel</Btn>
+          <Btn disabled={!f.title.trim() || !f.date} onClick={() => onSave({
+            ...f, companyId: f.companyId || null, projectId: f.projectId || null, attendeeIds,
+          })}><Check size={15} /> {data ? "Save" : "Add event"}</Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+/* ------------------------------- DAY DETAIL --------------------------------- */
+const DayDetailModal = ({ date, exceptions, toggleException, events, tasks, projects, companies, members,
+  onAddEvent, onEditEvent, onDeleteEvent, onOpenProject, onClose }) => {
+  const ex = exceptions.find((x) => x.date === date);
+  const dayEvents = events.filter((e) => e.date === date);
+  const dayTasks = tasksDueOn(tasks, date);
+  const dayDeadlines = projectDeadlinesOn(projects, date);
+  const dow = new Date(date + "T00:00:00").toLocaleDateString("en", { weekday: "long" });
+  return (
+    <Modal title={dow} subtitle={date} wide onClose={onClose}>
+      <div style={{ display: "grid", gap: 20 }}>
+        <button onClick={() => toggleException(date)} className="pd-press" style={{
+          display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", borderRadius: 13, cursor: "pointer", textAlign: "left",
+          background: ex ? (ex.type === "holiday" ? "#FDEED3" : "#DDF3FE") : T.cardSoft, border: `1px solid ${ex ? "transparent" : T.line}`,
+        }}>
+          {ex ? (ex.type === "holiday" ? <Sun size={16} style={{ color: "#4A2A03" }} /> : <Plane size={16} style={{ color: "#062F44" }} />)
+             : <CircleDot size={16} style={{ color: T.ink3 }} />}
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>
+              {ex ? `Marked as ${ex.type}` : "Working day"}
+            </div>
+            <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>Tap to cycle: working → holiday → travel → working.</div>
+          </div>
+        </button>
+
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <span style={{ fontSize: 12, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3 }}>Events</span>
+            <Btn small ghost onClick={() => onAddEvent(date)}><Plus size={13} /> Add</Btn>
+          </div>
+          <div style={{ display: "grid", gap: 8 }}>
+            {dayEvents.map((ev) => {
+              const meta = EVENT_TYPE_META[ev.type] ?? EVENT_TYPE_META.other;
+              const Icon = meta.icon;
+              const c = companies.find((x) => x.id === ev.companyId);
+              return (
+                <div key={ev.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", borderRadius: 12, border: `1px solid ${T.line}` }}>
+                  <Chip bg={meta.bg} color={meta.color}><Icon size={11} /> {meta.label}</Chip>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{ev.title}</div>
+                    <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
+                      {ev.startTime || "—"}{ev.endTime ? `–${ev.endTime}` : ""}{c ? ` · ${c.name}` : ""}{ev.location ? ` · ${ev.location}` : ""}
+                    </div>
+                  </div>
+                  <IconBtn label="Edit event" onClick={() => onEditEvent(ev)}><Pencil size={13} /></IconBtn>
+                  <IconBtn label="Delete event" danger onClick={() => onDeleteEvent(ev)}><Trash2 size={13} /></IconBtn>
+                </div>
+              );
+            })}
+            {dayEvents.length === 0 && <span style={{ fontSize: 11.5, color: T.ink3 }}>No events on this day.</span>}
+          </div>
+        </div>
+
+        {dayTasks.length > 0 && (
+          <div>
+            <span style={{ fontSize: 12, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3 }}>Task deadlines</span>
+            <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
+              {dayTasks.map((t) => {
+                const p = projects.find((x) => x.id === t.projectId);
+                const m = members.find((x) => x.id === t.assigneeId);
+                return (
+                  <div key={t.id} style={{ padding: "10px 14px", borderRadius: 12, border: `1px solid ${T.line}` }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{t.title}</div>
+                    <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>{p?.name ?? "—"}{m ? ` · ${m.name}` : ""}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {dayDeadlines.length > 0 && (
+          <div>
+            <span style={{ fontSize: 12, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3 }}>Project deadlines</span>
+            <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
+              {dayDeadlines.map((p) => (
+                <div key={p.id} className="pd-rise" style={{ padding: "10px 14px", borderRadius: 12, border: `1px solid ${T.line}`, cursor: "pointer" }}
+                  onClick={() => onOpenProject(p.id)}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{p.name}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </Modal>
   );
 };
 
