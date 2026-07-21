@@ -5,7 +5,7 @@ import {
   Play, PhoneMissed, RotateCcw, UserCheck, CalendarClock, History, ScrollText,
   Ban, Flame, CalendarDays, BarChart3, Bell, Download, LogIn, LogOut, Plane,
   TrendingUp, TrendingDown, Sun, Building2, Pencil, Tag, MapPin, Video,
-  CalendarPlus, Briefcase, Menu,
+  CalendarPlus, Briefcase, Menu, GanttChart, Trophy,
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient.js";
 import * as db from "./lib/db.js";
@@ -297,6 +297,42 @@ export function computeMonthlyStats({ sessions, tasks, exceptions }, offset = 0)
   return { label, hours, tasksDone: done.length, weightDone, late, workingDays, lossDays, lossFactor, velocity, buckets };
 }
 
+/* Best-ever month by execution velocity, scanning back from the current
+ * month. Skips months with zero activity so an idle stretch never poses as
+ * "the bar to beat" — this is the "personal best" self-competition target,
+ * one level up from computeMonthlyStats' single-month-vs-previous-month. */
+export function computeAllTimeBest({ sessions, tasks, exceptions }, monthsBack = 24) {
+  let best = null;
+  for (let o = 0; o >= -monthsBack; o--) {
+    const stats = computeMonthlyStats({ sessions, tasks, exceptions }, o);
+    if (stats.tasksDone === 0 && stats.hours === 0) continue;
+    if (!best || stats.velocity > best.velocity) best = { ...stats, offset: o };
+  }
+  return best;
+}
+
+/* Due / overdue / on-time / early / late breakdown for a set of tasks, plus
+ * an overall completion-weighted productivity percentage. Pure and
+ * scope-agnostic — callers pass whatever task slice they want (a project,
+ * a company, or everything), and since it just reads the live task list it
+ * updates instantly wherever it's called, no separate "refresh" needed. */
+export function computeProductivityBreakdown(tasks) {
+  const open = tasks.filter((t) => t.state !== "completed");
+  const overdue = open.filter((t) => t.state === "overdue");
+  const due = open.filter((t) => t.state !== "overdue"); // pending / in_progress / retry_pending
+  const completed = tasks.filter((t) => t.state === "completed");
+  const late = completed.filter((t) => t.completedLate);
+  const onTime = completed.filter((t) => !t.completedLate);
+  const early = onTime.filter((t) => t.deadline && t.completedAt && ymdOf(new Date(t.completedAt)) < t.deadline);
+  const totalWeight = tasks.reduce((n, t) => n + t.weight, 0);
+  const completedWeight = completed.reduce((n, t) => n + t.weight, 0);
+  return {
+    due, overdue, onTime, early, late, completed,
+    totalWeight, completedWeight,
+    overallProductivity: totalWeight ? Math.round((completedWeight / totalWeight) * 100) : 0,
+  };
+}
+
 /* Open (non-completed) tasks whose deadline falls on this YYYY-MM-DD. */
 export function tasksDueOn(tasks, ymd) {
   return tasks.filter((t) => t.deadline === ymd && t.state !== "completed");
@@ -344,6 +380,7 @@ export function compileProjectReport({ project, company, tasks, transitions, ref
   const nameOf = (id) => members.find((m) => m.id === id)?.name ?? "Unassigned";
   const fmt = (iso) => (iso ? new Date(iso).toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" }) : "—");
   const stack = computeSandStack(project, tasks);
+  const breakdown = computeProductivityBreakdown(tasks);
 
   const report = {
     format: "puroductive-project-report",
@@ -351,6 +388,11 @@ export function compileProjectReport({ project, company, tasks, transitions, ref
     company: { name: company?.name, industry: company?.industry, location: company?.location },
     project: { name: project.name, type: project.type, baselinePercent: project.baseline, deadline: project.deadline, deadlineLocked: !!project.locked },
     sandStack: { fillPercent: Math.round(stack.fillPercent), degraded: stack.degraded, completedWeight: stack.completedWeight, totalWeight: stack.totalWeight },
+    productivity: {
+      due: breakdown.due.length, overdue: breakdown.overdue.length,
+      onTime: breakdown.onTime.length, early: breakdown.early.length, late: breakdown.late.length,
+      overallProductivity: Math.round(stack.fillPercent),
+    },
     tasks: tasks.map((t) => ({
       title: t.title, state: t.state, assignee: nameOf(t.assigneeId),
       deadline: t.deadline, completedAt: t.completedAt, completedLate: !!t.completedLate,
@@ -385,6 +427,28 @@ export function compileProjectReport({ project, company, tasks, transitions, ref
   const attachmentBlocks = report.tasks.filter((t) => t.attachmentLinks.length).map((t) =>
     `<li><b>${esc(t.title)}</b>: ${t.attachmentLinks.map((u) => `<a href="${esc(u)}">${esc(u)}</a>`).join(", ")}</li>`).join("");
 
+  // Classic Word-safe "bar chart": a fixed-width filled/empty table-cell pair
+  // per row. Real SVG/canvas doesn't render reliably once opened as a .doc,
+  // but table cells with inline background-color/width always do.
+  const BAR_MAX_PX = 220;
+  const productivityRows = [
+    ["Due", breakdown.due.length, "#8A8F99"],
+    ["Overdue", breakdown.overdue.length, "#B91C1C"],
+    ["Completed on time", breakdown.onTime.length, "#3F6212"],
+    ["Completed early", breakdown.early.length, "#7CB518"],
+    ["Completed late", breakdown.late.length, "#D97706"],
+  ];
+  const productivityMax = Math.max(1, ...productivityRows.map(([, n]) => n));
+  const productivityBlocks = productivityRows.map(([label, n, color]) => {
+    const px = Math.round((n / productivityMax) * BAR_MAX_PX);
+    return `<tr><td style="width:140pt;">${esc(label)}</td>
+      <td style="width:24pt;" align="right"><b>${n}</b></td>
+      <td><table cellpadding="0" cellspacing="0"><tr>
+        <td style="width:${px}px;height:12px;background:${color};"></td>
+        <td style="width:${BAR_MAX_PX - px}px;height:12px;background:#EFEFEA;"></td>
+      </tr></table></td></tr>`;
+  }).join("");
+
   const docHtml = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">
 <head><meta charset="utf-8"><title>${esc(project.name)} — Project Report</title>
 <!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View></w:WordDocument></xml><![endif]-->
@@ -399,12 +463,16 @@ export function compileProjectReport({ project, company, tasks, transitions, ref
   table.grid th { background: #F4FBE3; text-align: left; }
   table.ref { width: 100%; background: #FDF9EF; border: 0.75pt solid #EFE3C8; margin-bottom: 8pt; }
   table.ref td { padding: 8pt 10pt; font-size: 10pt; }
+  table.prod td { padding: 4pt 6pt; font-size: 10pt; vertical-align: middle; }
 </style></head><body>
 <h1>${esc(project.name)}</h1>
 <p class="meta">${esc(company?.name ?? "")} · ${esc(company?.location ?? "")} · Generated ${esc(fmt(report.generatedAt))}<br/>
 Type: ${esc(project.type === "zero_to_one" ? "Zero → One" : `Ongoing (baseline ${project.baseline}%)`)} ·
 Deadline: ${esc(project.deadline ?? "—")}${project.locked ? " (locked)" : ""} ·
 Sand stack: <b>${report.sandStack.fillPercent}%</b>${report.sandStack.degraded ? " — DEGRADED" : ""}</p>
+<h2>Productivity Breakdown</h2>
+<p class="meta">Overall productivity: <b>${report.productivity.overallProductivity}%</b> of baseline-weighted work completed.</p>
+<table class="prod">${productivityBlocks}</table>
 <h2>Task Register</h2>
 <table class="grid"><tr><th>Task</th><th>State</th><th>Assignee</th><th>Deadline</th><th>Completed</th><th>Retries</th><th>Weight</th></tr>${taskRows}</table>
 <h2>Task Timelines</h2>${timelineBlocks || "<p><i>No transitions recorded yet.</i></p>"}
@@ -416,6 +484,20 @@ Sand stack: <b>${report.sandStack.fillPercent}%</b>${report.sandStack.degraded ?
 }
 export function downloadProjectDoc(compiled, filename) {
   const blob = new Blob(["\ufeff" + compiled.docHtml], { type: "application/msword" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+/* rows: array of arrays, first row is the header. Escapes quotes/commas per
+ * RFC 4180 so titles/notes with commas don't break columns. */
+export function downloadCsv(rows, filename) {
+  const cell = (v) => {
+    const s = String(v ?? "");
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const csv = rows.map((row) => row.map(cell).join(",")).join("\r\n");
+  const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = filename; a.click();
@@ -858,22 +940,37 @@ export default function PuroductiveApp({ session }) {
   const seenHandoffStatus = useRef(new Map());
   useEffect(() => {
     let cancelled = false;
-    db.fetchBootstrap().then((data) => {
-      if (cancelled) return;
-      setCompanies(data.companies);
-      setMembers(data.members);
-      setGroups(data.groups);
-      setProjects(data.projects);
-      setExceptions(data.exceptions);
-      setSessions(data.sessions);
-      setEvents(data.events);
-      seenTaskIds.current = new Set(data.tasks.map((t) => t.id));
-      seenTransitionIds.current = new Set(data.transitions.map((t) => t.id));
-      seenReflectionIds.current = new Set(data.reflections.map((r) => r.id));
-      seenHandoffStatus.current = new Map(data.handoffs.map((h) => [h.id, h.status]));
-      dispatch({ type: "INIT", tasks: data.tasks, transitions: data.transitions, reflections: data.reflections, handoffs: data.handoffs });
-      setLoading(false);
-    }).catch((err) => { if (!cancelled) { setLoadError(err.message); setLoading(false); } });
+    /* Right after sign-in the freshly-minted access token's `iat` can lag a
+     * hair behind the clock on whichever Supabase node handles this burst of
+     * parallel queries, producing a transient "JWT issued at future" — retry
+     * once after a beat instead of making the user refresh manually. */
+    const load = (retriesLeft = 1) => {
+      db.fetchBootstrap().then((data) => {
+        if (cancelled) return;
+        setCompanies(data.companies);
+        setMembers(data.members);
+        setGroups(data.groups);
+        setProjects(data.projects);
+        setExceptions(data.exceptions);
+        setSessions(data.sessions);
+        setEvents(data.events);
+        seenTaskIds.current = new Set(data.tasks.map((t) => t.id));
+        seenTransitionIds.current = new Set(data.transitions.map((t) => t.id));
+        seenReflectionIds.current = new Set(data.reflections.map((r) => r.id));
+        seenHandoffStatus.current = new Map(data.handoffs.map((h) => [h.id, h.status]));
+        dispatch({ type: "INIT", tasks: data.tasks, transitions: data.transitions, reflections: data.reflections, handoffs: data.handoffs });
+        setLoading(false);
+      }).catch((err) => {
+        if (cancelled) return;
+        if (retriesLeft > 0 && /issued at future/i.test(err.message)) {
+          setTimeout(() => { if (!cancelled) load(retriesLeft - 1); }, 1200);
+          return;
+        }
+        setLoadError(err.message);
+        setLoading(false);
+      });
+    };
+    load();
     return () => { cancelled = true; };
   }, []);
 
@@ -1139,6 +1236,7 @@ export default function PuroductiveApp({ session }) {
     { key: "projects", label: "Projects", icon: FolderKanban },
     { key: "team", label: "Team", icon: Users },
     { key: "calendar", label: "Calendar", icon: CalendarDays },
+    { key: "gantt", label: "Gantt", icon: GanttChart },
     { key: "reports", label: "Reports", icon: BarChart3 },
   ];
 
@@ -1309,6 +1407,9 @@ export default function PuroductiveApp({ session }) {
             onDeleteEvent={deleteEvent}
             onOpenDay={(ymd) => setModal({ kind: "dayDetail", date: ymd })}
             onOpenProject={(id) => { setOpenProjectId(id); setView("projects"); }} />
+        )}
+        {view === "gantt" && (
+          <GanttView companies={companies} scopedProjects={scopedProjects} members={members} tasks={engine.tasks} />
         )}
         {view === "reports" && (
           <ReportsView sessions={sessions} tasks={engine.tasks} exceptions={exceptions}
@@ -2463,13 +2564,223 @@ const BarPair = ({ week, cur, prev, max, mesh }) => (
   </div>
 );
 
+/* Horizontal labeled bar per productivity category — the in-app equivalent
+ * of the table-cell bar chart compileProjectReport puts in the .doc export,
+ * so the live view and the downloaded report always agree on the numbers. */
+const StatBar = ({ label, value, max, color }) => (
+  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+    <span style={{ width: 116, flexShrink: 0, fontSize: 11.5, fontWeight: 600, color: T.ink2 }}>{label}</span>
+    <div style={{ flex: 1, height: 12, borderRadius: 999, background: T.lineSoft, overflow: "hidden" }}>
+      <div style={{ height: "100%", borderRadius: 999, width: `${max ? (value / max) * 100 : 0}%`, background: color, transition: "width 400ms cubic-bezier(.22,1,.36,1)" }} />
+    </div>
+    <span className="pd-num" style={{ width: 26, textAlign: "right", fontSize: 12.5, fontWeight: 700, color: T.ink }}>{value}</span>
+  </div>
+);
+
+/* ------------------------------- GANTT VIEW -------------------------------
+ * Timeline bar per task: createdAt → completedAt (or deadline while open),
+ * colored by STATE_META so it reads consistently with TaskRow elsewhere.
+ * Tasks without a deadline can't be placed on an axis, so they're listed
+ * separately rather than drawn as a bar. */
+const GANTT_RANGES = [
+  { key: "30", label: "Next 30 days" },
+  { key: "90", label: "Next 90 days" },
+  { key: "all", label: "All" },
+];
+const GanttView = ({ companies, scopedProjects, members, tasks }) => {
+  const [projectFilter, setProjectFilter] = useState("all");
+  const [assigneeFilter, setAssigneeFilter] = useState("all");
+  const [range, setRange] = useState("30");
+  const [activeStates, setActiveStates] = useState(() => new Set(Object.keys(STATE_META)));
+
+  const toggleState = (key) => setActiveStates((s) => {
+    const next = new Set(s);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
+
+  const filteredProjects = projectFilter === "all"
+    ? scopedProjects
+    : scopedProjects.filter((p) => p.id === projectFilter);
+  const projectIds = new Set(filteredProjects.map((p) => p.id));
+
+  const inScope = tasks.filter((t) =>
+    projectIds.has(t.projectId) &&
+    (assigneeFilter === "all" || t.assigneeId === assigneeFilter) &&
+    activeStates.has(t.state));
+  const dated = inScope.filter((t) => t.deadline);
+  const undated = inScope.filter((t) => !t.deadline);
+
+  const barSpan = (t) => {
+    const start = new Date(t.createdAt || t.deadline + "T00:00:00");
+    const end = new Date(t.completedAt || t.deadline + "T23:59:59");
+    return { start, end: end < start ? start : end };
+  };
+
+  const today = new Date();
+  let rangeStart, rangeEnd;
+  if (range === "all") {
+    const spans = dated.map(barSpan);
+    rangeStart = spans.length ? new Date(Math.min(...spans.map((s) => s.start.getTime()), today.getTime())) : today;
+    rangeEnd = spans.length ? new Date(Math.max(...spans.map((s) => s.end.getTime()), today.getTime())) : new Date(today.getTime() + 30 * 864e5);
+  } else {
+    rangeStart = today;
+    rangeEnd = new Date(today.getTime() + Number(range) * 864e5);
+  }
+  const rangeMs = Math.max(1, rangeEnd.getTime() - rangeStart.getTime());
+  const pctOf = (d) => Math.min(100, Math.max(0, ((d.getTime() - rangeStart.getTime()) / rangeMs) * 100));
+  const todayPct = pctOf(today);
+
+  const visibleDated = range === "all" ? dated : dated.filter((t) => {
+    const { start, end } = barSpan(t);
+    return end >= rangeStart && start <= rangeEnd;
+  });
+
+  const exportCsv = () => {
+    const rows = [["Project", "Company", "Task", "Assignee", "State", "Start", "Deadline", "Completed", "Weight", "Retries"]];
+    for (const t of inScope) {
+      const project = scopedProjects.find((p) => p.id === t.projectId);
+      const company = companies.find((c) => c.id === project?.companyId);
+      const assignee = members.find((m) => m.id === t.assigneeId);
+      rows.push([
+        project?.name ?? "—", company?.name ?? "—", t.title, assignee?.name ?? "Unassigned",
+        STATE_META[t.state]?.label ?? t.state, (t.createdAt || "").slice(0, 10), t.deadline ?? "—",
+        (t.completedAt || "").slice(0, 10), t.weight, t.retryCount,
+      ]);
+    }
+    downloadCsv(rows, `gantt-export-${todayIso()}.csv`);
+  };
+
+  return (
+    <div className="pd-fade-in">
+      <PageHead kicker="Monitoring" title="Gantt Chart"
+        sub="Every task's timeline, filtered your way."
+        action={<Btn small ghost onClick={exportCsv}><Download size={13} /> Export CSV</Btn>} />
+
+      {/* Filters */}
+      <Card style={{ padding: 16, marginBottom: 20, display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>
+        <select style={{ ...inputStyle, width: "auto", minHeight: 38 }} value={projectFilter} onChange={(e) => setProjectFilter(e.target.value)}>
+          <option value="all">All projects</option>
+          {scopedProjects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+        <select style={{ ...inputStyle, width: "auto", minHeight: 38 }} value={assigneeFilter} onChange={(e) => setAssigneeFilter(e.target.value)}>
+          <option value="all">Everyone</option>
+          {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+        </select>
+        <div style={{ display: "flex", gap: 6 }}>
+          {Object.entries(STATE_META).map(([key, meta]) => (
+            <button key={key} onClick={() => toggleState(key)} className="pd-press" style={{
+              minHeight: 30, padding: "0 12px", borderRadius: 9, cursor: "pointer", fontSize: 11.5, fontWeight: 600,
+              border: `1px solid ${activeStates.has(key) ? meta.color + "55" : T.line}`,
+              background: activeStates.has(key) ? meta.bg : "#FFFFFF",
+              color: activeStates.has(key) ? meta.color : T.ink3,
+            }}>{meta.label}</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
+          {GANTT_RANGES.map(({ key, label }) => (
+            <button key={key} onClick={() => setRange(key)} className="pd-press" style={{
+              minHeight: 30, padding: "0 12px", borderRadius: 9, cursor: "pointer", fontSize: 11.5, fontWeight: 600,
+              border: `1px solid ${range === key ? "rgba(36,51,5,0.12)" : T.line}`,
+              background: range === key ? "#F2FADF" : "#FFFFFF",
+              color: range === key ? "#3F6212" : T.ink3,
+            }}>{label}</button>
+          ))}
+        </div>
+      </Card>
+
+      {inScope.length === 0 && <Empty text="No tasks match these filters." />}
+
+      {/* One card per project, one row per dated task */}
+      {filteredProjects.map((p) => {
+        const rows = visibleDated.filter((t) => t.projectId === p.id);
+        if (!rows.length) return null;
+        const company = companies.find((c) => c.id === p.companyId);
+        return (
+          <Card key={p.id} style={{ padding: 20, marginBottom: 14 }}>
+            <SectionHead title={p.name} action={<Chip>{company?.name ?? "—"}</Chip>} />
+            <div style={{ display: "grid", gap: 8 }}>
+              {rows.map((t) => {
+                const { start, end } = barSpan(t);
+                const left = pctOf(start);
+                const width = Math.max(pctOf(end) - left, 1.2);
+                const meta = STATE_META[t.state];
+                const assignee = members.find((m) => m.id === t.assigneeId);
+                return (
+                  <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                    <div style={{ width: 220, flexShrink: 0, minWidth: 0 }}>
+                      <div style={{ fontSize: 12.5, fontWeight: 600, color: T.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.title}</div>
+                      <div style={{ fontSize: 10.5, color: T.ink3, marginTop: 1 }}>{assignee ? assignee.name : "Unassigned"} · due {t.deadline}</div>
+                    </div>
+                    <div style={{ position: "relative", flex: 1, height: 24, borderRadius: 7, background: T.cardSoft, border: `1px solid ${T.lineSoft}`, overflow: "hidden" }}>
+                      {todayPct >= 0 && todayPct <= 100 && (
+                        <div style={{ position: "absolute", top: 0, bottom: 0, left: `${todayPct}%`, width: 1, background: T.ink3, opacity: 0.5, zIndex: 2 }} />
+                      )}
+                      <div title={`${meta.label} · weight ${t.weight}`} style={{
+                        position: "absolute", top: 3, bottom: 3, left: `${left}%`, width: `${width}%`,
+                        borderRadius: 5, background: meta.color, minWidth: 4,
+                      }} />
+                    </div>
+                    <Chip bg={meta.bg} color={meta.color}>{meta.label}</Chip>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        );
+      })}
+
+      {undated.length > 0 && (
+        <>
+          <SectionHead title="No deadline set" />
+          <div style={{ display: "grid", gap: 8, marginBottom: 20 }}>
+            {undated.map((t) => {
+              const project = scopedProjects.find((p) => p.id === t.projectId);
+              const meta = STATE_META[t.state];
+              const assignee = members.find((m) => m.id === t.assigneeId);
+              return (
+                <Card key={t.id} style={{ padding: "12px 18px", display: "flex", alignItems: "center", gap: 12 }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: 600, color: T.ink }}>{t.title}</div>
+                    <div style={{ fontSize: 10.5, color: T.ink3, marginTop: 1 }}>{project?.name ?? "—"} · {assignee ? assignee.name : "Unassigned"}</div>
+                  </div>
+                  <Chip bg={meta.bg} color={meta.color}>{meta.label}</Chip>
+                </Card>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
 const ReportsView = ({ sessions, tasks, exceptions, projects, companies, onExport }) => {
   const [offset, setOffset] = useState(0); // 0 = this month, -1 = last month
+  const [scopeId, setScopeId] = useState("all");
   const cur = computeMonthlyStats({ sessions, tasks, exceptions }, offset);
   const prev = computeMonthlyStats({ sessions, tasks, exceptions }, offset - 1);
   const ahead = cur.velocity >= prev.velocity;
   const maxBucket = Math.max(1, ...cur.buckets, ...prev.buckets);
   const factor = prev.velocity === 0 ? (cur.velocity > 0 ? 100 : 0) : ((cur.velocity - prev.velocity) / prev.velocity) * 100;
+
+  const best = computeAllTimeBest({ sessions, tasks, exceptions });
+  const newBest = best && offset === 0 && cur.velocity >= best.velocity && cur.tasksDone > 0;
+
+  const scopeProject = scopeId === "all" ? null : projects.find((p) => p.id === scopeId);
+  const scopedTasks = scopeId === "all" ? tasks : tasks.filter((t) => t.projectId === scopeId);
+  const breakdown = computeProductivityBreakdown(scopedTasks);
+  const overallProductivity = scopeProject
+    ? Math.round(computeSandStack(scopeProject, scopedTasks).fillPercent)
+    : breakdown.overallProductivity;
+  const breakdownRows = [
+    { label: "Due", value: breakdown.due.length, color: "#8A8F99" },
+    { label: "Overdue", value: breakdown.overdue.length, color: STATE_META.overdue.color },
+    { label: "On time", value: breakdown.onTime.length, color: STATE_META.completed.color },
+    { label: "Early", value: breakdown.early.length, color: T.limeDeep },
+    { label: "Late", value: breakdown.late.length, color: "#D97706" },
+  ];
+  const breakdownMax = Math.max(1, ...breakdownRows.map((r) => r.value));
 
   return (
     <div className="pd-fade-in">
@@ -2518,6 +2829,27 @@ const ReportsView = ({ sessions, tasks, exceptions, projects, companies, onExpor
         </p>
       </Mesh>
 
+      {/* Personal best — the actual self-competition target, not just last month */}
+      {best && (
+        <Card style={{ padding: "16px 20px", marginBottom: 20, display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+          <div style={{ width: 38, height: 38, borderRadius: 12, flexShrink: 0, display: "grid", placeItems: "center",
+            background: newBest ? "#F2FADF" : T.cardSoft, color: newBest ? "#3F6212" : T.ink3 }}>
+            <Trophy size={18} />
+          </div>
+          <div style={{ flex: 1, minWidth: 200 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: T.ink }}>
+              Personal best: <span className="pd-num">{best.velocity.toFixed(1)}</span> weight/week · {best.label}
+            </div>
+            <div style={{ fontSize: 11, color: T.ink3, marginTop: 2 }}>
+              {newBest
+                ? "You're at or above your all-time best this month."
+                : `${cur.label} is running at ${best.velocity ? Math.round((cur.velocity / best.velocity) * 100) : 0}% of your best.`}
+            </div>
+          </div>
+          {newBest && <Chip bg="#F2FADF" color="#3F6212">New personal best!</Chip>}
+        </Card>
+      )}
+
       {/* Stat grid */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 14, marginBottom: 20 }}>
         {[
@@ -2550,6 +2882,28 @@ const ReportsView = ({ sessions, tasks, exceptions, projects, companies, onExpor
           {cur.buckets.map((v, i) => (
             <BarPair key={i} week={i + 1} cur={v} prev={prev.buckets[i]} max={maxBucket} mesh={THEME_PRESETS[0].mesh} />
           ))}
+        </div>
+      </Card>
+
+      {/* Productivity breakdown — real-time (reads live task state), scopable
+       * to a single project. The same numbers land in the .doc export via
+       * compileProjectReport, so what you see here matches what downloads. */}
+      <SectionHead title="Productivity breakdown"
+        action={
+          <select style={{ ...inputStyle, width: "auto", minHeight: 36 }} value={scopeId} onChange={(e) => setScopeId(e.target.value)}>
+            <option value="all">All projects</option>
+            {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        } />
+      <Card style={{ padding: 24, marginBottom: 20 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 18 }}>
+          <span className="pd-num" style={{ fontFamily: T.fontDisplay, fontSize: 32, fontWeight: 700, letterSpacing: "-0.03em" }}>
+            {overallProductivity}%
+          </span>
+          <span style={{ fontSize: 12, color: T.ink3 }}>overall productivity{scopeProject ? ` · ${scopeProject.name}` : ""}</span>
+        </div>
+        <div style={{ display: "grid", gap: 12 }}>
+          {breakdownRows.map((r) => <StatBar key={r.label} {...r} max={breakdownMax} />)}
         </div>
       </Card>
 

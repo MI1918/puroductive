@@ -44,7 +44,7 @@ const rowToProject = (r) => ({
 });
 const rowToTask = (r) => ({
   id: r.id, projectId: r.project_id, title: r.title, assigneeId: r.assignee_id,
-  state: r.state, weight: r.weight, deadline: r.deadline,
+  state: r.state, weight: r.weight, deadline: r.deadline, createdAt: r.created_at,
   retryCount: r.retry_count, completedAt: r.completed_at, completedLate: !!r.completed_late,
 });
 const rowToTransition = (r) => ({
