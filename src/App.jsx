@@ -5,7 +5,8 @@ import {
   Play, PhoneMissed, RotateCcw, UserCheck, CalendarClock, History, ScrollText,
   Ban, Flame, CalendarDays, BarChart3, Bell, Download, LogIn, LogOut, Plane,
   TrendingUp, TrendingDown, Sun, Building2, Pencil, Tag, MapPin, Video,
-  CalendarPlus, Briefcase, Menu, GanttChart, Trophy,
+  CalendarPlus, Briefcase, Menu, GanttChart, Trophy, UserPlus, Star,
+  ChevronsUpDown, Eye, Send, Layers, Palmtree,
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient.js";
 import * as db from "./lib/db.js";
@@ -75,6 +76,43 @@ const STATE_META = {
   retry_pending: { label: "Retry pending", color: "#B45309", bg: "#FDF3E3" },
   overdue:       { label: "Overdue",       color: "#B91C1C", bg: "#FDECEA" },
   completed:     { label: "Completed",     color: "#3F6212", bg: "#F2FADF" },
+};
+
+/* ------------------------- workspace roles (schema_v4) --------------------
+ * Mirrors the check constraint on workspace_members.role. `rank` is what the
+ * UI compares against — a role may only manage roles strictly below its own,
+ * which is what stops an admin from demoting the owner. */
+const ROLE_META = {
+  owner:  { label: "Owner",  rank: 3, hint: "Full control, including deleting the workspace" },
+  admin:  { label: "Admin",  rank: 2, hint: "Can invite people and manage roles" },
+  member: { label: "Member", rank: 1, hint: "Can create and complete work" },
+  viewer: { label: "Viewer", rank: 0, hint: "Read-only — can see everything, change nothing" },
+};
+const canWrite = (role) => ROLE_META[role]?.rank >= 1;
+const canAdmin = (role) => ROLE_META[role]?.rank >= 2;
+
+/* --------------------- calendar day types (schema_v4) ---------------------
+ * holiday/travel predate v4 and mean "the calendar took this day". The two
+ * leave types are a person's own time off and carry a reason, which is what
+ * the month-end leave breakdown groups by. */
+const EXCEPTION_META = {
+  holiday:        { label: "Holiday", short: "Holiday", bg: "#FDEED3", color: "#4A2A03",
+                    mesh: ["#FDEED3", "#FBD38D", "#F6AD55"], leave: false },
+  travel:         { label: "Travel",  short: "Travel",  bg: "#DDF3FE", color: "#062F44",
+                    mesh: ["#DDF3FE", "#A5DFF9", "#67C3F0"], leave: false },
+  leave_declared: { label: "Leave declared (booked ahead)", short: "Leave booked",
+                    bg: "#EEE9FD", color: "#291D52", mesh: ["#EEE9FD", "#D3C6F8", "#B3A0F2"], leave: true },
+  leave_taken:    { label: "Leave taken", short: "Leave taken",
+                    bg: "#FDECEA", color: "#7A1F12", mesh: ["#FDECEA", "#F8C6BD", "#F09A8A"], leave: true },
+};
+export const isLeaveType = (type) => !!EXCEPTION_META[type]?.leave;
+
+/* Who a calendar mark is aimed at (tasks.mark_scope). */
+const MARK_SCOPE_META = {
+  self:   { label: "Just me" },
+  member: { label: "A specific person" },
+  group:  { label: "A group" },
+  team:   { label: "Everyone" },
 };
 
 /* ---------------- engine reducer: tasks + immutable logs ------------------
@@ -175,6 +213,18 @@ export function engineReducer(s, a) {
 
     case "ADD_TASK":
       return { ...s, tasks: [...s.tasks, a.task] };
+
+    /* Calendar marking (see MARK_SCOPE_META). Deliberately outside the
+     * TRANSITIONS table: marking is a display flag, not a lifecycle event, so
+     * it must never consume a state-machine edge or write a transition log. */
+    case "MARK_TASK":
+      return {
+        ...s,
+        tasks: s.tasks.map((x) => (x.id === a.taskId
+          ? { ...x, isMarked: a.isMarked, markLabel: a.markLabel ?? "",
+              markScope: a.markScope ?? null, markTargetId: a.markTargetId ?? null }
+          : x)),
+      };
 
     /* The ONLY delete path — and it refuses anything not completed. */
     case "ARCHIVE_COMPLETED_TASK": {
@@ -278,23 +328,62 @@ export function computeMonthlyStats({ sessions, tasks, exceptions }, offset = 0)
   const weightDone = done.reduce((n, t) => n + t.weight, 0);
   const late = done.filter((t) => t.completedLate).length;
 
-  // Working days = Mon–Sat inside the window; exceptions are lost days.
-  let workingDays = 0, lossDays = 0;
+  /* Working days = Mon–Sat inside the window. Every exception costs a day, but
+   * the two families are counted apart: holiday/travel are days the calendar
+   * took away, leave is a day a person chose to take. Both reduce capacity —
+   * which is why lossFactor sums them — but a month with 8 leave days and a
+   * month with 8 travel days are very different management problems, so the
+   * report needs them separable. */
+  let workingDays = 0, interruptionDays = 0, leaveDays = 0;
+  const leaveEntries = [];
   for (let d = new Date(start); d < end; d.setDate(d.getDate() + 1)) {
     if (d.getDay() === 0) continue;
     workingDays++;
-    if (exceptions.some((x) => x.date === ymdOf(d))) lossDays++;
+    const ymd = ymdOf(d);
+    const onDay = exceptions.filter((x) => x.date === ymd);
+    if (!onDay.length) continue;
+    if (onDay.some((x) => isLeaveType(x.type))) {
+      leaveDays++;
+      for (const x of onDay.filter((e) => isLeaveType(e.type))) leaveEntries.push(x);
+    } else {
+      interruptionDays++;
+    }
   }
+  const lossDays = interruptionDays + leaveDays;
   const lossFactor = workingDays ? lossDays / workingDays : 0;
   const weeks = Math.max(1, (end - start) / (7 * 864e5));
   const velocity = weightDone / weeks; // execution velocity: weight / week
+
+  /* Leave grouped by the stated reason — the month-end answer to "how many
+   * days off, and what for". Unstated reasons collapse into one bucket rather
+   * than being dropped, so nothing goes missing from the totals.
+   *
+   * These are PERSON-days, not calendar days: two people on leave the same
+   * Tuesday is one leaveDay (the calendar lost one day) but two person-days
+   * (the team lost two). Summing the rows below will therefore exceed
+   * leaveDays on any day more than one person was out, which is correct —
+   * they answer different questions and are labelled separately in the UI. */
+  const byReason = new Map();
+  for (const x of leaveEntries) {
+    const key = (x.reason || "").trim() || "No reason given";
+    const cur = byReason.get(key) ?? { reason: key, personDays: 0, declared: 0, taken: 0 };
+    cur.personDays++;
+    if (x.type === "leave_declared") cur.declared++; else cur.taken++;
+    byReason.set(key, cur);
+  }
+  const leaveByReason = [...byReason.values()].sort((a, b) => b.personDays - a.personDays);
+  const leavePersonDays = leaveEntries.length;
 
   // Weekly buckets for the chart (days 1-7, 8-14, 15-21, 22-28, 29+).
   const buckets = [0, 0, 0, 0, 0];
   for (const t of done) {
     buckets[Math.min(4, Math.floor((new Date(t.completedAt).getDate() - 1) / 7))] += t.weight;
   }
-  return { label, hours, tasksDone: done.length, weightDone, late, workingDays, lossDays, lossFactor, velocity, buckets };
+  return {
+    label, hours, tasksDone: done.length, weightDone, late,
+    workingDays, lossDays, lossFactor, velocity, buckets,
+    interruptionDays, leaveDays, leaveByReason, leavePersonDays,
+  };
 }
 
 /* Best-ever month by execution velocity, scanning back from the current
@@ -360,6 +449,17 @@ export function buildAgenda({ events, tasks, projects }, days = 14) {
   items.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
   return items;
 }
+/* Human-readable "who is this task for". A team task names its group; an
+ * individual task names the person. Both fall back to a legible label rather
+ * than an empty string, since this renders inline in task rows. */
+export function taskAudience(task, members, groups = []) {
+  if (task.scope === "team") {
+    const g = groups.find((x) => x.id === task.assigneeGroupId);
+    return g ? `${g.name} (team)` : "Whole team";
+  }
+  return members.find((m) => m.id === task.assigneeId)?.name ?? "Unassigned";
+}
+
 export function relativeDayLabel(ymd) {
   const today = ymdOf(new Date());
   if (ymd === today) return "Today";
@@ -925,6 +1025,18 @@ export default function PuroductiveApp({ session }) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const isMobile = useIsMobile();
 
+  /* --------------------------- workspaces (v4) ----------------------------
+   * The workspace is chosen before any data loads, because every query is
+   * filtered by it. `null` means "still discovering which workspaces this
+   * account belongs to". The last choice is remembered per browser so a
+   * refresh doesn't dump a team member back into their personal workspace. */
+  const [workspaces, setWorkspaces] = useState([]);
+  const [workspaceId, setWorkspaceId] = useState(null);
+  const [memberships, setMemberships] = useState([]);
+  const activeWorkspace = workspaces.find((w) => w.id === workspaceId) ?? null;
+  const myRole = activeWorkspace?.myRole ?? "viewer";
+  const readOnly = !canWrite(myRole);
+
   const toast = (msg, kind = "ok") => {
     const id = uid();
     setToasts((ts) => [...ts, { id, msg, kind }]);
@@ -938,14 +1050,74 @@ export default function PuroductiveApp({ session }) {
   const seenTransitionIds = useRef(new Set());
   const seenReflectionIds = useRef(new Set());
   const seenHandoffStatus = useRef(new Map());
+  /* Step 1 — which workspaces does this account belong to? This also claims
+   * any pending email invites, so a teammate who was invited while signed out
+   * finds the workspace waiting for them on their next sign-in. */
   useEffect(() => {
     let cancelled = false;
+    const load = (retriesLeft = 1) => {
+      db.fetchWorkspaces().then((list) => {
+        if (cancelled) return;
+        if (!list.length) {
+          /* The v4 trigger gives every new signup a personal workspace, so an
+           * empty list means this account predates the migration. Say so
+           * plainly rather than showing an empty app that silently drops
+           * every write. */
+          setLoadError(
+            "No workspace found for this account. If you just ran the schema_v4 migration, " +
+            "make sure it completed without errors — every account needs a personal workspace row."
+          );
+          setLoading(false);
+          return;
+        }
+        const remembered = localStorage.getItem("pd.workspaceId");
+        const pick = list.find((w) => w.id === remembered) ?? list[0];
+        setWorkspaces(list);
+        setWorkspaceId(pick.id);
+      }).catch((err) => {
+        if (cancelled) return;
+        if (retriesLeft > 0 && /issued at future/i.test(err.message)) {
+          setTimeout(() => { if (!cancelled) load(retriesLeft - 1); }, 1200);
+          return;
+        }
+        /* By far the most likely first-run failure: the app has been deployed
+         * but supabase/schema_v4.sql hasn't been run yet, so there is no
+         * workspaces table to read. A raw "relation does not exist" tells the
+         * user nothing actionable, so name the actual fix. */
+        if (/relation .*(workspaces|workspace_members).* does not exist|schema cache/i.test(err.message)) {
+          setLoadError(
+            "This build needs the workspace tables, which aren't in your database yet. " +
+            "Open supabase/schema_v4.sql, read the notes at the top, and run it once in the " +
+            "Supabase SQL editor — it's additive and leaves your existing data in place."
+          );
+        } else {
+          setLoadError(err.message);
+        }
+        setLoading(false);
+      });
+    };
+    load();
+    return () => { cancelled = true; };
+  }, []);
+
+  /* Step 2 — load that workspace's data. Re-runs on every workspace switch,
+   * which is why it resets the "seen" trackers: they describe what's already
+   * in the database for the workspace currently loaded, and carrying them
+   * across a switch would make the persistence watchers below skip rows they
+   * have never actually written. */
+  useEffect(() => {
+    if (!workspaceId) return;
+    let cancelled = false;
+    setLoading(true);
+    db.setActiveWorkspace(workspaceId);
+    localStorage.setItem("pd.workspaceId", workspaceId);
+
     /* Right after sign-in the freshly-minted access token's `iat` can lag a
      * hair behind the clock on whichever Supabase node handles this burst of
      * parallel queries, producing a transient "JWT issued at future" — retry
      * once after a beat instead of making the user refresh manually. */
     const load = (retriesLeft = 1) => {
-      db.fetchBootstrap().then((data) => {
+      Promise.all([db.fetchBootstrap(), db.fetchMemberships(workspaceId)]).then(([data, mems]) => {
         if (cancelled) return;
         setCompanies(data.companies);
         setMembers(data.members);
@@ -954,11 +1126,13 @@ export default function PuroductiveApp({ session }) {
         setExceptions(data.exceptions);
         setSessions(data.sessions);
         setEvents(data.events);
+        setMemberships(mems);
         seenTaskIds.current = new Set(data.tasks.map((t) => t.id));
         seenTransitionIds.current = new Set(data.transitions.map((t) => t.id));
         seenReflectionIds.current = new Set(data.reflections.map((r) => r.id));
         seenHandoffStatus.current = new Map(data.handoffs.map((h) => [h.id, h.status]));
         dispatch({ type: "INIT", tasks: data.tasks, transitions: data.transitions, reflections: data.reflections, handoffs: data.handoffs });
+        setLoadError(null);
         setLoading(false);
       }).catch((err) => {
         if (cancelled) return;
@@ -972,7 +1146,7 @@ export default function PuroductiveApp({ session }) {
     };
     load();
     return () => { cancelled = true; };
-  }, []);
+  }, [workspaceId]);
 
   /* ---- persistence watchers: mirror reducer-driven state into Supabase ---- */
   useEffect(() => {
@@ -1028,20 +1202,31 @@ export default function PuroductiveApp({ session }) {
     db.updateSessionLogout(activeSession.id, logoutAt).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     toast("Clocked out — session logged");
   };
-  /* Cycle a calendar day: none → holiday → travel → none. */
-  const toggleException = (date) => {
-    const cur = exceptions.find((x) => x.date === date);
-    if (!cur) {
-      const id = uid();
-      setExceptions((xs) => [...xs, { id, date, type: "holiday", label: "" }]);
-      db.createException(id, date, "holiday").catch((e) => toast(`Sync failed: ${e.message}`, "error"));
-    } else if (cur.type === "holiday") {
-      setExceptions((xs) => xs.map((x) => (x.date === date ? { ...x, type: "travel" } : x)));
-      db.setExceptionType(cur.id, "travel").catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+  /* Marking a calendar day. This replaced a none → holiday → travel → none
+   * click-cycle: leave has to capture a reason (and optionally whose leave it
+   * is), and there is no way to ask for that from a bare toggle, so the
+   * calendar now opens MarkDayModal and calls back in here. */
+  const saveException = (data) => {
+    const existing = exceptions.find((x) => x.id === data.id) ?? exceptions.find((x) => x.date === data.date);
+    if (existing) {
+      const next = { ...existing, ...data, id: existing.id };
+      setExceptions((xs) => xs.map((x) => (x.id === existing.id ? next : x)));
+      db.updateException(next).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     } else {
-      setExceptions((xs) => xs.filter((x) => x.date !== date));
-      db.removeException(cur.id).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+      const ex = { ...data, id: uid(), label: data.label ?? "" };
+      setExceptions((xs) => [...xs, ex]);
+      db.createException(ex).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     }
+    setModal(null);
+    toast(`${EXCEPTION_META[data.type].short} marked for ${data.date}`);
+  };
+  const clearException = (date) => {
+    const cur = exceptions.find((x) => x.date === date);
+    if (!cur) return;
+    setExceptions((xs) => xs.filter((x) => x.id !== cur.id));
+    db.removeException(cur.id).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    setModal(null);
+    toast("Day mark cleared");
   };
 
   /* ---------------- ENGINE 5 wiring: reminder loop ------------------------ */
@@ -1203,6 +1388,59 @@ export default function PuroductiveApp({ session }) {
     affected.forEach((m) => db.updateMember({ ...m, groupId: null }).catch((e) => toast(`Sync failed: ${e.message}`, "error")));
   };
 
+  /* ------------------------ workspaces & membership ------------------------ */
+  const switchWorkspace = (id) => {
+    if (id === workspaceId) return;
+    /* Reset view state along with the data — an open project id from the old
+     * workspace resolves to nothing in the new one and would render a blank
+     * detail page. */
+    setOpenProjectId(null);
+    setActiveCompanyId("all");
+    setView("dashboard");
+    setModal(null);
+    setWorkspaceId(id);
+    if (isMobile) setSidebarOpen(false);
+  };
+  const addWorkspace = async (name) => {
+    try {
+      const created = await db.createWorkspace("ws-" + uid(), name);
+      setWorkspaces((ws) => [...ws, created]);
+      setModal(null);
+      toast(`Workspace "${name}" created`);
+      switchWorkspace(created.id);
+    } catch (e) {
+      toast(`Could not create workspace: ${e.message}`, "error");
+    }
+  };
+  const invitePerson = async ({ email, role, memberId }) => {
+    try {
+      const created = await db.inviteToWorkspace(workspaceId, email, role, memberId || null);
+      setMemberships((ms) => [...ms, created]);
+      toast(`${email} invited — they'll see this workspace next time they sign in`);
+    } catch (e) {
+      toast(e.message, "error");
+    }
+  };
+  const changeRole = async (m, role) => {
+    setMemberships((ms) => ms.map((x) => (x.id === m.id ? { ...x, role } : x)));
+    try { await db.updateMembershipRole(m.id, role); toast(`${m.email} is now ${ROLE_META[role].label.toLowerCase()}`); }
+    catch (e) { toast(`Sync failed: ${e.message}`, "error"); }
+  };
+  const removePerson = async (m) => {
+    setMemberships((ms) => ms.filter((x) => x.id !== m.id));
+    try { await db.removeMembership(m.id); toast(`${m.email} removed from this workspace`); }
+    catch (e) { toast(`Sync failed: ${e.message}`, "error"); }
+  };
+
+  /* --------------------------- task calendar marks -------------------------- */
+  const saveTaskMark = (taskId, mark) => {
+    dispatch({ type: "MARK_TASK", taskId, ...mark });
+    const t = engine.tasks.find((x) => x.id === taskId);
+    if (t) db.updateTaskMark({ ...t, ...mark }).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    setModal(null);
+    toast(mark.isMarked ? "Task marked on the calendar" : "Mark removed");
+  };
+
   /* --------------------------- calendar events CRUD ------------------------- */
   const saveEvent = (data) => {
     if (data.id) {
@@ -1235,6 +1473,7 @@ export default function PuroductiveApp({ session }) {
     { key: "companies", label: "Companies", icon: Building2 },
     { key: "projects", label: "Projects", icon: FolderKanban },
     { key: "team", label: "Team", icon: Users },
+    { key: "people", label: "People & access", icon: UserPlus },
     { key: "calendar", label: "Calendar", icon: CalendarDays },
     { key: "gantt", label: "Gantt", icon: GanttChart },
     { key: "reports", label: "Reports", icon: BarChart3 },
@@ -1309,6 +1548,9 @@ export default function PuroductiveApp({ session }) {
             {isMobile && <IconBtn label="Close menu" onClick={() => setSidebarOpen(false)}><X size={15} /></IconBtn>}
           </div>
 
+          <WorkspaceSwitcher workspaces={workspaces} activeId={workspaceId} myRole={myRole}
+            onSwitch={switchWorkspace} onCreate={() => setModal({ kind: "workspace" })} />
+
           <nav style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             {NAV.map(({ key, label, icon: Icon }) => {
               const active = view === key;
@@ -1366,6 +1608,18 @@ export default function PuroductiveApp({ session }) {
 
       {/* ------------------------------- MAIN ------------------------------ */}
       <main className="pd-scroll" style={{ flex: 1, padding: isMobile ? "20px 16px 48px" : "34px 40px 60px", maxWidth: 1220, margin: "0 auto", width: "100%" }}>
+        {/* A viewer's writes are refused by RLS at the database, so without
+          * this they'd click Add, see nothing happen, and have no idea why. */}
+        {readOnly && (
+          <Card soft style={{ padding: "12px 16px", marginBottom: 18, display: "flex", alignItems: "center", gap: 11,
+            border: `1px solid ${T.line}` }}>
+            <Eye size={15} style={{ color: T.ink3, flexShrink: 0 }} />
+            <span style={{ fontSize: 12.5, color: T.ink2, lineHeight: 1.55 }}>
+              You have <strong>viewer</strong> access to {activeWorkspace?.name}. You can read everything here,
+              but changes won't save — ask an admin for member access.
+            </span>
+          </Card>
+        )}
         {view === "dashboard" && (
           <Dashboard {...{ companies, projects, members, engine, theme }}
             openProject={(id) => { setOpenProjectId(id); setView("projects"); }} />
@@ -1382,11 +1636,12 @@ export default function PuroductiveApp({ session }) {
             onCreate={() => setModal({ kind: "project", data: null })} />
         )}
         {view === "projects" && openProject && (
-          <ProjectDetail project={openProject} companies={companies} members={members} engine={engine}
+          <ProjectDetail project={openProject} companies={companies} members={members} groups={groups} engine={engine}
             onBack={() => setOpenProjectId(null)}
             tryTransition={tryTransition} attemptDelete={attemptDelete}
             onReassign={(t) => setModal({ kind: "reassign", taskId: t.id })}
             onReschedule={(t) => setModal({ kind: "reschedule", taskId: t.id })}
+            onMark={(t) => setModal({ kind: "markTask", task: t })}
             onAddTask={() => setModal({ kind: "task", projectId: openProject.id })}
             onExport={() => exportProject(openProject)} />
         )}
@@ -1397,14 +1652,25 @@ export default function PuroductiveApp({ session }) {
             onDeleteMember={deleteMember}
             onManageGroups={() => setModal({ kind: "groupsManage" })} />
         )}
+        {view === "people" && (
+          <PeopleView memberships={memberships} members={members} workspace={activeWorkspace} myRole={myRole}
+            myEmail={session?.user?.email}
+            onInvite={invitePerson} onChangeRole={changeRole} onRemove={removePerson}
+            onRename={(name) => {
+              setWorkspaces((ws) => ws.map((w) => (w.id === workspaceId ? { ...w, name } : w)));
+              db.renameWorkspace(workspaceId, name).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+              toast("Workspace renamed");
+            }} />
+        )}
         {view === "calendar" && (
-          <CalendarView exceptions={exceptions} toggleException={toggleException}
+          <CalendarView exceptions={exceptions}
             sessions={sessions} activeSession={activeSession} clockIn={clockIn} clockOut={clockOut}
             tasks={engine.tasks} alertsOn={alertsOn} enableAlerts={enableAlerts}
-            events={events} projects={projects} companies={companies} members={members}
+            events={events} projects={projects} companies={companies} members={members} groups={groups}
             onAddEvent={(date) => setModal({ kind: "event", data: null, date })}
             onEditEvent={(ev) => setModal({ kind: "event", data: ev })}
             onDeleteEvent={deleteEvent}
+            onMarkDay={(ymd) => setModal({ kind: "markDay", date: ymd })}
             onOpenDay={(ymd) => setModal({ kind: "dayDetail", date: ymd })}
             onOpenProject={(id) => { setOpenProjectId(id); setView("projects"); }} />
         )}
@@ -1442,7 +1708,7 @@ export default function PuroductiveApp({ session }) {
           onConfirm={(d) => { tryTransition(modal.taskId, "RESCHEDULE", { newDeadline: d }); setModal(null); }} />
       )}
       {!interventionTask && modal?.kind === "task" && (
-        <TaskForm projectId={modal.projectId} members={members} onSave={addTask} onClose={() => setModal(null)} />
+        <TaskForm projectId={modal.projectId} members={members} groups={groups} onSave={addTask} onClose={() => setModal(null)} />
       )}
       {!interventionTask && modal?.kind === "project" && (
         <ProjectForm data={modal.data} companies={companies} defaultCompanyId={activeCompanyId}
@@ -1463,17 +1729,83 @@ export default function PuroductiveApp({ session }) {
           onSave={saveEvent} onClose={() => setModal(null)} />
       )}
       {!interventionTask && modal?.kind === "dayDetail" && (
-        <DayDetailModal date={modal.date} exceptions={exceptions} toggleException={toggleException}
+        <DayDetailModal date={modal.date} exceptions={exceptions}
           events={events} tasks={engine.tasks} projects={projects} companies={companies} members={members}
           onAddEvent={(date) => setModal({ kind: "event", data: null, date })}
           onEditEvent={(ev) => setModal({ kind: "event", data: ev })}
           onDeleteEvent={deleteEvent}
+          onMarkDay={(date) => setModal({ kind: "markDay", date })}
+          onMarkTask={(t) => setModal({ kind: "markTask", task: t })}
           onOpenProject={(id) => { setOpenProjectId(id); setView("projects"); setModal(null); }}
           onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "markDay" && (
+        <MarkDayModal date={modal.date} existing={exceptions.find((x) => x.date === modal.date)}
+          members={members} onSave={saveException} onClear={clearException} onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "markTask" && (
+        <MarkTaskModal task={modal.task} members={members} groups={groups}
+          onSave={(mark) => saveTaskMark(modal.task.id, mark)} onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "workspace" && (
+        <WorkspaceForm onSave={addWorkspace} onClose={() => setModal(null)} />
       )}
     </div>
   );
 }
+
+/* ---------------------- WORKSPACE SWITCHER (sidebar) -----------------------
+ * Collapsed to a single row until clicked — a solo user has exactly one
+ * workspace and shouldn't be made to look at a list of one. */
+const WorkspaceSwitcher = ({ workspaces, activeId, myRole, onSwitch, onCreate }) => {
+  const [open, setOpen] = useState(false);
+  const active = workspaces.find((w) => w.id === activeId);
+  if (!active) return null;
+  return (
+    <div style={{ marginBottom: 22 }}>
+      <Label>Workspace</Label>
+      <button onClick={() => setOpen((o) => !o)} className="pd-press" style={{
+        display: "flex", alignItems: "center", gap: 9, width: "100%", minHeight: 40, padding: "0 11px",
+        borderRadius: 11, cursor: "pointer", textAlign: "left",
+        border: `1px solid ${T.line}`, background: T.cardSoft,
+      }}>
+        <Layers size={14} style={{ color: T.limeDeep, flexShrink: 0 }} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: T.ink,
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{active.name}</div>
+          <div style={{ fontSize: 10, color: T.ink3, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+            {active.kind === "personal" ? "Personal" : ROLE_META[myRole]?.label ?? myRole}
+          </div>
+        </div>
+        <ChevronsUpDown size={13} style={{ color: T.ink3, flexShrink: 0 }} />
+      </button>
+      {open && (
+        <div style={{ marginTop: 5, display: "flex", flexDirection: "column", gap: 3 }}>
+          {workspaces.map((w) => (
+            <button key={w.id} onClick={() => { onSwitch(w.id); setOpen(false); }} className="pd-press" style={{
+              display: "flex", alignItems: "center", gap: 8, minHeight: 34, padding: "0 11px",
+              borderRadius: 9, cursor: "pointer", textAlign: "left", fontSize: 12,
+              fontWeight: w.id === activeId ? 600 : 450, color: w.id === activeId ? T.ink : T.ink2,
+              background: w.id === activeId ? T.bg : "transparent",
+              border: `1px solid ${w.id === activeId ? T.line : "transparent"}`,
+            }}>
+              {w.kind === "personal" ? <Lock size={10} style={{ color: T.ink3, flexShrink: 0 }} />
+                                     : <Users size={10} style={{ color: T.ink3, flexShrink: 0 }} />}
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{w.name}</span>
+            </button>
+          ))}
+          <button onClick={() => { onCreate(); setOpen(false); }} className="pd-press" style={{
+            display: "flex", alignItems: "center", gap: 8, minHeight: 34, padding: "0 11px",
+            borderRadius: 9, cursor: "pointer", textAlign: "left", fontSize: 12,
+            color: T.limeDeep, fontWeight: 600, background: "transparent", border: "1px solid transparent",
+          }}>
+            <Plus size={11} style={{ flexShrink: 0 }} /> New workspace
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
 
 /* ------------------------ OPEN HANDOFFS (sidebar) -------------------------- */
 const OpenHandoffsPanel = ({ handoffs, tasks, members }) => {
@@ -1615,7 +1947,7 @@ const ProjectsList = ({ projects, companies, engine, onOpen, onCreate }) => (
 );
 
 /* ============================ PROJECT DETAIL ============================== */
-const ProjectDetail = ({ project, companies, members, engine, onBack, tryTransition, attemptDelete, onReassign, onReschedule, onAddTask, onExport }) => {
+const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onAddTask, onExport }) => {
   const isMobile = useIsMobile();
   const c = companies.find((x) => x.id === project.companyId);
   const theme = c?.theme ?? THEME_PRESETS[0];
@@ -1696,9 +2028,9 @@ const ProjectDetail = ({ project, companies, members, engine, onBack, tryTransit
         {/* RIGHT — tasks with state-machine actions */}
         <div style={{ display: "grid", gap: 10 }}>
           {tasks.map((t) => (
-            <TaskRow key={t.id} t={t} members={members}
+            <TaskRow key={t.id} t={t} members={members} groups={groups}
               tryTransition={tryTransition} attemptDelete={attemptDelete}
-              onReassign={onReassign} onReschedule={onReschedule}
+              onReassign={onReassign} onReschedule={onReschedule} onMark={onMark}
               hasReflection={engine.reflections.some((r) => r.taskId === t.id)} />
           ))}
           {tasks.length === 0 && <Empty text="No tasks yet — add the first one." />}
@@ -1709,9 +2041,8 @@ const ProjectDetail = ({ project, companies, members, engine, onBack, tryTransit
 };
 
 /* ------------------------------- TASK ROW --------------------------------- */
-const TaskRow = ({ t, members, tryTransition, attemptDelete, onReassign, onReschedule, hasReflection }) => {
+const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign, onReschedule, onMark, hasReflection }) => {
   const meta = STATE_META[t.state];
-  const m = members.find((x) => x.id === t.assigneeId);
   const acts = [];
   if (TRANSITIONS[t.state].START) acts.push({ k: "START", label: "Start", icon: Play, run: () => tryTransition(t.id, "START") });
   if (TRANSITIONS[t.state].COMPLETE) acts.push({
@@ -1733,13 +2064,19 @@ const TaskRow = ({ t, members, tryTransition, attemptDelete, onReassign, onResch
             <span style={{ fontSize: 13.5, fontWeight: 600, color: t.state === "completed" ? T.ink3 : T.ink,
               textDecoration: t.state === "completed" ? "line-through" : "none" }}>{t.title}</span>
             <Chip bg={meta.bg} color={meta.color}>{meta.label}</Chip>
+            {t.scope === "team" && <Chip bg="#EAF6FE" color="#0284C7"><Users size={10} /> Team</Chip>}
+            {t.isMarked && <Chip bg="#FDF3E3" color="#B45309"><Star size={10} /> Marked</Chip>}
             {t.completedLate && <Chip bg="#FDF3E3" color="#B45309">Completed late</Chip>}
             {t.retryCount > 0 && t.state !== "completed" && <Chip>{t.retryCount} failed attempt{t.retryCount > 1 ? "s" : ""}</Chip>}
           </div>
           <div className="pd-num" style={{ fontSize: 11.5, color: T.ink3, marginTop: 5 }}>
-            {m ? m.name : "Unassigned"}{t.deadline ? ` · due ${t.deadline}` : ""} · weight {t.weight}
+            {taskAudience(t, members, groups)}{t.deadline ? ` · due ${t.deadline}` : ""} · weight {t.weight}
+            {t.isMarked && t.markLabel ? ` · ${t.markLabel}` : ""}
           </div>
         </div>
+        <IconBtn onClick={() => onMark(t)} label={t.isMarked ? "Edit calendar mark" : "Mark on calendar"}>
+          <Star size={13.5} style={t.isMarked ? { color: "#D97706", fill: "#D97706" } : undefined} />
+        </IconBtn>
         <IconBtn onClick={() => attemptDelete(t)} label={t.state === "completed" ? "Archive task" : "Delete (will be refused)"} danger>
           <Trash2 size={13.5} />
         </IconBtn>
@@ -1758,31 +2095,82 @@ const TaskRow = ({ t, members, tryTransition, attemptDelete, onReassign, onResch
 };
 
 /* ------------------------------ TASK FORM --------------------------------- */
-const TaskForm = ({ projectId, members, onSave, onClose }) => {
-  const [f, setF] = useState({ title: "", assigneeId: members[0]?.id ?? "", deadline: "", weight: 1 });
+const TaskForm = ({ projectId, members, groups, onSave, onClose }) => {
+  const [f, setF] = useState({
+    title: "", scope: "individual", assigneeId: members[0]?.id ?? "",
+    assigneeGroupId: groups[0]?.id ?? "", deadline: "", weight: 1,
+  });
+  const team = f.scope === "team";
   return (
     <Modal title="Add task" subtitle="A new grain for the stack" onClose={onClose}>
       <div style={{ display: "grid", gap: 18 }}>
         <div><Label>Title</Label>
           <input style={inputStyle} value={f.title} onChange={(e) => setF({ ...f, title: e.target.value })} placeholder="e.g. Call vendor for quotation" /></div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(90px, 1fr))", gap: 12 }}>
-          <div><Label>Assignee</Label>
-            <select style={inputStyle} value={f.assigneeId} onChange={(e) => setF({ ...f, assigneeId: e.target.value })}>
-              <option value="">Unassigned</option>
-              {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
-            </select></div>
+
+        {/* Individual vs team is a two-button choice rather than a dropdown —
+          * it changes which assignee field is shown below it, and a visible
+          * switch makes that consequence obvious. */}
+        <div>
+          <Label>Task type</Label>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            {[
+              { key: "individual", label: "Individual", icon: UserCheck, hint: "One person owns it" },
+              { key: "team", label: "Team", icon: Users, hint: "A group owns it together" },
+            ].map(({ key, label, icon: Icon, hint }) => {
+              const on = f.scope === key;
+              return (
+                <button key={key} type="button" onClick={() => setF({ ...f, scope: key })} className="pd-press" style={{
+                  display: "flex", alignItems: "center", gap: 9, padding: "11px 13px", borderRadius: 11,
+                  cursor: "pointer", textAlign: "left",
+                  background: on ? "#F4FBE3" : "#FFFFFF", border: `1px solid ${on ? "#C9E88A" : T.line}`,
+                }}>
+                  <Icon size={15} style={{ color: on ? T.limeDeep : T.ink3, flexShrink: 0 }} />
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: on ? 600 : 450, color: T.ink }}>{label}</div>
+                    <div style={{ fontSize: 10.5, color: T.ink3, marginTop: 1 }}>{hint}</div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 12 }}>
+          {team ? (
+            <div><Label>Group</Label>
+              <select style={inputStyle} value={f.assigneeGroupId} onChange={(e) => setF({ ...f, assigneeGroupId: e.target.value })}>
+                <option value="">Whole team</option>
+                {groups.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+              </select></div>
+          ) : (
+            <div><Label>Assignee</Label>
+              <select style={inputStyle} value={f.assigneeId} onChange={(e) => setF({ ...f, assigneeId: e.target.value })}>
+                <option value="">Unassigned</option>
+                {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select></div>
+          )}
           <div><Label>Deadline</Label>
             <input type="date" style={inputStyle} value={f.deadline} onChange={(e) => setF({ ...f, deadline: e.target.value })} /></div>
           <div><Label>Weight</Label>
             <input type="number" min={1} max={10} style={inputStyle} value={f.weight}
               onChange={(e) => setF({ ...f, weight: Math.max(1, Math.min(10, +e.target.value || 1)) })} /></div>
         </div>
+        {team && (
+          <p style={{ margin: 0, fontSize: 11.5, color: T.ink3, lineHeight: 1.55 }}>
+            A team task can still be handed to one person to execute — reassigning it does not
+            change it back into individual work, so month-end reporting keeps counting it as team output.
+          </p>
+        )}
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
           <Btn ghost onClick={onClose}>Cancel</Btn>
           <Btn disabled={!f.title.trim()} onClick={() => onSave({
             id: "t-" + uid(), projectId, title: f.title.trim(), state: "pending",
-            assigneeId: f.assigneeId || null, deadline: f.deadline || null, weight: f.weight,
+            scope: f.scope,
+            assigneeId: team ? null : (f.assigneeId || null),
+            assigneeGroupId: team ? (f.assigneeGroupId || null) : null,
+            deadline: f.deadline || null, weight: f.weight,
             retryCount: 0, completedAt: null, completedLate: false,
+            isMarked: false, markLabel: "", markScope: null, markTargetId: null,
           })}><Check size={15} /> Add task</Btn>
         </div>
       </div>
@@ -2167,6 +2555,157 @@ const GroupsManageModal = ({ groups, onSave, onDelete, onClose }) => {
 };
 
 /* ============================================================================
+ * PEOPLE & ACCESS — who can actually sign in and see this workspace
+ *
+ * The distinction that trips people up: TeamView's roster (team_members) is
+ * "names I can assign work to", and can include people with no account at
+ * all. This screen is "accounts that can open this workspace". Inviting
+ * someone optionally links the two, so a roster entry becomes a real person.
+ * ==========================================================================*/
+const PeopleView = ({ memberships, members, workspace, myRole, myEmail, onInvite, onChangeRole, onRemove, onRename }) => {
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState("member");
+  const [memberId, setMemberId] = useState("");
+  const [name, setName] = useState(workspace?.name ?? "");
+  const admin = canAdmin(myRole);
+  const personal = workspace?.kind === "personal";
+  const emailValid = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim());
+  /* Roster entries nobody has been invited as yet — the useful ones to offer,
+   * since re-linking an already-invited entry would just fail the unique index. */
+  const linkedIds = new Set(memberships.map((m) => m.memberId).filter(Boolean));
+  const unlinked = members.filter((m) => !linkedIds.has(m.id));
+
+  const submit = () => {
+    onInvite({ email: email.trim(), role, memberId: memberId || null });
+    setEmail(""); setMemberId(""); setRole("member");
+  };
+
+  return (
+    <div className="pd-fade-in">
+      <PageHead kicker="Workspace access" title="People & access"
+        sub="Invite teammates by email. They sign up (or sign in) and this workspace appears for them — their existing personal workspace stays untouched." />
+
+      {personal && (
+        <Card soft style={{ padding: "14px 18px", marginBottom: 18, display: "flex", gap: 11, alignItems: "flex-start" }}>
+          <Lock size={15} style={{ color: T.ink3, flexShrink: 0, marginTop: 1 }} />
+          <div style={{ fontSize: 12.5, color: T.ink2, lineHeight: 1.6 }}>
+            This is your <strong>personal</strong> workspace — it is private to you and cannot be shared.
+            Create a team workspace from the switcher in the sidebar to start collaborating.
+          </div>
+        </Card>
+      )}
+
+      {!personal && admin && (
+        <Card style={{ padding: 22, marginBottom: 20 }}>
+          <SectionHead title="Invite someone" />
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 14, marginBottom: 14 }}>
+            <div><Label>Email address</Label>
+              <input style={inputStyle} value={email} type="email" placeholder="teammate@company.com"
+                onChange={(e) => setEmail(e.target.value)} /></div>
+            <div><Label>Role</Label>
+              <select style={inputStyle} value={role} onChange={(e) => setRole(e.target.value)}>
+                {Object.entries(ROLE_META)
+                  /* You can only grant a role below your own — otherwise an
+                   * admin could mint a second owner and lock the first out. */
+                  .filter(([key]) => ROLE_META[key].rank < ROLE_META[myRole].rank)
+                  .map(([key, meta]) => <option key={key} value={key}>{meta.label}</option>)}
+              </select></div>
+            <div><Label>Link to roster entry (optional)</Label>
+              <select style={inputStyle} value={memberId} onChange={(e) => setMemberId(e.target.value)}>
+                <option value="">Don't link</option>
+                {unlinked.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select></div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 11.5, color: T.ink3, lineHeight: 1.55, maxWidth: 460 }}>
+              {ROLE_META[role].hint}. Linking to a roster entry means tasks already assigned to that
+              name become theirs.
+            </span>
+            <Btn disabled={!emailValid} onClick={submit}><Send size={14} /> Send invite</Btn>
+          </div>
+        </Card>
+      )}
+
+      <SectionHead title={`${memberships.length} ${memberships.length === 1 ? "person" : "people"}`} />
+      <div style={{ display: "grid", gap: 8 }}>
+        {memberships.map((m) => {
+          const linked = members.find((x) => x.id === m.memberId);
+          const isMe = (m.email || "").toLowerCase() === (myEmail || "").toLowerCase();
+          /* Nobody may act on a peer or a superior — that is what keeps an
+           * admin from demoting the owner or removing another admin. */
+          const manageable = admin && !isMe && ROLE_META[m.role].rank < ROLE_META[myRole].rank;
+          return (
+            <Card key={m.id} style={{ padding: "13px 16px", display: "flex", alignItems: "center", gap: 13, flexWrap: "wrap" }}>
+              <div style={{ width: 32, height: 32, borderRadius: 99, flexShrink: 0, display: "grid", placeItems: "center",
+                background: T.bg, border: `1px solid ${T.line}`, fontSize: 12, fontWeight: 600, color: T.ink2 }}>
+                {(linked?.name ?? m.email ?? "?").slice(0, 1).toUpperCase()}
+              </div>
+              <div style={{ flex: 1, minWidth: 150 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>
+                  {linked?.name ?? m.email}{isMe && <span style={{ color: T.ink3, fontWeight: 450 }}> · you</span>}
+                </div>
+                <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
+                  {linked ? m.email : ROLE_META[m.role].hint}
+                </div>
+              </div>
+              {m.status === "invited" && <Chip bg="#FDF3E3" color="#B45309">Invite pending</Chip>}
+              {manageable ? (
+                <select value={m.role} onChange={(e) => onChangeRole(m, e.target.value)}
+                  style={{ ...inputStyle, width: "auto", minWidth: 108, height: 34, fontSize: 12, padding: "0 10px" }}>
+                  {Object.entries(ROLE_META)
+                    .filter(([key]) => ROLE_META[key].rank < ROLE_META[myRole].rank)
+                    .map(([key, meta]) => <option key={key} value={key}>{meta.label}</option>)}
+                </select>
+              ) : (
+                <Chip bg={m.role === "viewer" ? "#F3F3EE" : "#F2FADF"} color={m.role === "viewer" ? "#5A5F69" : "#3F6212"}>
+                  {m.role === "viewer" ? <Eye size={10} /> : <ShieldCheck size={10} />} {ROLE_META[m.role].label}
+                </Chip>
+              )}
+              {manageable && <IconBtn label={`Remove ${m.email}`} danger onClick={() => onRemove(m)}><Trash2 size={13} /></IconBtn>}
+            </Card>
+          );
+        })}
+        {memberships.length === 0 && <Empty text="Nobody here yet." />}
+      </div>
+
+      {!personal && admin && (
+        <>
+          <SectionHead title="Workspace settings" />
+          <Card style={{ padding: 22, display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap" }}>
+            <div style={{ flex: 1, minWidth: 200 }}>
+              <Label>Workspace name</Label>
+              <input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} />
+            </div>
+            <Btn ghost disabled={!name.trim() || name === workspace?.name} onClick={() => onRename(name.trim())}>
+              <Check size={14} /> Rename
+            </Btn>
+          </Card>
+        </>
+      )}
+    </div>
+  );
+};
+
+/* --------------------------- NEW WORKSPACE FORM ----------------------------- */
+const WorkspaceForm = ({ onSave, onClose }) => {
+  const [name, setName] = useState("");
+  return (
+    <Modal title="New workspace" onClose={onClose}
+      subtitle="A shared space with its own companies, projects, team and calendar. Nothing is copied across from your other workspaces.">
+      <div style={{ display: "grid", gap: 18 }}>
+        <div><Label>Workspace name</Label>
+          <input style={inputStyle} value={name} autoFocus onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. Jhydro Interiors — Site Team" /></div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          <Btn ghost onClick={onClose}>Cancel</Btn>
+          <Btn disabled={!name.trim()} onClick={() => onSave(name.trim())}><Check size={15} /> Create</Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+/* ============================================================================
  * CALENDAR WORKSPACE — clock-in/out, holiday & travel logging, alert controls
  * ==========================================================================*/
 const ClockTicker = ({ since }) => {
@@ -2183,8 +2722,8 @@ const EVENT_TYPE_META = {
   other: { label: "Other", icon: CalendarClock, color: "#5A5F69", bg: "#F3F3EE" },
 };
 
-const CalendarView = ({ exceptions, toggleException, sessions, activeSession, clockIn, clockOut, tasks, alertsOn, enableAlerts,
-  events, projects, companies, members, onAddEvent, onEditEvent, onDeleteEvent, onOpenDay, onOpenProject }) => {
+const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, tasks, alertsOn, enableAlerts,
+  events, projects, companies, members, groups, onAddEvent, onEditEvent, onDeleteEvent, onMarkDay, onOpenDay, onOpenProject }) => {
   const isMobile = useIsMobile();
   const stats = computeMonthlyStats({ sessions, tasks, exceptions }, 0);
   const { start, end, label } = monthWindow(0);
@@ -2195,6 +2734,7 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
   const monthSessions = sessions.filter((s) => new Date(s.loginAt) >= start && new Date(s.loginAt) < end);
   const exFor = (ymd) => exceptions.find((x) => x.date === ymd);
   const todaysTasks = tasksDueOn(tasks, today);
+  const markedTasks = tasks.filter((t) => t.isMarked && t.state !== "completed");
   const agenda = buildAgenda({ events, tasks, projects }, 14);
 
   return (
@@ -2203,6 +2743,7 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
         sub="Tap a day to see its schedule — meetings, visits, task deadlines, and mark holiday/travel."
         action={<div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <Btn ghost onClick={enableAlerts}><Bell size={14} /> {alertsOn ? "Alerts on · test chime" : "Enable native alerts"}</Btn>
+          <Btn ghost onClick={() => onMarkDay(today)}><Palmtree size={14} /> Mark a day</Btn>
           <Btn onClick={() => onAddEvent(today)}><CalendarPlus size={14} /> Add event</Btn>
         </div>} />
 
@@ -2231,31 +2772,69 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
           <div className="pd-num" style={{ marginTop: 6, fontSize: 11.5, color: T.ink3 }}>{stats.lossDays} of {stats.workingDays} working days interrupted</div>
         </Card>
         <Card style={{ padding: "20px 22px" }}>
-          <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3, marginBottom: 10 }}>Today's tasks</div>
-          {todaysTasks.length === 0
-            ? <div style={{ fontSize: 12, color: T.ink3 }}>Nothing due today.</div>
-            : <div style={{ display: "grid", gap: 6 }}>
-                {todaysTasks.slice(0, 4).map((t) => {
-                  const p = projects.find((x) => x.id === t.projectId);
-                  const m = members.find((x) => x.id === t.assigneeId);
-                  return (
-                    <div key={t.id} style={{ fontSize: 11.5, color: T.ink2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      <strong style={{ color: T.ink }}>{t.title}</strong> · {p?.name ?? "—"}{m ? ` · ${m.name}` : ""}
-                    </div>
-                  );
-                })}
-                {todaysTasks.length > 4 && <div style={{ fontSize: 11, color: T.ink3 }}>+{todaysTasks.length - 4} more</div>}
-              </div>}
+          <div className="pd-num" style={{ fontFamily: T.fontDisplay, fontSize: 34, fontWeight: 600, letterSpacing: "-0.03em",
+            color: stats.leaveDays > 0 ? "#7C5CDB" : T.ink }}>{stats.leaveDays}</div>
+          <div style={{ marginTop: 8, fontSize: 11, fontWeight: 500, letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3 }}>Leave days · {label}</div>
+          <div className="pd-num" style={{ marginTop: 6, fontSize: 11.5, color: T.ink3 }}>
+            {stats.interruptionDays} holiday/travel · {stats.leaveByReason.length} reason{stats.leaveByReason.length !== 1 ? "s" : ""}
+          </div>
         </Card>
       </div>
+
+      {/* ------------------------- TODAY, front and centre -------------------
+        * Item 3's "tasks that have to be done today must be highlighted": a
+        * dedicated panel above the grid rather than a stat tile, because a
+        * count is not actionable and a list is. */}
+      <Card soft style={{ padding: isMobile ? 16 : "20px 24px", marginBottom: 20,
+        border: `1.5px solid ${T.limeDeep}`, boxShadow: "0 0 0 4px rgba(124,181,24,0.12)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: todaysTasks.length ? 14 : 0, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+            <CalendarClock size={16} style={{ color: T.limeDeep }} />
+            <h2 style={{ margin: 0, fontFamily: T.fontDisplay, fontSize: 16, fontWeight: 600, letterSpacing: "-0.02em" }}>
+              Due today
+            </h2>
+            <span className="pd-num" style={{ fontSize: 11.5, color: T.ink3 }}>{today}</span>
+          </div>
+          {markedTasks.length > 0 && (
+            <Chip bg="#FDF3E3" color="#B45309"><Star size={10} /> {markedTasks.length} marked</Chip>
+          )}
+        </div>
+        {todaysTasks.length === 0
+          ? <div style={{ fontSize: 12.5, color: T.ink3 }}>Nothing due today — the day is yours.</div>
+          : <div style={{ display: "grid", gap: 8 }}>
+              {todaysTasks.map((t) => {
+                const p = projects.find((x) => x.id === t.projectId);
+                const who = taskAudience(t, members, groups);
+                const meta = STATE_META[t.state];
+                return (
+                  <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 11, flexWrap: "wrap",
+                    padding: "10px 13px", borderRadius: 10, background: "#FFFFFF", border: `1px solid ${t.isMarked ? "#F3D19E" : T.line}` }}>
+                    {t.isMarked && <Star size={12} style={{ color: "#D97706", fill: "#D97706", flexShrink: 0 }} />}
+                    <div style={{ flex: 1, minWidth: 140 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{t.title}</div>
+                      <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
+                        {p?.name ?? "—"} · {who}{t.markLabel ? ` · ${t.markLabel}` : ""}
+                      </div>
+                    </div>
+                    <Chip bg={t.scope === "team" ? "#EAF6FE" : "#F3F3EE"} color={t.scope === "team" ? "#0284C7" : "#5A5F69"}>
+                      {t.scope === "team" ? <Users size={10} /> : <UserCheck size={10} />} {t.scope === "team" ? "Team" : "Individual"}
+                    </Chip>
+                    <Chip bg={meta.bg} color={meta.color}>{meta.label}</Chip>
+                  </div>
+                );
+              })}
+            </div>}
+      </Card>
 
       {/* Month grid */}
       <Card style={{ padding: isMobile ? 12 : 24, marginBottom: 20 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
           <h2 style={{ margin: 0, fontFamily: T.fontDisplay, fontSize: 17, fontWeight: 600, letterSpacing: "-0.02em" }}>{label}</h2>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <Chip bg="#FDEED3" color="#4A2A03"><Sun size={10} /> Holiday</Chip>
-            <Chip bg="#DDF3FE" color="#062F44"><Plane size={10} /> Travel</Chip>
+            <Chip bg={EXCEPTION_META.holiday.bg} color={EXCEPTION_META.holiday.color}><Sun size={10} /> Holiday</Chip>
+            <Chip bg={EXCEPTION_META.travel.bg} color={EXCEPTION_META.travel.color}><Plane size={10} /> Travel</Chip>
+            <Chip bg={EXCEPTION_META.leave_declared.bg} color={EXCEPTION_META.leave_declared.color}><Palmtree size={10} /> Leave booked</Chip>
+            <Chip bg={EXCEPTION_META.leave_taken.bg} color={EXCEPTION_META.leave_taken.color}><Palmtree size={10} /> Leave taken</Chip>
             <Chip bg={EVENT_TYPE_META.meeting.bg} color={EVENT_TYPE_META.meeting.color}><Video size={10} /> Meeting/Visit</Chip>
           </div>
         </div>
@@ -2274,26 +2853,34 @@ const CalendarView = ({ exceptions, toggleException, sessions, activeSession, cl
             const dayEvents = events.filter((e) => e.date === ymd);
             const dayTasks = tasksDueOn(tasks, ymd);
             const dayDeadlines = projectDeadlinesOn(projects, ymd);
+            const marked = dayTasks.filter((t) => t.isMarked);
+            const exMeta = ex ? EXCEPTION_META[ex.type] ?? EXCEPTION_META.holiday : null;
+            const ExIcon = ex ? (isLeaveType(ex.type) ? Palmtree : ex.type === "holiday" ? Sun : Plane) : null;
             return (
               <button key={ymd} onClick={() => onOpenDay(ymd)} className="pd-press"
-                title={ex ? `${ex.type}${ex.label ? " · " + ex.label : ""}` : "Tap to view schedule"}
+                title={ex ? `${exMeta.label}${ex.reason ? " · " + ex.reason : ""}` : "Tap to view schedule"}
                 style={{
                   position: "relative", overflow: "hidden", minHeight: isMobile ? 44 : 66, borderRadius: isMobile ? 8 : 12,
                   cursor: "pointer", textAlign: "left", padding: isMobile ? "5px 4px" : "8px 9px",
-                  border: `1px solid ${isToday ? T.limeDeep : T.line}`,
-                  boxShadow: isToday ? "0 0 0 3px rgba(124,181,24,0.18)" : "none",
+                  /* Today gets a heavier ring than a marked day so "what do I
+                   * do now" always wins the eye over "what did I flag". */
+                  border: `${isToday ? 2 : 1}px solid ${isToday ? T.limeDeep : marked.length ? "#D97706" : T.line}`,
+                  boxShadow: isToday ? "0 0 0 4px rgba(124,181,24,0.22)"
+                    : marked.length ? "0 0 0 2px rgba(217,119,6,0.16)" : "none",
                   opacity: sunday && !ex && !dayEvents.length && !dayTasks.length && !dayDeadlines.length ? 0.45 : 1,
                   background: "#FFFFFF",
-                  ...(ex ? meshBackground(ex.type === "holiday" ? ["#FDEED3", "#FBD38D", "#F6AD55"] : ["#DDF3FE", "#A5DFF9", "#67C3F0"]) : {}),
+                  ...(ex ? meshBackground(exMeta.mesh) : isToday ? meshBackground(["#F6FEE7", "#EFFCC9", "#E4F9AC"]) : {}),
                 }}>
-                {ex && <GrainOverlay opacity={0.2} radius={12} />}
+                {(ex || isToday) && <GrainOverlay opacity={0.2} radius={12} />}
                 <div style={{ position: "relative", display: "flex", flexDirection: "column", gap: 4, height: "100%" }}>
-                  <span className="pd-num" style={{ fontSize: 12.5, fontWeight: 600, color: ex ? (ex.type === "holiday" ? "#4A2A03" : "#062F44") : T.ink }}>
+                  <span className="pd-num" style={{ fontSize: 12.5, fontWeight: isToday ? 700 : 600,
+                    color: ex ? exMeta.color : isToday ? "#3F6212" : T.ink }}>
                     {d.getDate()}
                   </span>
-                  {ex && (ex.type === "holiday" ? <Sun size={12} style={{ color: "#4A2A03" }} /> : <Plane size={12} style={{ color: "#062F44" }} />)}
+                  {ex && <ExIcon size={12} style={{ color: exMeta.color }} />}
                   {!ex && worked && <span style={{ width: 5, height: 5, borderRadius: 99, background: T.limeDeep }} title="Session logged" />}
-                  <div style={{ display: "flex", gap: 3, marginTop: "auto", flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", gap: 3, marginTop: "auto", flexWrap: "wrap", alignItems: "center" }}>
+                    {marked.length > 0 && <Star size={9} style={{ color: "#D97706", fill: "#D97706" }} />}
                     {dayEvents.length > 0 && <span style={{ width: 5, height: 5, borderRadius: 99, background: "#0284C7" }} title={`${dayEvents.length} event(s)`} />}
                     {dayTasks.length > 0 && <span style={{ width: 5, height: 5, borderRadius: 99, background: "#D97706" }} title={`${dayTasks.length} task(s) due`} />}
                     {dayDeadlines.length > 0 && <span style={{ width: 5, height: 5, borderRadius: 99, background: "#B91C1C" }} title={`${dayDeadlines.length} project deadline(s)`} />}
@@ -2440,29 +3027,175 @@ const CalendarEventForm = ({ data, defaultDate, companies, projects, members, on
   );
 };
 
+/* ------------------------------ MARK A DAY ----------------------------------
+ * Replaces the old click-to-cycle day toggle. Leave requires a reason before
+ * it can be saved — that requirement is the entire reason this is a form and
+ * not a toggle, since the month-end report groups leave by reason and a blank
+ * one makes the report useless. */
+const MarkDayModal = ({ date, existing, members, onSave, onClear, onClose }) => {
+  const [f, setF] = useState({
+    type: existing?.type ?? "holiday",
+    reason: existing?.reason ?? "",
+    memberId: existing?.memberId ?? "",
+  });
+  const needsReason = isLeaveType(f.type);
+  const ready = !needsReason || f.reason.trim().length > 0;
+  const dow = new Date(date + "T00:00:00").toLocaleDateString("en", { weekday: "long", day: "numeric", month: "long" });
+  return (
+    <Modal title="Mark this day" subtitle={dow} onClose={onClose}>
+      <div style={{ display: "grid", gap: 18 }}>
+        <div>
+          <Label>Day type</Label>
+          <div style={{ display: "grid", gap: 6 }}>
+            {Object.entries(EXCEPTION_META).map(([key, meta]) => {
+              const on = f.type === key;
+              const Icon = meta.leave ? Palmtree : key === "holiday" ? Sun : Plane;
+              return (
+                <button key={key} type="button" onClick={() => setF({ ...f, type: key })} className="pd-press" style={{
+                  display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10,
+                  cursor: "pointer", textAlign: "left",
+                  background: on ? meta.bg : "#FFFFFF", border: `1px solid ${on ? meta.color + "44" : T.line}`,
+                }}>
+                  <Icon size={14} style={{ color: on ? meta.color : T.ink3, flexShrink: 0 }} />
+                  <span style={{ flex: 1, fontSize: 12.5, fontWeight: on ? 600 : 450, color: on ? meta.color : T.ink2 }}>
+                    {meta.label}
+                  </span>
+                  {on && <Check size={13} style={{ color: meta.color }} />}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {needsReason && (
+          <div>
+            <Label>Reason for leave (required)</Label>
+            <input style={inputStyle} value={f.reason} autoFocus
+              onChange={(e) => setF({ ...f, reason: e.target.value })}
+              placeholder="e.g. Medical, Family function, Personal, Casual leave" />
+            <p style={{ margin: "7px 0 0", fontSize: 11, color: T.ink3, lineHeight: 1.55 }}>
+              Month-end reporting groups leave by exactly this text, so reusing the same wording
+              (&quot;Medical&quot; rather than &quot;medical appt&quot;) keeps the totals tidy.
+            </p>
+          </div>
+        )}
+
+        <div>
+          <Label>Whose day is this? (optional)</Label>
+          <select style={inputStyle} value={f.memberId} onChange={(e) => setF({ ...f, memberId: e.target.value })}>
+            <option value="">Everyone — applies to the whole workspace</option>
+            {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+          </select>
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+          <div>{existing && <Btn ghost danger onClick={() => onClear(date)}><Trash2 size={14} /> Clear mark</Btn>}</div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <Btn ghost onClick={onClose}>Cancel</Btn>
+            <Btn disabled={!ready} onClick={() => onSave({
+              id: existing?.id, date, type: f.type,
+              reason: needsReason ? f.reason.trim() : "", memberId: f.memberId || null,
+            })}><Check size={15} /> {existing ? "Update" : "Mark day"}</Btn>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+/* ---------------------------- MARK A TASK ----------------------------------
+ * Item 3's "any specific task that I want to mark". The mark is a display
+ * flag only — it never touches the state machine — and carries who it's aimed
+ * at so a note left for one person doesn't read as a note to everybody. */
+const MarkTaskModal = ({ task, members, groups, onSave, onClose }) => {
+  const [f, setF] = useState({
+    markLabel: task.markLabel ?? "",
+    markScope: task.markScope ?? "self",
+    markTargetId: task.markTargetId ?? "",
+  });
+  const needsTarget = f.markScope === "member" || f.markScope === "group";
+  const options = f.markScope === "member" ? members : groups;
+  return (
+    <Modal title={task.isMarked ? "Edit calendar mark" : "Mark on calendar"} subtitle={task.title} onClose={onClose}>
+      <div style={{ display: "grid", gap: 18 }}>
+        <div>
+          <Label>Note (shows next to the task)</Label>
+          <input style={inputStyle} value={f.markLabel} autoFocus
+            onChange={(e) => setF({ ...f, markLabel: e.target.value })}
+            placeholder="e.g. Blocking the client demo — do this first" />
+        </div>
+        <div>
+          <Label>Who is this mark for?</Label>
+          <select style={inputStyle} value={f.markScope}
+            onChange={(e) => setF({ ...f, markScope: e.target.value, markTargetId: "" })}>
+            {Object.entries(MARK_SCOPE_META).map(([key, meta]) => (
+              <option key={key} value={key}>{meta.label}</option>
+            ))}
+          </select>
+        </div>
+        {needsTarget && (
+          <div>
+            <Label>{f.markScope === "member" ? "Person" : "Group"}</Label>
+            <select style={inputStyle} value={f.markTargetId}
+              onChange={(e) => setF({ ...f, markTargetId: e.target.value })}>
+              <option value="">Select…</option>
+              {options.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
+            </select>
+          </div>
+        )}
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+          <div>
+            {task.isMarked && (
+              <Btn ghost danger onClick={() => onSave({ isMarked: false, markLabel: "", markScope: null, markTargetId: null })}>
+                <X size={14} /> Remove mark
+              </Btn>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <Btn ghost onClick={onClose}>Cancel</Btn>
+            <Btn disabled={needsTarget && !f.markTargetId} onClick={() => onSave({
+              isMarked: true, markLabel: f.markLabel.trim(),
+              markScope: f.markScope, markTargetId: f.markTargetId || null,
+            })}><Star size={14} /> {task.isMarked ? "Save mark" : "Mark task"}</Btn>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
 /* ------------------------------- DAY DETAIL --------------------------------- */
-const DayDetailModal = ({ date, exceptions, toggleException, events, tasks, projects, companies, members,
-  onAddEvent, onEditEvent, onDeleteEvent, onOpenProject, onClose }) => {
+const DayDetailModal = ({ date, exceptions, events, tasks, projects, companies, members,
+  onAddEvent, onEditEvent, onDeleteEvent, onMarkDay, onMarkTask, onOpenProject, onClose }) => {
   const ex = exceptions.find((x) => x.date === date);
+  const exMeta = ex ? EXCEPTION_META[ex.type] ?? EXCEPTION_META.holiday : null;
+  const ExIcon = ex ? (isLeaveType(ex.type) ? Palmtree : ex.type === "holiday" ? Sun : Plane) : null;
   const dayEvents = events.filter((e) => e.date === date);
   const dayTasks = tasksDueOn(tasks, date);
   const dayDeadlines = projectDeadlinesOn(projects, date);
+  const isToday = date === ymdOf(new Date());
   const dow = new Date(date + "T00:00:00").toLocaleDateString("en", { weekday: "long" });
+  const exMember = ex?.memberId ? members.find((m) => m.id === ex.memberId) : null;
   return (
-    <Modal title={dow} subtitle={date} wide onClose={onClose}>
+    <Modal title={dow} subtitle={isToday ? `${date} · Today` : date} wide onClose={onClose}>
       <div style={{ display: "grid", gap: 20 }}>
-        <button onClick={() => toggleException(date)} className="pd-press" style={{
+        <button onClick={() => onMarkDay(date)} className="pd-press" style={{
           display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", borderRadius: 13, cursor: "pointer", textAlign: "left",
-          background: ex ? (ex.type === "holiday" ? "#FDEED3" : "#DDF3FE") : T.cardSoft, border: `1px solid ${ex ? "transparent" : T.line}`,
+          background: ex ? exMeta.bg : T.cardSoft, border: `1px solid ${ex ? "transparent" : T.line}`,
         }}>
-          {ex ? (ex.type === "holiday" ? <Sun size={16} style={{ color: "#4A2A03" }} /> : <Plane size={16} style={{ color: "#062F44" }} />)
-             : <CircleDot size={16} style={{ color: T.ink3 }} />}
-          <div>
+          {ex ? <ExIcon size={16} style={{ color: exMeta.color }} /> : <CircleDot size={16} style={{ color: T.ink3 }} />}
+          <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>
-              {ex ? `Marked as ${ex.type}` : "Working day"}
+              {ex ? exMeta.label : "Working day"}
             </div>
-            <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>Tap to cycle: working → holiday → travel → working.</div>
+            <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
+              {ex
+                ? [ex.reason && `Reason: ${ex.reason}`, exMember && `For ${exMember.name}`, "Tap to change"]
+                    .filter(Boolean).join(" · ")
+                : "Tap to mark as holiday, travel, or leave."}
+            </div>
           </div>
+          <Pencil size={13} style={{ color: T.ink3, flexShrink: 0 }} />
         </button>
 
         <div>
@@ -2499,11 +3232,19 @@ const DayDetailModal = ({ date, exceptions, toggleException, events, tasks, proj
             <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
               {dayTasks.map((t) => {
                 const p = projects.find((x) => x.id === t.projectId);
-                const m = members.find((x) => x.id === t.assigneeId);
                 return (
-                  <div key={t.id} style={{ padding: "10px 14px", borderRadius: 12, border: `1px solid ${T.line}` }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{t.title}</div>
-                    <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>{p?.name ?? "—"}{m ? ` · ${m.name}` : ""}</div>
+                  <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 11,
+                    padding: "10px 14px", borderRadius: 12, border: `1px solid ${t.isMarked ? "#F3D19E" : T.line}`,
+                    background: t.isMarked ? "#FFFCF6" : "transparent" }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{t.title}</div>
+                      <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
+                        {p?.name ?? "—"} · {taskAudience(t, members)}{t.markLabel ? ` · ${t.markLabel}` : ""}
+                      </div>
+                    </div>
+                    <IconBtn label={t.isMarked ? "Edit calendar mark" : "Mark on calendar"} onClick={() => onMarkTask(t)}>
+                      <Star size={13} style={t.isMarked ? { color: "#D97706", fill: "#D97706" } : undefined} />
+                    </IconBtn>
                   </div>
                 );
               })}
@@ -2858,6 +3599,7 @@ const ReportsView = ({ sessions, tasks, exceptions, projects, companies, onExpor
           { label: "Tasks completed", value: cur.tasksDone, d: <Delta cur={cur.tasksDone} prev={prev.tasksDone} /> },
           { label: "Completed late", value: cur.late, d: <Delta cur={cur.late} prev={prev.late} invert /> },
           { label: "Loss factor", value: Math.round(cur.lossFactor * 100) + "%", d: <Delta cur={cur.lossFactor} prev={prev.lossFactor} invert /> },
+          { label: "Leave days", value: cur.leaveDays, d: <Delta cur={cur.leaveDays} prev={prev.leaveDays} invert /> },
         ].map(({ label, value, d }) => (
           <Card key={label} style={{ padding: "18px 20px" }}>
             <div className="pd-num" style={{ fontFamily: T.fontDisplay, fontSize: 28, fontWeight: 600, letterSpacing: "-0.03em" }}>{value}</div>
@@ -2905,6 +3647,54 @@ const ReportsView = ({ sessions, tasks, exceptions, projects, companies, onExpor
         <div style={{ display: "grid", gap: 12 }}>
           {breakdownRows.map((r) => <StatBar key={r.label} {...r} max={breakdownMax} />)}
         </div>
+      </Card>
+
+      {/* Leave & interruption — the month-end "how many days off, and why".
+        * Sits next to the productivity numbers deliberately: a month that
+        * looks slow reads very differently once you can see six leave days
+        * against it. */}
+      <SectionHead title={`Leave & interruption — ${cur.label}`} />
+      <Card style={{ padding: 24, marginBottom: 20 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 16, marginBottom: cur.leaveByReason.length ? 20 : 0 }}>
+          {[
+            { label: "Leave days", value: cur.leaveDays, color: "#7C5CDB" },
+            { label: "Holiday / travel", value: cur.interruptionDays, color: "#D97706" },
+            { label: "Working days", value: cur.workingDays, color: T.ink },
+            { label: "Effective days", value: cur.workingDays - cur.lossDays, color: T.limeDeep },
+          ].map(({ label, value, color }) => (
+            <div key={label}>
+              <div className="pd-num" style={{ fontFamily: T.fontDisplay, fontSize: 26, fontWeight: 600, letterSpacing: "-0.03em", color }}>{value}</div>
+              <div style={{ marginTop: 5, fontSize: 10.5, fontWeight: 500, letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3 }}>{label}</div>
+            </div>
+          ))}
+        </div>
+        {cur.leaveByReason.length > 0 ? (
+          <>
+            <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase",
+              color: T.ink3, marginBottom: 11, paddingTop: 18, borderTop: `1px solid ${T.lineSoft}` }}>
+              Leave by reason · {cur.leavePersonDays} person-day{cur.leavePersonDays !== 1 ? "s" : ""}
+            </div>
+            <div style={{ display: "grid", gap: 8 }}>
+              {cur.leaveByReason.map((r) => (
+                <div key={r.reason} style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+                  padding: "10px 13px", borderRadius: 10, border: `1px solid ${T.line}` }}>
+                  <Palmtree size={13} style={{ color: "#7C5CDB", flexShrink: 0 }} />
+                  <span style={{ flex: 1, minWidth: 120, fontSize: 12.5, fontWeight: 600, color: T.ink }}>{r.reason}</span>
+                  {r.declared > 0 && <Chip bg={EXCEPTION_META.leave_declared.bg} color={EXCEPTION_META.leave_declared.color}>{r.declared} booked</Chip>}
+                  {r.taken > 0 && <Chip bg={EXCEPTION_META.leave_taken.bg} color={EXCEPTION_META.leave_taken.color}>{r.taken} taken</Chip>}
+                  <span className="pd-num" style={{ fontSize: 13, fontWeight: 700, color: T.ink, minWidth: 46, textAlign: "right" }}>
+                    {r.personDays} day{r.personDays !== 1 ? "s" : ""}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </>
+        ) : (
+          <p style={{ margin: "16px 0 0", fontSize: 12, color: T.ink3, lineHeight: 1.6 }}>
+            No leave recorded this month. Mark a day as leave from the Calendar to have it counted here
+            — the reason you give is what these rows group by.
+          </p>
+        )}
       </Card>
 
       {/* Export */}
