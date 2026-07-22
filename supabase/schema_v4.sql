@@ -144,6 +144,18 @@ as $$
   );
 $$;
 
+-- These are called two ways: internally, by the RLS policies below (which
+-- run as whichever role made the request — hence `authenticated` needs
+-- EXECUTE or every policy check on the twelve data tables would fail outright);
+-- and, because SECURITY DEFINER functions in the public schema are exposed
+-- as RPC endpoints by default, potentially directly by anyone who finds the
+-- endpoint. They're harmless to call directly (auth.uid() is null for an
+-- unauthenticated request, so they just return false), but there's no reason
+-- to leave that open. Postgres grants EXECUTE to PUBLIC on every new
+-- function unless it's revoked, so that has to happen explicitly.
+revoke execute on function public.is_workspace_member(text) from public;
+revoke execute on function public.can_write_workspace(text) from public;
+revoke execute on function public.is_workspace_admin(text) from public;
 grant execute on function public.is_workspace_member(text) to authenticated;
 grant execute on function public.can_write_workspace(text) to authenticated;
 grant execute on function public.is_workspace_admin(text) to authenticated;
@@ -406,6 +418,10 @@ begin
   return claimed;
 end $$;
 
+-- Same reasoning as section 2's helpers: revoke the default PUBLIC grant,
+-- then re-add only what the app needs — a signed-in user calling this on
+-- their own sign-in.
+revoke execute on function public.claim_workspace_invites() from public;
 grant execute on function public.claim_workspace_invites() to authenticated;
 
 -- Every new signup needs a personal workspace of their own, or they land in
@@ -435,6 +451,14 @@ begin
 
   return new;
 end $$;
+
+-- Never called directly — only ever fired by the trigger below on an
+-- auth.users insert, which doesn't need or check an EXECUTE grant on the
+-- invoking session. Supabase grants EXECUTE on every new public-schema
+-- function to anon/authenticated/service_role explicitly at creation time
+-- (not merely the default PUBLIC grant), so all three have to be named here;
+-- revoking from PUBLIC alone leaves those explicit grants untouched.
+revoke execute on function public.ensure_personal_workspace() from anon, authenticated, public;
 
 drop trigger if exists on_auth_user_created_workspace on auth.users;
 create trigger on_auth_user_created_workspace
@@ -537,7 +561,10 @@ select
   case tg.tgenabled
     when 'O' then 'ENABLED'
     when 'D' then 'DISABLED  <-- PROBLEM'
-    else 'enabled (' || tg.tgenabled || ')'
+    -- tg.tgenabled is "char" (postgres's internal 1-byte type), not text —
+    -- concatenating it with a text literal has no unique `||` overload
+    -- until it's cast explicitly.
+    else 'enabled (' || tg.tgenabled::text || ')'
   end                                      as status
 from pg_trigger tg
 join pg_class c on c.oid = tg.tgrelid
