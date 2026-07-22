@@ -107,8 +107,15 @@ export async function fetchWorkspaces() {
    * supabase.rpc() returns a PostgrestFilterBuilder — thenable (it has
    * .then, so `await` works) but not a real Promise, so it has no .catch().
    * The two-argument form of .then() is the one method every thenable is
-   * guaranteed to have, so it's the portable way to swallow a failure here. */
-  await supabase.rpc("claim_workspace_invites").then(null, () => {});
+   * guaranteed to have, so it's the portable way to swallow a failure here.
+   *
+   * claim_workspace_invites() returns how many invites it just attached —
+   * the app surfaces that as a toast so joining a workspace this way isn't
+   * completely silent, which it otherwise would be: there is no invite email
+   * and no accept step, so this count is the only signal a newly-linked
+   * person gets that anything happened at all. */
+  const claimedCount = await supabase.rpc("claim_workspace_invites")
+    .then((res) => res.data ?? 0, () => 0);
 
   const [workspaces, memberships] = await Promise.all([
     notDeleted(supabase.from("workspaces").select("*")).then(throwIfError),
@@ -119,13 +126,14 @@ export async function fetchWorkspaces() {
   const myRoleByWs = new Map(
     memberships.filter((m) => m.user_id === myUid).map((m) => [m.workspace_id, m.role])
   );
-  return workspaces
+  const list = workspaces
     .filter((w) => myRoleByWs.has(w.id))
     .map((w) => ({ ...rowToWorkspace(w), myRole: myRoleByWs.get(w.id) }))
     /* Personal workspace first, then team workspaces alphabetically — the
      * solo user's single workspace should never move around on them. */
     .sort((a, b) =>
       a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === "personal" ? -1 : 1);
+  return { list, claimedCount };
 }
 
 export async function fetchMemberships(workspaceId) {
@@ -180,6 +188,37 @@ export async function inviteToWorkspace(workspaceId, email, role, memberId = nul
     throw new Error(error.message);
   }
   return rowToMembership(row);
+}
+
+/* Sends the actual invite email, via the invite-member Edge Function —
+ * inviteToWorkspace() above only ever wrote a database row, nothing was ever
+ * emailed. Call this AFTER inviteToWorkspace() succeeds, never before: if the
+ * membership row doesn't exist yet and this throws, there'd be nothing for
+ * the person to land in even if the email went out. If this fails after the
+ * row already exists, the invite still works the old way — silently linked
+ * on their next sign-in — just without an email telling them to look. */
+export async function sendWorkspaceInviteEmail(workspaceId, email, role) {
+  const { data, error } = await supabase.functions.invoke("invite-member", {
+    body: { workspaceId, email, role },
+  });
+  if (error) {
+    /* On a non-2xx response supabase-js's own error.message is a generic
+     * "Edge Function returned a non-2xx status code" — the actual reason
+     * (e.g. "Only workspace owners/admins can send invites") is in the JSON
+     * body the function returned, reachable only through error.context, the
+     * raw Response object. Falling back to the generic message if the body
+     * isn't there or isn't JSON. */
+    let detail = error.message;
+    if (error.context && typeof error.context.json === "function") {
+      try {
+        const body = await error.context.json();
+        if (body?.error) detail = body.error;
+      } catch { /* body wasn't JSON — keep the generic message */ }
+    }
+    throw new Error(detail);
+  }
+  if (data?.error) throw new Error(data.error);
+  return { alreadyHadAccount: !!data?.alreadyHadAccount };
 }
 
 export async function updateMembershipRole(id, role) {

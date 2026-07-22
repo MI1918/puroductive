@@ -89,9 +89,34 @@ Since v4 the app is multi-user. Two things that look similar but aren't:
   which point the tasks already assigned to that name become theirs.
 
 Invites are addressed to an email, not a user id, so you can invite someone
-who has never opened Puroductive. `claim_workspace_invites()` runs on every
-sign-in and attaches any invite matching that account's email — which is why
-an invited person just signs up normally and finds the workspace waiting.
+who has never opened Puroductive. Inviting someone does two things:
+
+1. Inserts a `workspace_members` row (status `invited`). `claim_workspace_invites()`
+   runs on every sign-in and attaches any invite matching that account's
+   email — this is what lets an invited person just sign up normally and
+   find the workspace waiting, with no separate "accept" step.
+2. Calls the `invite-member` Supabase Edge Function
+   ([`supabase/functions/invite-member/index.ts`](supabase/functions/invite-member/index.ts)),
+   which sends a real email via Supabase Auth's own admin invite API — no
+   third-party email service involved. If the person already has an
+   account, Supabase Auth refuses to "invite" them again; the app treats
+   that as success too, since step 1 already means they'll be linked
+   automatically on their next sign-in regardless.
+
+The Edge Function needs no manual secret setup — `SUPABASE_URL`,
+`SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` are injected into every
+Edge Function automatically. It checks the caller is actually an admin of
+the workspace (via the same `is_workspace_admin()` RLS helper the database
+itself uses) before sending anything, using the caller's own JWT — the
+service-role key is used for exactly the one privileged call and nothing
+else. Deploy/update it with the Supabase CLI (`supabase functions deploy
+invite-member`) or via the Supabase MCP connection.
+
+Supabase's free tier caps outgoing auth emails at roughly 4/hour — fine for
+testing with a handful of people, not for onboarding a large team at once.
+If you outgrow that, either add a custom SMTP provider in Supabase
+Auth settings, or have this function call a dedicated email API (Resend,
+Postmark, etc.) instead of `auth.admin.inviteUserByEmail`.
 
 Roles: **owner** > **admin** > **member** > **viewer**. A viewer's writes are
 refused by RLS at the database, not merely hidden in the UI. You may only

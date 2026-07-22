@@ -1114,8 +1114,16 @@ export default function PuroductiveApp({ session }) {
   useEffect(() => {
     let cancelled = false;
     const load = (retriesLeft = 1) => {
-      db.fetchWorkspaces().then((list) => {
+      db.fetchWorkspaces().then(({ list, claimedCount }) => {
         if (cancelled) return;
+        /* This is the only signal a newly-invited person gets that anything
+         * happened — there is no invite email and no accept step, the
+         * account just gets silently linked on its first sign-in. Without
+         * this toast that linking is invisible, which is exactly what made
+         * the invite flow look broken even when it had actually worked. */
+        if (claimedCount > 0) {
+          toast(`You've been added to ${claimedCount} new workspace${claimedCount > 1 ? "s" : ""}`);
+        }
         if (!list.length) {
           /* The v4 trigger gives every new signup a personal workspace, so an
            * empty list means this account predates the migration. Say so
@@ -1501,9 +1509,22 @@ export default function PuroductiveApp({ session }) {
     try {
       const created = await db.inviteToWorkspace(workspaceId, email, role, memberId || null);
       setMemberships((ms) => [...ms, created]);
-      toast(`${email} invited — they'll see this workspace next time they sign in`);
     } catch (e) {
       toast(e.message, "error");
+      return;
+    }
+    /* The membership row exists now regardless of what happens below, so a
+     * failure here is a softer problem: the invite still works the old way
+     * (silently linked next time they sign in), just without an email
+     * telling them to look. Surface that distinction rather than treating
+     * every outcome as the same success or the same failure. */
+    try {
+      const { alreadyHadAccount } = await db.sendWorkspaceInviteEmail(workspaceId, email, role);
+      toast(alreadyHadAccount
+        ? `${email} already has a Puroductive account — they'll see this workspace next time they sign in`
+        : `Invite email sent to ${email}`);
+    } catch (e) {
+      toast(`Added ${email}, but the invite email failed to send: ${e.message}`, "error");
     }
   };
   const changeRole = async (m, role) => {
