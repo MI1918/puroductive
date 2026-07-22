@@ -102,8 +102,13 @@ export async function fetchWorkspaces() {
   /* Claim first — an invite accepted a second ago should show up in the very
    * same load, not only after a manual refresh. A failure here is not fatal:
    * it just means no new invites got attached, and the workspaces you already
-   * belong to still load fine. */
-  await supabase.rpc("claim_workspace_invites").catch(() => {});
+   * belong to still load fine.
+   *
+   * supabase.rpc() returns a PostgrestFilterBuilder — thenable (it has
+   * .then, so `await` works) but not a real Promise, so it has no .catch().
+   * The two-argument form of .then() is the one method every thenable is
+   * guaranteed to have, so it's the portable way to swallow a failure here. */
+  await supabase.rpc("claim_workspace_invites").then(null, () => {});
 
   const [workspaces, memberships] = await Promise.all([
     notDeleted(supabase.from("workspaces").select("*")).then(throwIfError),
