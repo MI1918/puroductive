@@ -196,23 +196,32 @@ end $$;
 -- the person it belongs to. task_request_events is deliberately absent: with
 -- no UPDATE policy, Postgres refuses every update, which is what makes the
 -- paper trail tamper-evident rather than merely by convention.
+--
+-- Each is preceded by its own DROP — CREATE POLICY has no IF NOT EXISTS, so
+-- without this a second run of the script would fail with "policy already
+-- exists" the moment it reached here, contrary to this file's own claim of
+-- being safe to re-run.
+drop policy if exists "author edits own post" on public.posts;
 create policy "author edits own post" on public.posts
   for update to authenticated
   using (author_id = auth.uid() and public.can_write_workspace(workspace_id))
   with check (author_id = auth.uid() and public.can_write_workspace(workspace_id));
 
+drop policy if exists "author edits own comment" on public.post_comments;
 create policy "author edits own comment" on public.post_comments
   for update to authenticated
   using (author_id = auth.uid() and public.can_write_workspace(workspace_id))
   with check (author_id = auth.uid() and public.can_write_workspace(workspace_id));
 
 -- Media rows are tombstoned by the post's author when they remove an image.
+drop policy if exists "workspace update" on public.post_media;
 create policy "workspace update" on public.post_media
   for update to authenticated
   using (public.can_write_workspace(workspace_id))
   with check (public.can_write_workspace(workspace_id));
 
 -- Changing your vote rewrites your own row, and only your own.
+drop policy if exists "voter changes own vote" on public.poll_votes;
 create policy "voter changes own vote" on public.poll_votes
   for update to authenticated
   using (voter_id = auth.uid() and public.can_write_workspace(workspace_id))
@@ -220,11 +229,13 @@ create policy "voter changes own vote" on public.poll_votes
 
 -- Any writing member can act on a request — that is the point: it lands with
 -- Ravi, but Priya may be the one who picks it up after he declines.
+drop policy if exists "workspace update" on public.task_requests;
 create policy "workspace update" on public.task_requests
   for update to authenticated
   using (public.can_write_workspace(workspace_id))
   with check (public.can_write_workspace(workspace_id));
 
+drop policy if exists "workspace update" on public.poll_options;
 create policy "workspace update" on public.poll_options
   for update to authenticated
   using (public.can_write_workspace(workspace_id))
