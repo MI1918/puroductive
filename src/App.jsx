@@ -6,7 +6,8 @@ import {
   Ban, Flame, CalendarDays, BarChart3, Bell, Download, LogIn, LogOut, Plane,
   TrendingUp, TrendingDown, Sun, Building2, Pencil, Tag, MapPin, Video,
   CalendarPlus, Briefcase, Menu, GanttChart, Trophy, UserPlus, Star,
-  ChevronsUpDown, Eye, Send, Layers, Palmtree,
+  ChevronsUpDown, Eye, Send, Layers, Palmtree, MessageSquare, Image as ImageIcon,
+  BarChart2, HelpCircle, PartyPopper, ArrowRightLeft, Paperclip,
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient.js";
 import * as db from "./lib/db.js";
@@ -106,6 +107,23 @@ const EXCEPTION_META = {
                     bg: "#FDECEA", color: "#7A1F12", mesh: ["#FDECEA", "#F8C6BD", "#F09A8A"], leave: true },
 };
 export const isLeaveType = (type) => !!EXCEPTION_META[type]?.leave;
+
+/* ------------------------ board post kinds (schema_v5) --------------------
+ * The intent of a post, chosen when it's written. The same site photo means
+ * something different depending on which of these it's tagged as, and each
+ * one gets a different response affordance underneath it. */
+const POST_KIND_META = {
+  update:       { label: "Update", blurb: "Just sharing — no response needed",
+                  icon: MessageSquare, bg: "#F3F3EE", color: "#5A5F69", posted: "Posted to the board" },
+  discussion:   { label: "What are your thoughts?", blurb: "Open it up for everyone's opinion",
+                  icon: HelpCircle, bg: "#EAF6FE", color: "#0284C7", posted: "Asked the team for thoughts" },
+  task_request: { label: "Task request", blurb: "Ask someone to take this on — they can accept or pass it along",
+                  icon: UserCheck, bg: "#FDF3E3", color: "#B45309", posted: "Task request sent" },
+  poll:         { label: "Poll", blurb: "Let people vote between options",
+                  icon: BarChart2, bg: "#EEE9FD", color: "#291D52", posted: "Poll posted" },
+  accomplished: { label: "Task accomplished", blurb: "Mark work as done and show it off",
+                  icon: PartyPopper, bg: "#F2FADF", color: "#3F6212", posted: "Nice — logged as accomplished" },
+};
 
 /* Who a calendar mark is aimed at (tasks.mark_scope). */
 const MARK_SCOPE_META = {
@@ -476,7 +494,7 @@ export function relativeDayLabel(ymd) {
  *   · docHtml — Word-compatible HTML; saved as .doc it opens directly in
  *               MS Word with headings, tables, and the reflection log intact
  * ==========================================================================*/
-export function compileProjectReport({ project, company, tasks, transitions, reflections, members }) {
+export function compileProjectReport({ project, company, tasks, transitions, reflections, members, board }) {
   const nameOf = (id) => members.find((m) => m.id === id)?.name ?? "Unassigned";
   const fmt = (iso) => (iso ? new Date(iso).toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" }) : "—");
   const stack = computeSandStack(project, tasks);
@@ -505,6 +523,23 @@ export function compileProjectReport({ project, company, tasks, transitions, ref
       at: r.at, task: tasks.find((t) => t.id === r.taskId)?.title ?? "Task",
       whatWentWrong: r.whatWentWrong, rootBottleneck: r.rootBottleneck, correctiveAction: r.correctiveAction,
     })),
+    /* Board task requests touching this project, with every decline and
+     * transfer they went through. This is what makes "whenever a report is
+     * generated that task has a paper trail" true rather than aspirational —
+     * a task that four people passed on reads very differently from one
+     * somebody picked up immediately. */
+    requestTrail: (board?.requests ?? [])
+      .filter((r) => r.projectId === project.id || tasks.some((t) => t.id === r.taskId))
+      .map((r) => ({
+        title: r.title, status: r.status, assignee: nameOf(r.assigneeMemberId),
+        events: (board?.requestEvents ?? [])
+          .filter((e) => e.requestId === r.id)
+          .map((e) => ({
+            at: e.at, action: e.action, reason: e.reason,
+            from: e.fromMemberId ? nameOf(e.fromMemberId) : null,
+            to: e.toMemberId ? nameOf(e.toMemberId) : null,
+          })),
+      })),
   };
 
   const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -524,6 +559,16 @@ export function compileProjectReport({ project, company, tasks, transitions, ref
         <b>Corrective action:</b> ${esc(r.correctiveAction)}
       </td></tr></table>`).join("")
     : "<p><i>No missed deadlines — no interventions were required.</i></p>";
+  const trailBlocks = report.requestTrail.length
+    ? report.requestTrail.map((r) => `
+      <h3>${esc(r.title)} — ${esc(r.status)}${r.assignee ? ` (currently ${esc(r.assignee)})` : ""}</h3>
+      <ul>${r.events.map((e) => {
+        const who = e.action === "transferred" ? `${esc(e.from ?? "—")} &rarr; ${esc(e.to ?? "—")}`
+          : e.action === "declined" ? esc(e.from ?? "—")
+          : esc(e.to ?? "—");
+        return `<li>${esc(fmt(e.at))} — <b>${esc(e.action)}</b>: ${who}${e.reason ? ` <i>(&ldquo;${esc(e.reason)}&rdquo;)</i>` : ""}</li>`;
+      }).join("")}</ul>`).join("")
+    : "<p><i>No board task requests for this project.</i></p>";
   const attachmentBlocks = report.tasks.filter((t) => t.attachmentLinks.length).map((t) =>
     `<li><b>${esc(t.title)}</b>: ${t.attachmentLinks.map((u) => `<a href="${esc(u)}">${esc(u)}</a>`).join(", ")}</li>`).join("");
 
@@ -577,6 +622,9 @@ Sand stack: <b>${report.sandStack.fillPercent}%</b>${report.sandStack.degraded ?
 <table class="grid"><tr><th>Task</th><th>State</th><th>Assignee</th><th>Deadline</th><th>Completed</th><th>Retries</th><th>Weight</th></tr>${taskRows}</table>
 <h2>Task Timelines</h2>${timelineBlocks || "<p><i>No transitions recorded yet.</i></p>"}
 <h2>Supervisor Reflection Log (permanent)</h2>${reflectionBlocks}
+<h2>Task Request Paper Trail</h2>
+<p class="meta">Every hand-off a board task request went through, with the reason given. This record is append-only and cannot be edited after the fact.</p>
+${trailBlocks}
 <h2>Photo Verification — Attachment Links</h2>${attachmentBlocks ? `<ul>${attachmentBlocks}</ul>` : "<p><i>No attachments recorded.</i></p>"}
 </body></html>`;
 
@@ -1036,6 +1084,16 @@ export default function PuroductiveApp({ session }) {
   const activeWorkspace = workspaces.find((w) => w.id === workspaceId) ?? null;
   const myRole = activeWorkspace?.myRole ?? "viewer";
   const readOnly = !canWrite(myRole);
+  /* Which roster entry I am in this workspace, if an invite linked me to one.
+   * This is what makes "is this task request for me?" answerable. */
+  const myMembership = memberships.find((m) => (m.email || "").toLowerCase() === (session?.user?.email || "").toLowerCase());
+  const myMemberId = myMembership?.memberId ?? null;
+
+  /* ------------------------------ the board ------------------------------- */
+  const [board, setBoard] = useState({
+    posts: [], media: [], comments: [], pollOptions: [], pollVotes: [], requests: [], requestEvents: [],
+  });
+  const [mediaUrls, setMediaUrls] = useState({});
 
   const toast = (msg, kind = "ok") => {
     const id = uid();
@@ -1100,6 +1158,33 @@ export default function PuroductiveApp({ session }) {
     return () => { cancelled = true; };
   }, []);
 
+  /* Loading the board is deliberately failure-tolerant. Someone who has run
+   * schema_v4 but not yet schema_v5 has no posts table, and that must not
+   * take the whole app down with it — projects, tasks and the calendar are
+   * all still perfectly usable. The Board screen explains the gap instead. */
+  const [boardAvailable, setBoardAvailable] = useState(true);
+  const loadBoard = async () => {
+    /* Switching workspaces twice quickly can land an older fetch after a
+     * newer one. Capturing the workspace this call was issued for, and
+     * dropping the result if it is no longer the active one, keeps one
+     * workspace's posts from ever appearing inside another. */
+    const issuedFor = db.getActiveWorkspace();
+    try {
+      const data = await db.fetchBoard();
+      const paths = data.media.map((m) => m.path);
+      const urls = paths.length ? await db.signMediaUrls(paths).catch(() => ({})) : {};
+      if (db.getActiveWorkspace() !== issuedFor) return;
+      setBoard(data);
+      setMediaUrls(urls);
+      setBoardAvailable(true);
+    } catch (e) {
+      if (db.getActiveWorkspace() !== issuedFor) return;
+      if (/does not exist|schema cache/i.test(e.message)) setBoardAvailable(false);
+      else toast(`Board failed to load: ${e.message}`, "error");
+      setBoard({ posts: [], media: [], comments: [], pollOptions: [], pollVotes: [], requests: [], requestEvents: [] });
+    }
+  };
+
   /* Step 2 — load that workspace's data. Re-runs on every workspace switch,
    * which is why it resets the "seen" trackers: they describe what's already
    * in the database for the workspace currently loaded, and carrying them
@@ -1117,7 +1202,7 @@ export default function PuroductiveApp({ session }) {
      * parallel queries, producing a transient "JWT issued at future" — retry
      * once after a beat instead of making the user refresh manually. */
     const load = (retriesLeft = 1) => {
-      Promise.all([db.fetchBootstrap(), db.fetchMemberships(workspaceId)]).then(([data, mems]) => {
+      Promise.all([db.fetchBootstrap(), db.fetchMemberships(workspaceId), loadBoard()]).then(([data, mems]) => {
         if (cancelled) return;
         setCompanies(data.companies);
         setMembers(data.members);
@@ -1260,7 +1345,7 @@ export default function PuroductiveApp({ session }) {
       tasks: engine.tasks.filter((t) => t.projectId === proj.id),
       transitions: engine.transitions,
       reflections: engine.reflections,
-      members,
+      members, board,
     });
     downloadProjectDoc(compiled, proj.name.replace(/[^\w]+/g, "-") + "-report.doc");
     toast("Report compiled — Word document downloading");
@@ -1432,6 +1517,150 @@ export default function PuroductiveApp({ session }) {
     catch (e) { toast(`Sync failed: ${e.message}`, "error"); }
   };
 
+  /* ------------------------------- the board -------------------------------
+   * Posting is a multi-step write (post row, then media, then poll options or
+   * a task request) and there is no transaction across them from the browser.
+   * The post row is written first so everything else has a parent to hang
+   * off; if a later step fails the post survives as a plain caption, which is
+   * a far better failure mode than orphaned media nobody can see. */
+  const createPost = async (draft, files) => {
+    const postId = "po-" + uid();
+    try {
+      const post = await db.insertPost({
+        id: postId, kind: draft.kind, caption: draft.caption,
+        projectId: draft.projectId || null, taskId: draft.taskId || null,
+        authorMemberId: myMemberId,
+      });
+
+      let media = [];
+      if (files.length) {
+        const uploaded = [];
+        for (const file of files) uploaded.push(await db.uploadPostMedia(postId, file));
+        media = await db.insertPostMedia(postId, uploaded);
+        const urls = await db.signMediaUrls(uploaded.map((u) => u.path)).catch(() => ({}));
+        setMediaUrls((m) => ({ ...m, ...urls }));
+      }
+
+      let pollOptions = [], requests = [], requestEvents = [];
+      if (draft.kind === "poll") {
+        pollOptions = await db.insertPollOptions(postId, draft.pollOptions.filter((o) => o.trim()));
+      }
+      if (draft.kind === "task_request") {
+        const { request, event } = await db.insertTaskRequest({
+          id: "tr-" + uid(), postId, projectId: draft.projectId || null,
+          title: draft.requestTitle, deadline: draft.requestDeadline || null,
+          weight: draft.requestWeight ?? 1, assigneeMemberId: draft.assigneeMemberId || null,
+          reason: draft.caption,
+        });
+        requests = [request]; requestEvents = [event];
+      }
+
+      setBoard((b) => ({
+        ...b,
+        posts: [post, ...b.posts],
+        media: [...b.media, ...media],
+        pollOptions: [...b.pollOptions, ...pollOptions],
+        requests: [...b.requests, ...requests],
+        requestEvents: [...b.requestEvents, ...requestEvents],
+      }));
+      setModal(null);
+      toast(POST_KIND_META[draft.kind].posted);
+    } catch (e) {
+      toast(`Could not post: ${e.message}`, "error");
+    }
+  };
+
+  const addComment = async (postId, body) => {
+    try {
+      const c = await db.insertComment(postId, body, myMemberId);
+      setBoard((b) => ({ ...b, comments: [...b.comments, c] }));
+    } catch (e) { toast(`Comment failed: ${e.message}`, "error"); }
+  };
+
+  const vote = async (postId, optionId) => {
+    const myUid = session?.user?.id;
+    /* Optimistic: replace my existing vote rather than appending, mirroring
+     * the unique index that would reject a second row anyway. */
+    setBoard((b) => ({
+      ...b,
+      pollVotes: [...b.pollVotes.filter((v) => !(v.postId === postId && v.voterId === myUid)),
+                  { id: "tmp-" + uid(), postId, optionId, voterId: myUid }],
+    }));
+    try { await db.castVote(postId, optionId); }
+    catch (e) { toast(`Vote failed: ${e.message}`, "error"); loadBoard(); }
+  };
+
+  const deletePost = async (post) => {
+    setBoard((b) => ({ ...b, posts: b.posts.filter((p) => p.id !== post.id) }));
+    try { await db.softDeletePost(post.id); toast("Post removed"); }
+    catch (e) { toast(`Sync failed: ${e.message}`, "error"); loadBoard(); }
+  };
+
+  /* Accepting is the moment a board conversation becomes real work: it mints
+   * an ordinary task, which from then on lives in the state machine and shows
+   * up in the sand stack, the calendar and the reports like any other. */
+  const acceptRequest = async (req) => {
+    const projectId = req.projectId || projects[0]?.id;
+    if (!projectId) { toast("Create a project first — an accepted task has to live somewhere", "error"); return; }
+    const task = {
+      id: "t-" + uid(), projectId, title: req.title, state: "pending",
+      scope: "individual", assigneeId: req.assigneeMemberId || null, assigneeGroupId: null,
+      deadline: req.deadline || null, weight: req.weight ?? 1,
+      retryCount: 0, completedAt: null, completedLate: false,
+      isMarked: false, markLabel: "", markScope: null, markTargetId: null,
+    };
+    try {
+      /* The task row must exist in Postgres before the request can point at
+       * it — task_requests.task_id is a foreign key. Normally new tasks reach
+       * the database via the engine.tasks watcher, which fires asynchronously
+       * after render and would lose that race, so this one is written
+       * directly and pre-registered as "seen" to stop the watcher inserting
+       * it a second time. */
+      await db.insertTask(task);
+      seenTaskIds.current.add(task.id);
+      dispatch({ type: "ADD_TASK", task });
+
+      await db.updateTaskRequest(req.id, { status: "accepted", taskId: task.id });
+      const event = await db.recordRequestEvent(req.id, {
+        action: "accepted", toMemberId: req.assigneeMemberId ?? null,
+      });
+      setBoard((b) => ({
+        ...b,
+        requests: b.requests.map((r) => (r.id === req.id ? { ...r, status: "accepted", taskId: task.id } : r)),
+        requestEvents: [...b.requestEvents, event],
+      }));
+      toast(`Accepted — "${req.title}" is now a task`);
+    } catch (e) { toast(`Sync failed: ${e.message}`, "error"); }
+  };
+
+  /* Declining without naming a successor leaves the request unowned and
+   * visible; declining WITH one is a transfer. Both write to the append-only
+   * trail, which is what lets a report months later show that this task
+   * passed through two people before anyone started it. */
+  const declineRequest = async (req, { toMemberId, reason }) => {
+    const action = toMemberId ? "transferred" : "declined";
+    try {
+      await db.updateTaskRequest(req.id, {
+        status: toMemberId ? "pending" : "declined",
+        assigneeMemberId: toMemberId ?? null,
+      });
+      const event = await db.recordRequestEvent(req.id, {
+        action, fromMemberId: req.assigneeMemberId ?? null, toMemberId: toMemberId ?? null, reason,
+      });
+      setBoard((b) => ({
+        ...b,
+        requests: b.requests.map((r) => (r.id === req.id
+          ? { ...r, status: toMemberId ? "pending" : "declined", assigneeMemberId: toMemberId ?? null }
+          : r)),
+        requestEvents: [...b.requestEvents, event],
+      }));
+      setModal(null);
+      toast(toMemberId
+        ? `Transferred to ${members.find((m) => m.id === toMemberId)?.name ?? "someone else"} — logged`
+        : "Declined — logged");
+    } catch (e) { toast(`Sync failed: ${e.message}`, "error"); }
+  };
+
   /* --------------------------- task calendar marks -------------------------- */
   const saveTaskMark = (taskId, mark) => {
     dispatch({ type: "MARK_TASK", taskId, ...mark });
@@ -1470,6 +1699,7 @@ export default function PuroductiveApp({ session }) {
 
   const NAV = [
     { key: "dashboard", label: "Dashboard", icon: LayoutGrid },
+    { key: "board", label: "Board", icon: MessageSquare },
     { key: "companies", label: "Companies", icon: Building2 },
     { key: "projects", label: "Projects", icon: FolderKanban },
     { key: "team", label: "Team", icon: Users },
@@ -1652,6 +1882,16 @@ export default function PuroductiveApp({ session }) {
             onDeleteMember={deleteMember}
             onManageGroups={() => setModal({ kind: "groupsManage" })} />
         )}
+        {view === "board" && (
+          <BoardView board={board} mediaUrls={mediaUrls} available={boardAvailable}
+            members={members} projects={projects} companies={companies}
+            myUserId={session?.user?.id} myMemberId={myMemberId} readOnly={readOnly}
+            onCompose={() => setModal({ kind: "post" })}
+            onComment={addComment} onVote={vote} onDelete={deletePost}
+            onAccept={acceptRequest}
+            onDecline={(req) => setModal({ kind: "declineRequest", req })}
+            onOpenProject={(id) => { setOpenProjectId(id); setView("projects"); }} />
+        )}
         {view === "people" && (
           <PeopleView memberships={memberships} members={members} workspace={activeWorkspace} myRole={myRole}
             myEmail={session?.user?.email}
@@ -1749,6 +1989,14 @@ export default function PuroductiveApp({ session }) {
       )}
       {!interventionTask && modal?.kind === "workspace" && (
         <WorkspaceForm onSave={addWorkspace} onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "post" && (
+        <PostComposer members={members} projects={projects} tasks={engine.tasks}
+          onSave={createPost} onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "declineRequest" && (
+        <DeclineRequestModal req={modal.req} members={members}
+          onConfirm={(x) => declineRequest(modal.req, x)} onClose={() => setModal(null)} />
       )}
     </div>
   );
@@ -2549,6 +2797,552 @@ const GroupsManageModal = ({ groups, onSave, onDelete, onClose }) => {
       </div>
       <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 18 }}>
         <Btn ghost onClick={onClose}>Done</Btn>
+      </div>
+    </Modal>
+  );
+};
+
+/* ============================================================================
+ * THE BOARD — a workspace feed where posts carry an intent
+ * ==========================================================================*/
+const BoardView = ({ board, mediaUrls, available, members, projects, companies, myUserId, myMemberId,
+  readOnly, onCompose, onComment, onVote, onDelete, onAccept, onDecline, onOpenProject }) => {
+  const [filter, setFilter] = useState("all");
+
+  if (!available) {
+    return (
+      <div className="pd-fade-in">
+        <PageHead kicker="Collaboration" title="Board" />
+        <Card style={{ padding: 26 }}>
+          <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <AlertTriangle size={18} style={{ color: "#B45309", flexShrink: 0, marginTop: 1 }} />
+            <div style={{ fontSize: 13, color: T.ink2, lineHeight: 1.65 }}>
+              The board's tables aren't in your database yet. Run
+              <span className="pd-num"> supabase/schema_v5.sql </span>
+              once in the Supabase SQL editor and reload — it adds posts, comments, polls and task
+              requests, plus the private storage bucket the photos and videos go in.
+              <div style={{ marginTop: 8, color: T.ink3, fontSize: 12 }}>
+                Everything else in Puroductive keeps working in the meantime.
+              </div>
+            </div>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  const posts = filter === "all" ? board.posts : board.posts.filter((p) => p.kind === filter);
+  /* Requests needing a decision from me float to the top — a board is only
+   * useful if the thing waiting on you is the thing you see first. */
+  const mine = board.requests.filter((r) => r.status === "pending" && r.assigneeMemberId === myMemberId);
+
+  return (
+    <div className="pd-fade-in">
+      <PageHead kicker="Collaboration" title="Board"
+        sub="Share work, ask for opinions, hand out tasks, run a poll. Every task request keeps a permanent paper trail."
+        action={<Btn disabled={readOnly} onClick={onCompose}><Plus size={15} /> New post</Btn>} />
+
+      {mine.length > 0 && (
+        <Card soft style={{ padding: "13px 17px", marginBottom: 18, display: "flex", alignItems: "center", gap: 11,
+          border: "1px solid #F3D19E", background: "#FFFCF6" }}>
+          <UserCheck size={15} style={{ color: "#B45309", flexShrink: 0 }} />
+          <span style={{ fontSize: 12.5, color: T.ink2 }}>
+            <strong>{mine.length} task request{mine.length !== 1 ? "s" : ""}</strong> waiting on you below.
+          </span>
+        </Card>
+      )}
+
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 18 }}>
+        {[["all", "Everything"], ...Object.entries(POST_KIND_META).map(([k, m]) => [k, m.label])].map(([key, label]) => {
+          const on = filter === key;
+          return (
+            <button key={key} onClick={() => setFilter(key)} className="pd-press" style={{
+              minHeight: 32, padding: "0 13px", borderRadius: 99, cursor: "pointer",
+              fontSize: 12, fontWeight: on ? 600 : 450,
+              color: on ? "#243305" : T.ink3,
+              background: on ? "#EFFCC9" : "#FFFFFF",
+              border: `1px solid ${on ? "#C9E88A" : T.line}`,
+            }}>{label}</button>
+          );
+        })}
+      </div>
+
+      <div style={{ display: "grid", gap: 14 }}>
+        {posts.map((p) => (
+          <PostCard key={p.id} post={p} board={board} mediaUrls={mediaUrls}
+            members={members} projects={projects} myUserId={myUserId} myMemberId={myMemberId}
+            readOnly={readOnly}
+            onComment={onComment} onVote={onVote} onDelete={onDelete}
+            onAccept={onAccept} onDecline={onDecline} onOpenProject={onOpenProject} />
+        ))}
+        {posts.length === 0 && (
+          <Empty text={filter === "all"
+            ? "Nothing on the board yet — post a photo, ask a question, or hand someone a task."
+            : `No ${POST_KIND_META[filter].label.toLowerCase()} posts yet.`} />
+        )}
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------- POST CARD -------------------------------- */
+const PostCard = ({ post, board, mediaUrls, members, projects, myUserId, myMemberId, readOnly,
+  onComment, onVote, onDelete, onAccept, onDecline, onOpenProject }) => {
+  const [draft, setDraft] = useState("");
+  const [showTrail, setShowTrail] = useState(false);
+  const meta = POST_KIND_META[post.kind] ?? POST_KIND_META.update;
+  const Icon = meta.icon;
+  const media = board.media.filter((m) => m.postId === post.id);
+  const comments = board.comments.filter((c) => c.postId === post.id);
+  const request = board.requests.find((r) => r.postId === post.id);
+  const author = members.find((m) => m.id === post.authorMemberId);
+  const project = projects.find((p) => p.id === post.projectId);
+  const isAuthor = post.authorId === myUserId;
+
+  const submit = () => { if (draft.trim()) { onComment(post.id, draft.trim()); setDraft(""); } };
+
+  return (
+    <Card style={{ padding: 0, overflow: "hidden" }}>
+      {/* header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 11, padding: "15px 18px 12px" }}>
+        <div style={{ width: 32, height: 32, borderRadius: 99, flexShrink: 0, display: "grid", placeItems: "center",
+          background: T.bg, border: `1px solid ${T.line}`, fontSize: 12, fontWeight: 600, color: T.ink2 }}>
+          {(author?.name ?? "?").slice(0, 1).toUpperCase()}
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{author?.name ?? "Someone"}</div>
+          <div className="pd-num" style={{ fontSize: 11, color: T.ink3, marginTop: 1 }}>
+            {new Date(post.at).toLocaleString("en", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
+            {project ? ` · ${project.name}` : ""}
+          </div>
+        </div>
+        <Chip bg={meta.bg} color={meta.color}><Icon size={10} /> {meta.label}</Chip>
+        {isAuthor && !readOnly && (
+          <IconBtn label="Delete post" danger onClick={() => onDelete(post)}><Trash2 size={13} /></IconBtn>
+        )}
+      </div>
+
+      {post.caption && (
+        <div style={{ padding: "0 18px 13px", fontSize: 13.5, color: T.ink, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
+          {post.caption}
+        </div>
+      )}
+
+      {media.length > 0 && <MediaGrid media={media} mediaUrls={mediaUrls} />}
+
+      {post.kind === "poll" && (
+        <PollPanel post={post} board={board} myUserId={myUserId} readOnly={readOnly} onVote={onVote} />
+      )}
+
+      {request && (
+        <TaskRequestPanel request={request} board={board} members={members}
+          myMemberId={myMemberId} readOnly={readOnly}
+          showTrail={showTrail} onToggleTrail={() => setShowTrail((s) => !s)}
+          onAccept={onAccept} onDecline={onDecline} onOpenProject={onOpenProject} />
+      )}
+
+      {/* comments — the "what are your thoughts" surface */}
+      <div style={{ borderTop: `1px solid ${T.lineSoft}`, padding: "12px 18px 15px", background: T.cardSoft }}>
+        {comments.length > 0 && (
+          <div style={{ display: "grid", gap: 9, marginBottom: 11 }}>
+            {comments.map((c) => {
+              const who = members.find((m) => m.id === c.authorMemberId);
+              return (
+                <div key={c.id} style={{ display: "flex", gap: 9 }}>
+                  <div style={{ width: 24, height: 24, borderRadius: 99, flexShrink: 0, display: "grid", placeItems: "center",
+                    background: "#FFFFFF", border: `1px solid ${T.line}`, fontSize: 10, fontWeight: 600, color: T.ink3 }}>
+                    {(who?.name ?? "?").slice(0, 1).toUpperCase()}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: T.ink }}>{who?.name ?? "Someone"}</span>
+                    <span style={{ fontSize: 12.5, color: T.ink2, marginLeft: 7, lineHeight: 1.55 }}>{c.body}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {!readOnly && (
+          <div style={{ display: "flex", gap: 8 }}>
+            <input style={{ ...inputStyle, minHeight: 36, fontSize: 12.5 }} value={draft}
+              placeholder={post.kind === "discussion" ? "Share your thoughts…" : "Add a comment…"}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } }} />
+            <Btn small disabled={!draft.trim()} onClick={submit}><Send size={13} /></Btn>
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+};
+
+/* Signed URLs are minted at load; a missing one means the signature request
+ * failed or expired, so say so rather than rendering a broken image icon. */
+const MediaGrid = ({ media, mediaUrls }) => (
+  <div style={{ display: "grid", gap: 3,
+    gridTemplateColumns: media.length === 1 ? "1fr" : "repeat(auto-fit, minmax(160px, 1fr))" }}>
+    {media.map((m) => {
+      const url = mediaUrls[m.path];
+      if (!url) {
+        return (
+          <div key={m.id} style={{ aspectRatio: "4 / 3", display: "grid", placeItems: "center",
+            background: T.bg, color: T.ink3, fontSize: 11.5 }}>
+            <span><ImageIcon size={14} style={{ verticalAlign: "-2px", marginRight: 5 }} />Preview unavailable</span>
+          </div>
+        );
+      }
+      return m.mediaType === "video"
+        ? <video key={m.id} src={url} controls preload="metadata"
+            style={{ width: "100%", maxHeight: 420, objectFit: "cover", background: "#000", display: "block" }} />
+        : <img key={m.id} src={url} alt="" loading="lazy"
+            style={{ width: "100%", maxHeight: 420, objectFit: "cover", display: "block" }} />;
+    })}
+  </div>
+);
+
+/* --------------------------------- POLL ----------------------------------- */
+const PollPanel = ({ post, board, myUserId, readOnly, onVote }) => {
+  const options = board.pollOptions.filter((o) => o.postId === post.id);
+  const votes = board.pollVotes.filter((v) => v.postId === post.id);
+  const myVote = votes.find((v) => v.voterId === myUserId);
+  const total = votes.length;
+  return (
+    <div style={{ padding: "4px 18px 16px", display: "grid", gap: 7 }}>
+      {options.map((o) => {
+        const count = votes.filter((v) => v.optionId === o.id).length;
+        const pct = total ? Math.round((count / total) * 100) : 0;
+        const on = myVote?.optionId === o.id;
+        return (
+          <button key={o.id} onClick={() => !readOnly && onVote(post.id, o.id)}
+            disabled={readOnly} className="pd-press" style={{
+              position: "relative", overflow: "hidden", display: "flex", alignItems: "center", gap: 10,
+              minHeight: 40, padding: "0 13px", borderRadius: 10, textAlign: "left",
+              cursor: readOnly ? "default" : "pointer",
+              border: `1px solid ${on ? "#B3A0F2" : T.line}`, background: "#FFFFFF",
+            }}>
+            {/* the fill bar sits behind the label rather than beside it, so a
+              * long option name never squeezes the percentage off the row */}
+            <div style={{ position: "absolute", inset: 0, width: `${pct}%`,
+              background: on ? "#EEE9FD" : T.bg, transition: "width 240ms ease" }} />
+            <span style={{ position: "relative", flex: 1, fontSize: 12.5, fontWeight: on ? 600 : 450, color: T.ink }}>
+              {o.label}
+            </span>
+            {on && <Check size={12} style={{ position: "relative", color: "#7C5CDB" }} />}
+            <span className="pd-num" style={{ position: "relative", fontSize: 11.5, fontWeight: 600, color: T.ink3 }}>
+              {pct}%
+            </span>
+          </button>
+        );
+      })}
+      <div style={{ fontSize: 11, color: T.ink3, marginTop: 2 }}>
+        {total} vote{total !== 1 ? "s" : ""}{myVote ? " · tap another option to change yours" : ""}
+      </div>
+    </div>
+  );
+};
+
+/* --------------------------- TASK REQUEST PANEL ----------------------------
+ * The paper trail is shown inline rather than hidden in a report, because the
+ * person deciding whether to accept benefits most from seeing that two people
+ * have already passed it along. */
+const TaskRequestPanel = ({ request, board, members, myMemberId, readOnly, showTrail, onToggleTrail,
+  onAccept, onDecline, onOpenProject }) => {
+  const events = board.requestEvents.filter((e) => e.requestId === request.id);
+  const assignee = members.find((m) => m.id === request.assigneeMemberId);
+  const forMe = request.assigneeMemberId === myMemberId && request.status === "pending";
+  const statusMeta = {
+    pending:     { label: "Awaiting a decision", bg: "#FDF3E3", color: "#B45309" },
+    accepted:    { label: "Accepted", bg: "#F2FADF", color: "#3F6212" },
+    declined:    { label: "Declined — unassigned", bg: "#FDECEA", color: "#B91C1C" },
+    transferred: { label: "Transferred", bg: "#EAF6FE", color: "#0284C7" },
+    cancelled:   { label: "Cancelled", bg: "#F3F3EE", color: "#5A5F69" },
+  }[request.status] ?? { label: request.status, bg: "#F3F3EE", color: "#5A5F69" };
+
+  return (
+    <div style={{ margin: "0 18px 15px", padding: 15, borderRadius: 13,
+      border: `1px solid ${forMe ? "#F3D19E" : T.line}`, background: forMe ? "#FFFCF6" : T.cardSoft }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 9 }}>
+        <span style={{ fontSize: 13.5, fontWeight: 600, color: T.ink, flex: 1, minWidth: 140 }}>{request.title}</span>
+        <Chip bg={statusMeta.bg} color={statusMeta.color}>{statusMeta.label}</Chip>
+      </div>
+      <div className="pd-num" style={{ fontSize: 11.5, color: T.ink3, marginBottom: forMe ? 13 : 9 }}>
+        For {assignee?.name ?? "nobody yet"}
+        {request.deadline ? ` · due ${request.deadline}` : ""} · weight {request.weight}
+      </div>
+
+      {forMe && !readOnly && (
+        <div style={{ display: "flex", gap: 9, flexWrap: "wrap", marginBottom: 11 }}>
+          <Btn small onClick={() => onAccept(request)}><Check size={13} /> Accept — make it a task</Btn>
+          <Btn small ghost onClick={() => onDecline(request)}>
+            <ArrowRightLeft size={13} /> Not mine — pass it on
+          </Btn>
+        </div>
+      )}
+
+      {request.status === "accepted" && request.projectId && (
+        <Btn small ghost onClick={() => onOpenProject(request.projectId)}>
+          <ChevronRight size={13} /> Open the project
+        </Btn>
+      )}
+
+      {/* the permanent record */}
+      <button onClick={onToggleTrail} className="pd-press" style={{
+        display: "inline-flex", alignItems: "center", gap: 6, marginTop: 4, padding: 0,
+        background: "none", border: "none", cursor: "pointer",
+        fontSize: 11.5, fontWeight: 600, color: T.ink3,
+      }}>
+        <History size={12} /> {showTrail ? "Hide" : "Show"} paper trail ({events.length})
+      </button>
+      {showTrail && (
+        <div style={{ marginTop: 11, display: "grid", gap: 8, paddingTop: 11, borderTop: `1px solid ${T.lineSoft}` }}>
+          {events.map((e) => {
+            const from = members.find((m) => m.id === e.fromMemberId);
+            const to = members.find((m) => m.id === e.toMemberId);
+            const line = {
+              requested: `Requested${to ? ` from ${to.name}` : ""}`,
+              accepted: `Accepted${to ? ` by ${to.name}` : ""}`,
+              declined: `Declined${from ? ` by ${from.name}` : ""}`,
+              transferred: `Passed${from ? ` from ${from.name}` : ""}${to ? ` to ${to.name}` : ""}`,
+              cancelled: "Cancelled",
+            }[e.action] ?? e.action;
+            return (
+              <div key={e.id} style={{ display: "flex", gap: 9, alignItems: "flex-start" }}>
+                <span style={{ width: 6, height: 6, borderRadius: 99, marginTop: 6, flexShrink: 0,
+                  background: e.action === "declined" ? "#B91C1C" : e.action === "accepted" ? T.limeDeep : T.ink3 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: T.ink }}>{line}</div>
+                  {e.reason && <div style={{ fontSize: 11.5, color: T.ink2, marginTop: 1, lineHeight: 1.5 }}>“{e.reason}”</div>}
+                  <div className="pd-num" style={{ fontSize: 10.5, color: T.ink3, marginTop: 2 }}>
+                    {new Date(e.at).toLocaleString("en", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* ------------------------------ POST COMPOSER ------------------------------
+ * The kind is picked first and everything below adapts to it, because the
+ * fields a poll needs and the fields a task request needs have nothing in
+ * common — showing all of them at once and greying most out would be worse. */
+const PostComposer = ({ members, projects, tasks, onSave, onClose }) => {
+  const [kind, setKind] = useState("update");
+  const [caption, setCaption] = useState("");
+  const [projectId, setProjectId] = useState("");
+  const [files, setFiles] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [pollOptions, setPollOptions] = useState(["", ""]);
+  const [req, setReq] = useState({ title: "", assigneeMemberId: "", deadline: "", weight: 1 });
+  const [taskId, setTaskId] = useState("");
+
+  const onPick = (e) => {
+    /* 50 MB is the bucket's per-object limit (schema_v5.sql), so reject
+     * oversize files here rather than after a long upload that then fails. */
+    const picked = [...e.target.files].filter((f) => {
+      if (f.size > 50 * 1024 * 1024) { alert(`"${f.name}" is over the 50 MB limit and was skipped.`); return false; }
+      return true;
+    });
+    setFiles((cur) => [...cur, ...picked].slice(0, 6));
+    e.target.value = "";
+  };
+
+  const validPoll = pollOptions.filter((o) => o.trim()).length >= 2;
+  const ready = !busy && (
+    kind === "poll" ? validPoll && caption.trim()
+    : kind === "task_request" ? req.title.trim() && req.assigneeMemberId
+    : caption.trim() || files.length
+  );
+
+  const submit = async () => {
+    setBusy(true);
+    await onSave({
+      kind, caption: caption.trim(), projectId, taskId: kind === "accomplished" ? taskId : "",
+      pollOptions, requestTitle: req.title.trim(), assigneeMemberId: req.assigneeMemberId,
+      requestDeadline: req.deadline, requestWeight: req.weight,
+    }, files);
+    setBusy(false);
+  };
+
+  return (
+    <Modal title="New post" wide onClose={onClose}
+      subtitle="Pick what you want back from people — that's what changes how the post behaves.">
+      <div style={{ display: "grid", gap: 18 }}>
+        <div>
+          <Label>What is this?</Label>
+          <div style={{ display: "grid", gap: 6 }}>
+            {Object.entries(POST_KIND_META).map(([key, meta]) => {
+              const on = kind === key;
+              const Icon = meta.icon;
+              return (
+                <button key={key} type="button" onClick={() => setKind(key)} className="pd-press" style={{
+                  display: "flex", alignItems: "center", gap: 11, padding: "11px 13px", borderRadius: 11,
+                  cursor: "pointer", textAlign: "left",
+                  background: on ? meta.bg : "#FFFFFF", border: `1px solid ${on ? meta.color + "44" : T.line}`,
+                }}>
+                  <Icon size={15} style={{ color: on ? meta.color : T.ink3, flexShrink: 0 }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: on ? 600 : 500, color: on ? meta.color : T.ink }}>{meta.label}</div>
+                    <div style={{ fontSize: 11, color: T.ink3, marginTop: 1 }}>{meta.blurb}</div>
+                  </div>
+                  {on && <Check size={13} style={{ color: meta.color, flexShrink: 0 }} />}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div>
+          <Label>{kind === "poll" ? "Question" : "Caption"}</Label>
+          <textarea rows={3} style={{ ...inputStyle, minHeight: 78, paddingTop: 11, resize: "vertical" }}
+            value={caption} onChange={(e) => setCaption(e.target.value)}
+            placeholder={kind === "poll" ? "e.g. Which finish for the lobby wall?"
+              : kind === "discussion" ? "e.g. Ceiling detail came out like this — thoughts before we repeat it?"
+              : kind === "task_request" ? "Any context for the person you're asking…"
+              : "Say something about this…"} />
+        </div>
+
+        {kind === "poll" && (
+          <div>
+            <Label>Options</Label>
+            <div style={{ display: "grid", gap: 7 }}>
+              {pollOptions.map((o, i) => (
+                <div key={i} style={{ display: "flex", gap: 8 }}>
+                  <input style={inputStyle} value={o} placeholder={`Option ${i + 1}`}
+                    onChange={(e) => setPollOptions((os) => os.map((x, j) => (j === i ? e.target.value : x)))} />
+                  {pollOptions.length > 2 && (
+                    <IconBtn label="Remove option" danger
+                      onClick={() => setPollOptions((os) => os.filter((_, j) => j !== i))}>
+                      <X size={13} />
+                    </IconBtn>
+                  )}
+                </div>
+              ))}
+            </div>
+            {pollOptions.length < 6 && (
+              <Btn small ghost onClick={() => setPollOptions((os) => [...os, ""])} >
+                <Plus size={12} /> Add option
+              </Btn>
+            )}
+          </div>
+        )}
+
+        {kind === "task_request" && (
+          <>
+            <div><Label>What needs doing?</Label>
+              <input style={inputStyle} value={req.title} onChange={(e) => setReq({ ...req, title: e.target.value })}
+                placeholder="e.g. Re-do the skirting on the north wall" /></div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 12 }}>
+              <div><Label>Ask who?</Label>
+                <select style={inputStyle} value={req.assigneeMemberId}
+                  onChange={(e) => setReq({ ...req, assigneeMemberId: e.target.value })}>
+                  <option value="">Select someone…</option>
+                  {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+                </select></div>
+              <div><Label>Deadline</Label>
+                <input type="date" style={inputStyle} value={req.deadline}
+                  onChange={(e) => setReq({ ...req, deadline: e.target.value })} /></div>
+              <div><Label>Weight</Label>
+                <input type="number" min={1} max={10} style={inputStyle} value={req.weight}
+                  onChange={(e) => setReq({ ...req, weight: Math.max(1, Math.min(10, +e.target.value || 1)) })} /></div>
+            </div>
+            <p style={{ margin: 0, fontSize: 11.5, color: T.ink3, lineHeight: 1.55 }}>
+              They can accept it — which turns it into a real task — or pass it to someone else with a
+              reason. Either way it's written to a permanent trail that shows up in reports.
+            </p>
+          </>
+        )}
+
+        {kind === "accomplished" && (
+          <div><Label>Which task? (optional)</Label>
+            <select style={inputStyle} value={taskId} onChange={(e) => setTaskId(e.target.value)}>
+              <option value="">Not linked to a task</option>
+              {tasks.filter((t) => t.state !== "completed").map((t) => (
+                <option key={t.id} value={t.id}>{t.title}</option>
+              ))}
+            </select></div>
+        )}
+
+        <div><Label>Project (optional)</Label>
+          <select style={inputStyle} value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+            <option value="">—</option>
+            {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select></div>
+
+        <div>
+          <Label>Photos & video</Label>
+          <label className="pd-press" style={{
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 9, minHeight: 46,
+            borderRadius: 11, cursor: "pointer", border: `1px dashed ${T.line}`, background: T.cardSoft,
+            fontSize: 12.5, color: T.ink2, fontWeight: 500,
+          }}>
+            <Paperclip size={14} /> Choose files — up to 6, 50 MB each
+            <input type="file" multiple accept="image/*,video/*" onChange={onPick} style={{ display: "none" }} />
+          </label>
+          {files.length > 0 && (
+            <div style={{ display: "grid", gap: 6, marginTop: 9 }}>
+              {files.map((f, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 11px",
+                  borderRadius: 9, border: `1px solid ${T.line}`, fontSize: 12 }}>
+                  <ImageIcon size={13} style={{ color: T.ink3, flexShrink: 0 }} />
+                  <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis",
+                    whiteSpace: "nowrap", color: T.ink2 }}>{f.name}</span>
+                  <span className="pd-num" style={{ fontSize: 11, color: T.ink3 }}>{(f.size / 1048576).toFixed(1)} MB</span>
+                  <IconBtn label="Remove file" danger onClick={() => setFiles((fs) => fs.filter((_, j) => j !== i))}>
+                    <X size={12} />
+                  </IconBtn>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          <Btn ghost onClick={onClose}>Cancel</Btn>
+          <Btn disabled={!ready} onClick={submit}>
+            <Send size={14} /> {busy ? "Posting…" : "Post"}
+          </Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+/* --------------------------- DECLINE / TRANSFER ---------------------------- */
+const DeclineRequestModal = ({ req, members, onConfirm, onClose }) => {
+  const [toMemberId, setToMemberId] = useState("");
+  const [reason, setReason] = useState("");
+  return (
+    <Modal title="Pass this on" subtitle={req.title} onClose={onClose}
+      tone="warn">
+      <div style={{ display: "grid", gap: 18 }}>
+        <div>
+          <Label>Who should do it instead?</Label>
+          <select style={inputStyle} value={toMemberId} onChange={(e) => setToMemberId(e.target.value)}>
+            <option value="">Nobody — just decline it</option>
+            {members.filter((m) => m.id !== req.assigneeMemberId)
+              .map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+          </select>
+        </div>
+        <div>
+          <Label>Why? (required)</Label>
+          <textarea rows={3} style={{ ...inputStyle, minHeight: 78, paddingTop: 11, resize: "vertical" }}
+            value={reason} autoFocus onChange={(e) => setReason(e.target.value)}
+            placeholder="e.g. This is site electrical — Priya handles that scope" />
+          <p style={{ margin: "7px 0 0", fontSize: 11, color: T.ink3, lineHeight: 1.55 }}>
+            This is written to the permanent record and cannot be edited or deleted afterwards.
+            It appears in the task's paper trail and in any report that includes it.
+          </p>
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          <Btn ghost onClick={onClose}>Cancel</Btn>
+          <Btn disabled={!reason.trim()} onClick={() => onConfirm({ toMemberId: toMemberId || null, reason: reason.trim() })}>
+            {toMemberId ? <><ArrowRightLeft size={14} /> Transfer</> : <><Ban size={14} /> Decline</>}
+          </Btn>
+        </div>
       </div>
     </Modal>
   );

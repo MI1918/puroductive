@@ -48,18 +48,26 @@ Run these SQL files **in order** in your Supabase project's SQL editor:
 
    Unlike v3, this one needs no editing before you run it — it discovers the
    owners from the data itself.
-5. In Supabase → Authentication → URL Configuration, set **Site URL** to
+5. [`supabase/schema_v5.sql`](supabase/schema_v5.sql) — **the collaborative
+   board.** Posts with an intent (update / discussion / task request / poll /
+   accomplished), photo and video attachments, comments, votes, and task
+   requests with an append-only paper trail. Also creates the **private**
+   `post-media` storage bucket and its access policies.
+
+   Purely additive — it only creates new tables. If you skip it, everything
+   else keeps working and the Board screen tells you it needs running.
+6. In Supabase → Authentication → URL Configuration, set **Site URL** to
    your deployed URL (e.g. `https://mi1918.github.io/puroductive/`) and add
    it to **Redirect URLs**. This is what was sending confirmation-email links
    to `localhost` instead of the live site — Supabase redirects there by
    default regardless of what the app requests unless this is set. If you
    also develop locally, add `http://localhost:5173/puroductive/` (or
    whatever port Vite prints) to Redirect URLs too.
-6. In Supabase → Authentication → Providers, make sure Email is enabled. By
+7. In Supabase → Authentication → Providers, make sure Email is enabled. By
    default Supabase requires email confirmation on sign-up; either confirm via
    the email you receive, or turn "Confirm email" off in Authentication →
    Settings for faster local testing.
-7. Grab your Project URL and anon/public key from Project Settings → API.
+8. Grab your Project URL and anon/public key from Project Settings → API.
 
 ## Workspaces, invites and roles
 
@@ -104,7 +112,9 @@ Then open the printed local URL, sign up for an account, and sign in.
 
 Tables actually read/written by the UI: `companies`, `team_members`
 + `member_company_links`, `member_groups`, `projects`, `tasks`, `task_transitions`,
-`handoffs`, `reflections`, `calendar_exceptions`, `calendar_events`, `work_sessions`.
+`handoffs`, `reflections`, `calendar_exceptions`, `calendar_events`, `work_sessions`,
+`workspaces`, `workspace_members`, `posts`, `post_media`, `post_comments`,
+`poll_options`, `poll_votes`, `task_requests`, `task_request_events`.
 
 Present in the schema but **not** used by this UI (no screen exercises them):
 `phase_templates`, `project_phases`, `attachments`, `daily_notes`, `sync_log`,
@@ -132,6 +142,8 @@ supabase/
   schema_v3.sql           — per-user ownership + RLS rewrite (run once)
   schema_v4.sql           — shared workspaces, invites, roles, team tasks,
                             leave tracking; RLS rewritten again (run once)
+  schema_v5.sql           — the board: posts, media, comments, polls, task
+                            requests + paper trail, storage bucket (run once)
   seed.sql               — legacy starter data, predates per-user ownership
 baseline backup/
   ARCHITECTURE.md        — the original local-first core design this UI's

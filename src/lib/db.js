@@ -459,3 +459,216 @@ export async function updateSessionLogout(id, logoutAt) {
   await supabase.from("work_sessions").update({ logout_at: logoutAt, updated_at: nowIso(), device_id: getDeviceId() })
     .eq("id", id).then(throwIfError);
 }
+
+/* ============================================================================
+ * THE BOARD (schema_v5) — posts, media, comments, polls, task requests
+ * ==========================================================================*/
+
+const rowToPost = (r) => ({
+  id: r.id, authorId: r.author_id, authorMemberId: r.author_member_id ?? null,
+  kind: r.kind, caption: r.caption ?? "", projectId: r.project_id ?? null,
+  taskId: r.task_id ?? null, pinned: !!r.pinned, at: r.created_at,
+});
+const rowToMedia = (r) => ({
+  id: r.id, postId: r.post_id, path: r.storage_path, mediaType: r.media_type, sortOrder: r.sort_order,
+});
+const rowToComment = (r) => ({
+  id: r.id, postId: r.post_id, authorId: r.author_id, authorMemberId: r.author_member_id ?? null,
+  body: r.body, at: r.created_at,
+});
+const rowToPollOption = (r) => ({ id: r.id, postId: r.post_id, label: r.label, sortOrder: r.sort_order });
+const rowToPollVote = (r) => ({ id: r.id, postId: r.post_id, optionId: r.option_id, voterId: r.voter_id });
+const rowToRequest = (r) => ({
+  id: r.id, postId: r.post_id, taskId: r.task_id ?? null, projectId: r.project_id ?? null,
+  title: r.title, deadline: r.deadline ?? null, weight: r.weight,
+  requestedBy: r.requested_by, assigneeMemberId: r.assignee_member_id ?? null,
+  status: r.status, at: r.created_at,
+});
+const rowToRequestEvent = (r) => ({
+  id: r.id, requestId: r.request_id, action: r.action,
+  fromMemberId: r.from_member_id ?? null, toMemberId: r.to_member_id ?? null,
+  reason: r.reason ?? "", actorId: r.actor_id, at: r.created_at,
+});
+
+/* One round-trip for the whole board. The feed is capped rather than fully
+ * paginated: a workspace's recent activity is what people actually scroll,
+ * and the child tables are then fetched only for the posts in that window so
+ * a year-old thread's comments aren't dragged along. */
+export async function fetchBoard(limit = 60) {
+  const posts = await scoped(supabase.from("posts").select("*"))
+    .order("created_at", { ascending: false }).limit(limit).then(throwIfError);
+  const ids = posts.map((p) => p.id);
+  if (!ids.length) {
+    return { posts: [], media: [], comments: [], pollOptions: [], pollVotes: [], requests: [], requestEvents: [] };
+  }
+
+  const [media, comments, pollOptions, pollVotes, requests] = await Promise.all([
+    scoped(supabase.from("post_media").select("*").in("post_id", ids)).order("sort_order").then(throwIfError),
+    scoped(supabase.from("post_comments").select("*").in("post_id", ids)).order("created_at").then(throwIfError),
+    scoped(supabase.from("poll_options").select("*").in("post_id", ids)).order("sort_order").then(throwIfError),
+    inWorkspace(supabase.from("poll_votes").select("*").in("post_id", ids)).then(throwIfError),
+    scoped(supabase.from("task_requests").select("*").in("post_id", ids)).then(throwIfError),
+  ]);
+
+  /* The paper trail is keyed by request, not post, so it needs the request ids
+   * that the query above just resolved. */
+  const requestIds = requests.map((r) => r.id);
+  const requestEvents = requestIds.length
+    ? await inWorkspace(supabase.from("task_request_events").select("*").in("request_id", requestIds))
+        .order("created_at").then(throwIfError)
+    : [];
+
+  return {
+    posts: posts.map(rowToPost),
+    media: media.map(rowToMedia),
+    comments: comments.map(rowToComment),
+    pollOptions: pollOptions.map(rowToPollOption),
+    pollVotes: pollVotes.map(rowToPollVote),
+    requests: requests.map(rowToRequest),
+    requestEvents: requestEvents.map(rowToRequestEvent),
+  };
+}
+
+/* --------------------------------- media ---------------------------------
+ * Objects live at '<workspace>/<post>/<file>' because the storage policies in
+ * schema_v5.sql read that first segment to authorise access. Writing outside
+ * the active workspace's folder would be rejected by the bucket, which is the
+ * intended safety net rather than something to route around. */
+export async function uploadPostMedia(postId, file) {
+  const workspaceId = ws();
+  const ext = (file.name.split(".").pop() || "bin").toLowerCase();
+  const path = `${workspaceId}/${postId}/${uid()}.${ext}`;
+  const { error } = await supabase.storage.from("post-media")
+    .upload(path, file, { cacheControl: "3600", upsert: false });
+  if (error) throw new Error(`Upload failed: ${error.message}`);
+  return { path, mediaType: file.type.startsWith("video/") ? "video" : "image" };
+}
+
+export async function insertPostMedia(postId, items) {
+  if (!items.length) return [];
+  const now = nowIso();
+  const rows = items.map((m, i) => ({
+    id: "pm-" + uid(), post_id: postId, workspace_id: ws(),
+    storage_path: m.path, media_type: m.mediaType, sort_order: i,
+    updated_at: now, created_at: now, device_id: getDeviceId(),
+  }));
+  await supabase.from("post_media").insert(rows).then(throwIfError);
+  return rows.map(rowToMedia);
+}
+
+/* The bucket is private, so rendering an image means minting a short-lived
+ * signed URL. Batched because a feed of ten posts would otherwise fire fifty
+ * separate requests. */
+export async function signMediaUrls(paths, expiresIn = 3600) {
+  if (!paths.length) return {};
+  const { data, error } = await supabase.storage.from("post-media").createSignedUrls(paths, expiresIn);
+  if (error) throw new Error(error.message);
+  const out = {};
+  for (const row of data ?? []) {
+    if (row.signedUrl && !row.error) out[row.path] = row.signedUrl;
+  }
+  return out;
+}
+
+/* ---------------------------------- posts --------------------------------- */
+export async function insertPost(p) {
+  const now = nowIso();
+  const { data: userData } = await supabase.auth.getUser();
+  const row = {
+    id: p.id, workspace_id: ws(), author_id: userData?.user?.id,
+    author_member_id: p.authorMemberId || null,
+    kind: p.kind, caption: p.caption || "",
+    project_id: p.projectId || null, task_id: p.taskId || null,
+    pinned: p.pinned ? 1 : 0, updated_at: now, created_at: now, device_id: getDeviceId(),
+  };
+  await supabase.from("posts").insert(row).then(throwIfError);
+  return rowToPost(row);
+}
+export async function softDeletePost(id) {
+  await supabase.from("posts")
+    .update({ deleted_at: nowIso(), updated_at: nowIso(), device_id: getDeviceId() })
+    .eq("id", id).then(throwIfError);
+}
+
+/* -------------------------------- comments -------------------------------- */
+export async function insertComment(postId, body, authorMemberId = null) {
+  const now = nowIso();
+  const { data: userData } = await supabase.auth.getUser();
+  const row = {
+    id: "cm-" + uid(), post_id: postId, workspace_id: ws(),
+    author_id: userData?.user?.id, author_member_id: authorMemberId,
+    body, updated_at: now, created_at: now, device_id: getDeviceId(),
+  };
+  await supabase.from("post_comments").insert(row).then(throwIfError);
+  return rowToComment(row);
+}
+
+/* ---------------------------------- polls --------------------------------- */
+export async function insertPollOptions(postId, labels) {
+  const now = nowIso();
+  const rows = labels.map((label, i) => ({
+    id: "po-" + uid(), post_id: postId, workspace_id: ws(),
+    label, sort_order: i, updated_at: now, created_at: now, device_id: getDeviceId(),
+  }));
+  await supabase.from("poll_options").insert(rows).then(throwIfError);
+  return rows.map(rowToPollOption);
+}
+
+/* Changing your mind updates the existing row — uq_poll_votes_post_voter
+ * makes a second insert impossible, so upsert on that constraint is the
+ * whole vote-or-revote path. */
+export async function castVote(postId, optionId) {
+  const now = nowIso();
+  const { data: userData } = await supabase.auth.getUser();
+  const row = {
+    id: "pv-" + uid(), post_id: postId, option_id: optionId, workspace_id: ws(),
+    voter_id: userData?.user?.id, updated_at: now, created_at: now, device_id: getDeviceId(),
+  };
+  const { error } = await supabase.from("poll_votes")
+    .upsert(row, { onConflict: "post_id,voter_id" });
+  if (error) throw new Error(error.message);
+  return rowToPollVote(row);
+}
+
+/* ------------------------------ task requests -----------------------------
+ * Every state change writes a task_request_events row. That table has no
+ * UPDATE policy, so once written the trail cannot be rewritten — which is
+ * what makes it worth putting in a report. */
+export async function insertTaskRequest(req) {
+  const now = nowIso();
+  const { data: userData } = await supabase.auth.getUser();
+  const row = {
+    id: req.id, post_id: req.postId, workspace_id: ws(),
+    task_id: null, project_id: req.projectId || null,
+    title: req.title, deadline: req.deadline || null, weight: req.weight ?? 1,
+    requested_by: userData?.user?.id, assignee_member_id: req.assigneeMemberId || null,
+    status: "pending", updated_at: now, created_at: now, device_id: getDeviceId(),
+  };
+  await supabase.from("task_requests").insert(row).then(throwIfError);
+  const event = await recordRequestEvent(row.id, {
+    action: "requested", toMemberId: req.assigneeMemberId || null, reason: req.reason || "",
+  });
+  return { request: rowToRequest(row), event };
+}
+
+export async function recordRequestEvent(requestId, { action, fromMemberId = null, toMemberId = null, reason = "" }) {
+  const now = nowIso();
+  const { data: userData } = await supabase.auth.getUser();
+  const row = {
+    id: "re-" + uid(), request_id: requestId, workspace_id: ws(),
+    action, from_member_id: fromMemberId, to_member_id: toMemberId,
+    reason: reason || null, actor_id: userData?.user?.id,
+    created_at: now, device_id: getDeviceId(),
+  };
+  await supabase.from("task_request_events").insert(row).then(throwIfError);
+  return rowToRequestEvent(row);
+}
+
+export async function updateTaskRequest(id, patch) {
+  await supabase.from("task_requests").update({
+    ...(patch.status !== undefined ? { status: patch.status } : {}),
+    ...(patch.assigneeMemberId !== undefined ? { assignee_member_id: patch.assigneeMemberId } : {}),
+    ...(patch.taskId !== undefined ? { task_id: patch.taskId } : {}),
+    updated_at: nowIso(), device_id: getDeviceId(),
+  }).eq("id", id).then(throwIfError);
+}
