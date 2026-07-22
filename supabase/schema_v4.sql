@@ -483,9 +483,15 @@ alter table public.tasks
 
 do $$
 declare
-  con record;
+  -- Named `hit`, not `con` — PL/pgSQL resolves bare identifiers against
+  -- declared variables before the SQL is parsed, so a loop variable sharing
+  -- its name with the `pg_constraint con` alias below gets substituted in
+  -- place of the alias. The query would then try to read con.conname off
+  -- this variable itself, before the loop has ever assigned it — "record
+  -- con is not assigned yet".
+  hit record;
 begin
-  for con in
+  for hit in
     select con.conname
     from pg_constraint con
     join pg_class rel on rel.oid = con.conrelid
@@ -495,7 +501,7 @@ begin
       and con.contype = 'c'
       and pg_get_constraintdef(con.oid) ilike '%ex_type%'
   loop
-    execute format('alter table public.calendar_exceptions drop constraint %I;', con.conname);
+    execute format('alter table public.calendar_exceptions drop constraint %I;', hit.conname);
   end loop;
 end $$;
 
