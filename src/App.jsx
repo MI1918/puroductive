@@ -3316,8 +3316,7 @@ const DeclineRequestModal = ({ req, members, onConfirm, onClose }) => {
   const [toMemberId, setToMemberId] = useState("");
   const [reason, setReason] = useState("");
   return (
-    <Modal title="Pass this on" subtitle={req.title} onClose={onClose}
-      tone="warn">
+    <Modal title="Pass this on" subtitle={req.title} onClose={onClose} tone="danger">
       <div style={{ display: "grid", gap: 18 }}>
         <div>
           <Label>Who should do it instead?</Label>
