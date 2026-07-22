@@ -48,6 +48,15 @@ Run these SQL files **in order** in your Supabase project's SQL editor:
 
    Unlike v3, this one needs no editing before you run it — it discovers the
    owners from the data itself.
+
+   `task_transitions` and `reflections` carry append-only triggers that refuse
+   every UPDATE, so the script suspends them just long enough to stamp
+   `workspace_id` onto rows written before workspaces existed, then switches
+   them straight back on — all inside one transaction, so a failure rolls the
+   suspension back too. **The script's final query is the receipt: every row
+   in the Results pane must say `ENABLED`.** If any says `DISABLED`, restore
+   your backup instead of using the app — a disabled trigger means the
+   reflection log is silently editable.
 5. [`supabase/schema_v5.sql`](supabase/schema_v5.sql) — **the collaborative
    board.** Posts with an intent (update / discussion / task request / poll /
    accomplished), photo and video attachments, comments, votes, and task

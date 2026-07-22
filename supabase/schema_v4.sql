@@ -167,12 +167,46 @@ declare
   u record;
   ws_id text;
   now_txt text := to_char(now() at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS"Z"');
+  suspended text[] := '{}';
+  trg record;
+  entry text;
 begin
   -- 3a. Column first, nullable, on every table.
   foreach t in array data_tables loop
     execute format(
       'alter table public.%I add column if not exists workspace_id text references public.workspaces(id);', t
     );
+  end loop;
+
+  -- 3a-bis. THE APPEND-ONLY TRIGGERS.
+  --
+  -- task_transitions and reflections carry triggers that refuse every UPDATE
+  -- outright ("IMMUTABLE: this record is permanently logged"), ported from the
+  -- original SQLite schema — see `baseline backup/schema.sql`. That rule is
+  -- correct and stays; it is the reason the reflection log is worth anything.
+  -- But it also blocks this migration, which has to stamp a workspace_id onto
+  -- rows written before workspaces existed.
+  --
+  -- So the triggers are suspended for the length of the backfill and switched
+  -- straight back on. Two things make this safe rather than a hole in the
+  -- audit guarantee: it happens inside one transaction, so any failure rolls
+  -- the re-enable back in with everything else; and only triggers that were
+  -- enabled to begin with are recorded, so one you had deliberately disabled
+  -- is not silently switched on by this script.
+  for trg in
+    select c.relname::text as tbl, tg.tgname::text as name
+    from pg_trigger tg
+    join pg_class c on c.oid = tg.tgrelid
+    join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'public'
+      -- relname is `name`, not `text`; casting keeps this off the implicit
+      -- name/text operator, which is one of the easier things to trip over.
+      and c.relname::text = any(data_tables)
+      and not tg.tgisinternal   -- leave FK/constraint triggers alone
+      and tg.tgenabled = 'O'    -- 'O' = enabled in origin mode
+  loop
+    suspended := suspended || (trg.tbl || '|' || trg.name);
+    execute format('alter table public.%I disable trigger %I;', trg.tbl, trg.name);
   end loop;
 
   -- 3b. One personal workspace per user who owns any data today. Collect the
@@ -230,6 +264,15 @@ begin
     execute format('alter table public.%I alter column workspace_id set not null;', t);
     execute format('create index if not exists idx_%s_workspace on public.%I (workspace_id);', t, t);
   end loop;
+
+  -- 3e. Put the append-only guarantee back, exactly as it was found.
+  foreach entry in array suspended loop
+    execute format('alter table public.%I enable trigger %I;',
+                   split_part(entry, '|', 1), split_part(entry, '|', 2));
+  end loop;
+
+  raise notice 'Backfill complete. Re-enabled % trigger(s) that were suspended for the migration.',
+    coalesce(array_length(suspended, 1), 0);
 end $$;
 
 -- ============================================================================
@@ -286,6 +329,12 @@ create policy "membership updated by admins" on public.workspace_members
 do $$
 declare
   t text;
+  -- Append-only logs. These get SELECT and INSERT policies but deliberately
+  -- no UPDATE policy: the database triggers refuse updates anyway, and adding
+  -- a policy that says otherwise would misrepresent the design to anyone
+  -- reading the policy list — and would quietly permit rewriting history if
+  -- those triggers were ever dropped.
+  append_only text[] := array['task_transitions', 'reflections'];
 begin
   for t in select unnest(array[
     'companies', 'team_members', 'member_company_links', 'member_groups',
@@ -311,10 +360,12 @@ begin
     -- No DELETE policy anywhere on purpose: this app tombstones via
     -- deleted_at and never hard-deletes, so UPDATE is the only write path
     -- that removal needs. Leaving DELETE unpoliced means it is denied.
-    execute format(
-      'create policy "workspace update" on public.%I for update to authenticated
-         using (public.can_write_workspace(workspace_id))
-         with check (public.can_write_workspace(workspace_id));', t);
+    if not (t = any(append_only)) then
+      execute format(
+        'create policy "workspace update" on public.%I for update to authenticated
+           using (public.can_write_workspace(workspace_id))
+           with check (public.can_write_workspace(workspace_id));', t);
+    end if;
   end loop;
 end $$;
 
@@ -460,3 +511,32 @@ alter table public.calendar_exceptions
 -- how every pre-v4 row reads and why this stays nullable.
 alter table public.calendar_exceptions
   add column if not exists member_id text references public.team_members(id);
+
+-- ============================================================================
+-- 8. VERIFY
+-- ============================================================================
+--
+-- This is the last statement in the file, so its output is what lands in the
+-- Results pane when you run the script — no extra step needed. Section 3 has
+-- to suspend the append-only triggers to stamp workspace_id onto rows that
+-- predate workspaces, and this is the receipt that they came back.
+--
+-- Every row must read 'ENABLED'. Anything else means the migration did not
+-- finish cleanly — restore your backup rather than using the app, because a
+-- disabled trigger means the reflection log is silently editable.
+
+select
+  c.relname                                as table_name,
+  tg.tgname                                as trigger_name,
+  case tg.tgenabled
+    when 'O' then 'ENABLED'
+    when 'D' then 'DISABLED  <-- PROBLEM'
+    else 'enabled (' || tg.tgenabled || ')'
+  end                                      as status
+from pg_trigger tg
+join pg_class c on c.oid = tg.tgrelid
+join pg_namespace n on n.oid = c.relnamespace
+where n.nspname = 'public'
+  and not tg.tgisinternal
+  and c.relname in ('task_transitions', 'reflections', 'tasks', 'projects')
+order by c.relname, tg.tgname;
