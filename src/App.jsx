@@ -1320,6 +1320,16 @@ export default function PuroductiveApp({ session }) {
   });
   const [mediaUrls, setMediaUrls] = useState({});
 
+  /* ---------------------------- Google Calendar ------------------------------
+   * workspace-scoped, one connection per (user, workspace) — reloaded on
+   * every workspace switch same as everything else in the per-workspace
+   * effect below. */
+  const [googleConnection, setGoogleConnection] = useState(null);
+  const [googleSyncing, setGoogleSyncing] = useState(false);
+  const loadGoogleConnection = () => {
+    db.fetchGoogleConnection().then(setGoogleConnection).catch(() => {});
+  };
+
   /* ------------------------------ celebration -------------------------------
    * "big" is a project's sand stack filling completely; the small version is
    * any single on-time task completion. Confetti respects reduced-motion —
@@ -1448,6 +1458,7 @@ export default function PuroductiveApp({ session }) {
         setSessions(data.sessions);
         setEvents(data.events);
         setMemberships(mems);
+        loadGoogleConnection();
         seenTaskIds.current = new Set(data.tasks.map((t) => t.id));
         seenTransitionIds.current = new Set(data.transitions.map((t) => t.id));
         seenReflectionIds.current = new Set(data.reflections.map((r) => r.id));
@@ -1593,6 +1604,69 @@ export default function PuroductiveApp({ session }) {
      * (a Supabase Realtime subscription) for what's a low-frequency event. */
     const iv = setInterval(loadNotifications, 60_000);
     return () => clearInterval(iv);
+  }, []);
+
+  /* ------------------------- Google Calendar sync -------------------------- */
+  const connectGoogle = async () => {
+    try {
+      const authUrl = await db.startGoogleConnect(workspaceId);
+      // Full top-level navigation, deliberately — this leaves the SPA. See
+      // db.js's startGoogleConnect for why there's no way around that.
+      window.location.href = authUrl;
+    } catch (e) {
+      toast(`Could not start Google sign-in: ${e.message}`, "error");
+    }
+  };
+  const disconnectGoogleHandler = async () => {
+    if (!googleConnection) return;
+    setGoogleConnection(null);
+    try { await db.disconnectGoogleCalendar(googleConnection.id); toast("Google Calendar disconnected"); }
+    catch (e) { toast(`Sync failed: ${e.message}`, "error"); loadGoogleConnection(); }
+  };
+  const syncGoogleNow = async () => {
+    if (!googleConnection || googleSyncing) return;
+    setGoogleSyncing(true);
+    try {
+      const result = await db.syncGoogleCalendar(workspaceId);
+      loadGoogleConnection();
+      db.fetchBootstrap().then((data) => setEvents(data.events)).catch(() => {});
+      toast(`Synced — ${result.pulled} pulled, ${result.pushed} pushed${result.deleted ? `, ${result.deleted} removed` : ""}`);
+    } catch (e) {
+      toast(`Google sync failed: ${e.message}`, "error");
+    } finally {
+      setGoogleSyncing(false);
+    }
+  };
+
+  /* Polls while connected and the tab is open — matches the scope decision
+   * made before building this (sync-while-open first; a server-side
+   * scheduled job for "even when closed" is a documented follow-up, not
+   * built yet). 3 minutes: frequent enough to feel real, spaced out enough
+   * that it isn't hammering Google's API or constantly re-exchanging the
+   * refresh token. */
+  useEffect(() => {
+    if (!googleConnection) return;
+    const iv = setInterval(syncGoogleNow, 3 * 60_000);
+    return () => clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [googleConnection?.id]);
+
+  /* Lands here once, right after google-oauth-callback's redirect —
+   * ?google=connected or ?google=error&reason=.... Cleaned from the URL
+   * immediately so a refresh doesn't re-show the toast. */
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const status = params.get("google");
+    if (!status) return;
+    if (status === "connected") {
+      toast("Google Calendar connected");
+      loadGoogleConnection();
+    } else if (status === "error") {
+      toast(`Google Calendar connection failed (${params.get("reason") || "unknown reason"})`, "error");
+    }
+    params.delete("google"); params.delete("reason");
+    const clean = window.location.pathname + (params.toString() ? `?${params}` : "");
+    window.history.replaceState({}, "", clean);
   }, []);
 
   /* ---------------- ENGINE 7 wiring: report export ------------------------ */
@@ -2272,6 +2346,8 @@ export default function PuroductiveApp({ session }) {
             sessions={sessions} activeSession={activeSession} clockIn={clockIn} clockOut={clockOut}
             tasks={engine.tasks} alertsOn={alertsOn} enableAlerts={enableAlerts}
             events={events} projects={projects} companies={companies} members={members} groups={groups}
+            googleConnection={googleConnection} googleSyncing={googleSyncing}
+            onConnectGoogle={connectGoogle} onDisconnectGoogle={disconnectGoogleHandler} onSyncGoogleNow={syncGoogleNow}
             onAddEvent={(date) => setModal({ kind: "event", data: null, date })}
             onEditEvent={(ev) => setModal({ kind: "event", data: ev })}
             onDeleteEvent={deleteEvent}
@@ -4005,8 +4081,43 @@ const EVENT_TYPE_META = {
   other: { label: "Other", icon: CalendarClock, color: T.ink2, bg: T.cardSoft },
 };
 
+/* ------------------------- GOOGLE CALENDAR CONNECTION -----------------------
+ * Connect is a full-page redirect to Google (no way around that — a consent
+ * screen can't render in an iframe or a fetch response), so this card is
+ * mostly status + a couple of buttons, not a form. */
+const GoogleCalendarCard = ({ connection, syncing, onConnect, onDisconnect, onSyncNow }) => (
+  <Card style={{ padding: "16px 20px", marginBottom: 20, display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+    <div style={{ width: 38, height: 38, borderRadius: 11, flexShrink: 0, display: "grid", placeItems: "center",
+      background: connection ? "#F2FADF" : T.cardSoft, color: connection ? "#3F6212" : T.ink3 }}>
+      <CalendarDays size={17} />
+    </div>
+    <div style={{ flex: 1, minWidth: 200 }}>
+      <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>
+        {connection ? "Google Calendar connected" : "Google Calendar not connected"}
+      </div>
+      <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
+        {connection
+          ? `${connection.googleEmail ?? "Connected"}${connection.lastSyncedAt ? ` · last synced ${relativeTime(connection.lastSyncedAt)}` : " · not yet synced"}`
+          : "Two-way sync — events created here appear in Google, and vice versa. Runs while this tab is open."}
+      </div>
+    </div>
+    {connection ? (
+      <div style={{ display: "flex", gap: 8 }}>
+        <Btn small ghost disabled={syncing} onClick={onSyncNow}>
+          {syncing ? "Syncing…" : <><RotateCcw size={13} /> Sync now</>}
+        </Btn>
+        <Btn small danger onClick={onDisconnect}>Disconnect</Btn>
+      </div>
+    ) : (
+      <Btn small onClick={onConnect}><CalendarPlus size={14} /> Connect Google Calendar</Btn>
+    )}
+  </Card>
+);
+
 const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, tasks, alertsOn, enableAlerts,
-  events, projects, companies, members, groups, onAddEvent, onEditEvent, onDeleteEvent, onMarkDay, onOpenDay, onOpenProject }) => {
+  events, projects, companies, members, groups, googleConnection, googleSyncing,
+  onConnectGoogle, onDisconnectGoogle, onSyncGoogleNow,
+  onAddEvent, onEditEvent, onDeleteEvent, onMarkDay, onOpenDay, onOpenProject }) => {
   const isMobile = useIsMobile();
   const stats = computeMonthlyStats({ sessions, tasks, exceptions }, 0);
   const { start, end, label } = monthWindow(0);
@@ -4029,6 +4140,9 @@ const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, 
           <Btn ghost onClick={() => onMarkDay(today)}><Palmtree size={14} /> Mark a day</Btn>
           <Btn onClick={() => onAddEvent(today)}><CalendarPlus size={14} /> Add event</Btn>
         </div>} />
+
+      <GoogleCalendarCard connection={googleConnection} syncing={googleSyncing}
+        onConnect={onConnectGoogle} onDisconnect={onDisconnectGoogle} onSyncNow={onSyncGoogleNow} />
 
       {/* Clock + month stats strip */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14, marginBottom: 20 }}>

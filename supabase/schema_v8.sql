@@ -68,5 +68,14 @@ create policy "disconnect own connection" on public.google_calendar_connections
   with check (user_id = auth.uid());
 
 alter table public.calendar_events add column if not exists google_event_id text;
+-- Deliberately NOT a partial index (no `where google_event_id is not null`).
+-- Postgres's ON CONFLICT (columns) inference does not match a partial
+-- index from a plain column list — confirmed by testing the exact upsert
+-- the sync Edge Function issues, which failed with 42P10 "no unique or
+-- exclusion constraint matching the ON CONFLICT specification" against the
+-- partial version. The predicate was unnecessary anyway: multiple NULL
+-- google_event_id rows never violate a unique constraint under standard
+-- SQL NULL semantics, so this gives the same practical guarantee while
+-- actually working as an ON CONFLICT target.
 create unique index if not exists uq_calendar_events_google_event
-  on public.calendar_events (workspace_id, google_event_id) where google_event_id is not null;
+  on public.calendar_events (workspace_id, google_event_id);

@@ -316,6 +316,61 @@ export async function deleteChatMessage(id) {
     .eq("id", id).then(throwIfError);
 }
 
+/* --------------------------- Google Calendar sync --------------------------
+ * All three calls go through supabase.functions.invoke(), which attaches
+ * the current session's Authorization header automatically — none of these
+ * pass a token explicitly. */
+const rowToGoogleConnection = (r) => ({
+  id: r.id, workspaceId: r.workspace_id, googleEmail: r.google_email ?? null,
+  connectedAt: r.connected_at, lastSyncedAt: r.last_synced_at ?? null,
+});
+
+/* Same non-2xx error-body gotcha as sendWorkspaceInviteEmail() — see that
+ * function's comment. Pulled out here since three functions in this file
+ * now need it. */
+async function readFunctionError(error) {
+  if (!error) return null;
+  if (error.context && typeof error.context.json === "function") {
+    try {
+      const body = await error.context.json();
+      if (body?.error) return body.error;
+    } catch { /* body wasn't JSON */ }
+  }
+  return error.message;
+}
+
+export async function fetchGoogleConnection() {
+  const row = await scoped(supabase.from("google_calendar_connections").select("*"))
+    .maybeSingle().then(throwIfError);
+  return row ? rowToGoogleConnection(row) : null;
+}
+
+/* Returns the Google consent URL to send the browser to — the caller does
+ * `window.location.href = authUrl`, a full top-level navigation away from
+ * the app. There's no way around leaving the SPA for this: Google's consent
+ * screen can't be shown in an iframe or a fetch response. */
+export async function startGoogleConnect(workspaceId) {
+  const { data, error } = await supabase.functions.invoke("google-oauth-start", { body: { workspaceId } });
+  if (error) throw new Error((await readFunctionError(error)) || "Could not start Google sign-in");
+  if (data?.error) throw new Error(data.error);
+  return data.authUrl;
+}
+
+export async function syncGoogleCalendar(workspaceId) {
+  const { data, error } = await supabase.functions.invoke("google-calendar-sync", { body: { workspaceId } });
+  if (error) throw new Error((await readFunctionError(error)) || "Sync failed");
+  if (data?.error) throw new Error(data.error);
+  return data; // { pulled, deleted, pushed }
+}
+
+/* Disconnecting is the one write on this table the client does directly —
+ * everything else goes through the Edge Functions on the service role. */
+export async function disconnectGoogleCalendar(id) {
+  await supabase.from("google_calendar_connections")
+    .update({ deleted_at: nowIso(), updated_at: nowIso() })
+    .eq("id", id).then(throwIfError);
+}
+
 /* ------------------------------- bootstrap -------------------------------- */
 export async function fetchBootstrap() {
   const [companies, members, links, groups, projects, tasks, transitions, handoffs, reflections, exceptions, sessions, events] =
