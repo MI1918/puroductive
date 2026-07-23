@@ -8,6 +8,7 @@ import {
   CalendarPlus, Briefcase, Menu, GanttChart, Trophy, UserPlus, Star,
   ChevronsUpDown, Eye, Send, Layers, Palmtree, MessageSquare, Image as ImageIcon,
   BarChart2, HelpCircle, PartyPopper, ArrowRightLeft, Paperclip,
+  Crown, Medal, Zap, MessageCircle, Hash,
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient.js";
 import * as db from "./lib/db.js";
@@ -456,6 +457,78 @@ export function computeProductivityBreakdown(tasks) {
   };
 }
 
+/* ============================================================================
+ * ENGINE 8 — GAMIFICATION (pure, derived entirely from existing task data)
+ *
+ * "Feel like a game, but leading it requires being productive." Rather than
+ * a separate points ledger (its own table, its own migration, its own way
+ * to drift out of sync with what actually happened), points are computed
+ * straight off the same completed-task records the rest of the app already
+ * reads — a task's weight and whether it was completed late are already
+ * tracked, so a leaderboard is just a different lens on data that exists,
+ * not a new source of truth to keep consistent with the real one.
+ * ==========================================================================*/
+
+/* Late completion earns weight × 5, on-time earns weight × 10 — the whole
+ * mechanic is one line: being on time is worth double, so ranking well
+ * requires the actual thing this app is for, not just closing tickets. */
+export function pointsForTask(t) {
+  if (t.state !== "completed") return 0;
+  return t.weight * (t.completedLate ? 5 : 10);
+}
+
+/* One row per member, individually-assigned completions only — a
+ * team-scoped task has no single assignee to credit, and splitting its
+ * points across a group's membership gets arbitrary fast (who was actually
+ * on it?). Team output is already visible in the project's own sand stack;
+ * this is deliberately the individual half of the picture. */
+export function computeLeaderboard(tasks, members, sinceIso = null) {
+  const inWindow = (iso) => !sinceIso || new Date(iso) >= new Date(sinceIso);
+  const rows = new Map(members.map((m) => [m.id, {
+    member: m, points: 0, tasksDone: 0, onTime: 0, late: 0, weightDone: 0,
+  }]));
+  for (const t of tasks) {
+    if (t.state !== "completed" || !t.assigneeId || !t.completedAt || !inWindow(t.completedAt)) continue;
+    const row = rows.get(t.assigneeId);
+    if (!row) continue;
+    row.points += pointsForTask(t);
+    row.tasksDone++;
+    row.weightDone += t.weight;
+    if (t.completedLate) row.late++; else row.onTime++;
+  }
+  return [...rows.values()].sort((a, b) => b.points - a.points);
+}
+
+/* Consecutive days, counting back from today, with at least one on-time
+ * completion — a late completion breaks it, same "on time is what counts"
+ * rule as the points themselves. */
+export function computeStreak(tasks, memberId) {
+  const onTimeDays = new Set(
+    tasks
+      .filter((t) => t.assigneeId === memberId && t.state === "completed" && !t.completedLate && t.completedAt)
+      .map((t) => ymdOf(new Date(t.completedAt)))
+  );
+  let streak = 0;
+  const d = new Date();
+  while (onTimeDays.has(ymdOf(d))) { streak++; d.setDate(d.getDate() - 1); }
+  return streak;
+}
+
+export const LEVEL_TIERS = [
+  { min: 0,    label: "Getting Started",  color: "#8A8F99" },
+  { min: 150,  label: "Building Momentum", color: "#0284C7" },
+  { min: 500,  label: "On a Roll",         color: "#7CB518" },
+  { min: 1200, label: "Top Performer",     color: "#D97706" },
+  { min: 2500, label: "Legend",            color: "#7C5CDB" },
+];
+export function levelForPoints(points) {
+  let level = LEVEL_TIERS[0];
+  for (const tier of LEVEL_TIERS) { if (points >= tier.min) level = tier; }
+  const idx = LEVEL_TIERS.indexOf(level);
+  const next = LEVEL_TIERS[idx + 1] ?? null;
+  return { ...level, next, toNext: next ? next.min - points : 0 };
+}
+
 /* Open (non-completed) tasks whose deadline falls on this YYYY-MM-DD. */
 export function tasksDueOn(tasks, ymd) {
   return tasks.filter((t) => t.deadline === ymd && t.state !== "completed");
@@ -726,6 +799,8 @@ const GlobalStyle = () => (
       50% { transform: scale(1.035); filter: saturate(1.15); }
     }
     .pd-mold-creep { animation: pdMoldCreep 9s ease-in-out infinite; }
+    .pd-msg-del { opacity: 0; transition: opacity 150ms; }
+    .pd-msg-row:hover .pd-msg-del { opacity: 1; }
     @media (prefers-reduced-motion: reduce) {
       .pd-rise, .pd-press, .pd-fade-in, .pd-pop-in, .pd-sand-fill, .pd-shake, .pd-toast, .pd-mold-creep { animation: none !important; transition: none !important; }
       .pd-rise:hover { transform: none; }
@@ -1968,6 +2043,8 @@ export default function PuroductiveApp({ session }) {
     { key: "projects", label: "Projects", icon: FolderKanban },
     { key: "team", label: "Team", icon: Users },
     { key: "people", label: "People & access", icon: UserPlus },
+    { key: "leaderboard", label: "Leaderboard", icon: Trophy },
+    { key: "chat", label: "Chat", icon: MessageCircle },
     { key: "calendar", label: "Calendar", icon: CalendarDays },
     { key: "gantt", label: "Gantt", icon: GanttChart },
     { key: "reports", label: "Reports", icon: BarChart3 },
@@ -2182,6 +2259,13 @@ export default function PuroductiveApp({ session }) {
               db.renameWorkspace(workspaceId, name).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
               toast("Workspace renamed");
             }} />
+        )}
+        {view === "leaderboard" && (
+          <LeaderboardView tasks={engine.tasks} members={members} />
+        )}
+        {view === "chat" && (
+          <ChatView workspaceId={workspaceId} groups={groups} members={members}
+            myUserId={session?.user?.id} myMemberId={myMemberId} readOnly={readOnly} />
         )}
         {view === "calendar" && (
           <CalendarView exceptions={exceptions}
@@ -4691,6 +4775,228 @@ const GanttView = ({ companies, scopedProjects, members, tasks }) => {
           </div>
         </>
       )}
+    </div>
+  );
+};
+
+/* ============================================================================
+ * LEADERBOARD — the game layer. Every number on this screen traces back to
+ * completed tasks and nothing else; there's no separate "score" to inflate.
+ * ==========================================================================*/
+const RANK_ICON = [Crown, Medal, Medal]; // 1st, 2nd, 3rd — everyone else just gets a number
+const RANK_COLOR = ["#D97706", "#8A8F99", "#B45309"];
+
+const LeaderboardView = ({ tasks, members }) => {
+  const [windowKey, setWindowKey] = useState("month"); // month | allTime
+  const sinceIso = windowKey === "month" ? monthWindow(0).start.toISOString() : null;
+  const rows = computeLeaderboard(tasks, members, sinceIso).filter((r) => r.tasksDone > 0 || r.member.roles?.length);
+  const leader = rows[0];
+  const maxPoints = Math.max(1, ...rows.map((r) => r.points));
+
+  return (
+    <div className="pd-fade-in">
+      <PageHead kicker="The game layer" title="Leaderboard"
+        sub="Points come straight from completed task weight — on time counts double. Nothing here is a separate score to game."
+        action={
+          <div style={{ display: "flex", gap: 6, background: T.card, border: `1px solid ${T.line}`, borderRadius: 12, padding: 4, boxShadow: T.shadowSm }}>
+            {[["month", "This month"], ["allTime", "All-time"]].map(([key, label]) => {
+              const on = windowKey === key;
+              return (
+                <button key={key} onClick={() => setWindowKey(key)} className="pd-press" style={{
+                  minHeight: 34, padding: "0 14px", borderRadius: 9, cursor: "pointer", fontSize: 12.5, fontWeight: 600,
+                  color: on ? "#243305" : T.ink3, border: "none", position: "relative", overflow: "hidden",
+                  ...(on ? meshBackground(["#EFFCC9", "#D6F47A", "#BCE95C"]) : { background: "transparent" }),
+                }}>
+                  {on && <GrainOverlay opacity={0.2} radius={9} />}
+                  <span style={{ position: "relative" }}>{label}</span>
+                </button>
+              );
+            })}
+          </div>
+        } />
+
+      {leader && leader.points > 0 && (
+        <Mesh mesh={["#FDEED3", "#FBD38D", "#F6AD55"]} style={{
+          borderRadius: 22, padding: "22px 26px", marginBottom: 20,
+          border: "1px solid rgba(22,24,29,0.07)", boxShadow: T.shadowMd,
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+            <Crown size={28} style={{ color: "#78350F", flexShrink: 0 }} />
+            <div style={{ flex: 1, minWidth: 180 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.1em", textTransform: "uppercase", color: "#78350F", opacity: 0.75 }}>
+                In the lead
+              </div>
+              <div style={{ fontFamily: T.fontDisplay, fontSize: 22, fontWeight: 700, color: "#4A2A03", marginTop: 2 }}>
+                {leader.member.name}
+              </div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div className="pd-num" style={{ fontFamily: T.fontDisplay, fontSize: 30, fontWeight: 700, color: "#4A2A03" }}>{leader.points}</div>
+              <div style={{ fontSize: 10.5, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: "#78350F", opacity: 0.7 }}>points</div>
+            </div>
+          </div>
+        </Mesh>
+      )}
+
+      <div style={{ display: "grid", gap: 8 }}>
+        {rows.map((r, i) => {
+          const level = levelForPoints(r.points);
+          const streak = computeStreak(tasks, r.member.id);
+          const RankIcon = i < 3 ? RANK_ICON[i] : null;
+          return (
+            <Card key={r.member.id} style={{ padding: "14px 18px", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+              <div style={{ width: 28, textAlign: "center", flexShrink: 0 }}>
+                {RankIcon
+                  ? <RankIcon size={18} style={{ color: RANK_COLOR[i] }} />
+                  : <span className="pd-num" style={{ fontSize: 13, fontWeight: 700, color: T.ink3 }}>{i + 1}</span>}
+              </div>
+              <div style={{ width: 34, height: 34, borderRadius: 99, flexShrink: 0, display: "grid", placeItems: "center",
+                background: T.cardSoft, border: `1px solid ${T.line}`, fontSize: 12.5, fontWeight: 600, color: T.ink2 }}>
+                {r.member.name.slice(0, 1).toUpperCase()}
+              </div>
+              <div style={{ flex: 1, minWidth: 140 }}>
+                <div style={{ fontSize: 13.5, fontWeight: 600, color: T.ink }}>{r.member.name}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 3 }}>
+                  <Chip bg={level.color + "1A"} color={level.color}>{level.label}</Chip>
+                  {streak > 1 && <Chip bg="#FDF3E3" color="#B45309"><Zap size={10} /> {streak}-day streak</Chip>}
+                </div>
+              </div>
+              {/* Points bar — same visual language as StatBar in Reports, so the
+                * game layer still reads as part of the same product. */}
+              <div style={{ width: 140, height: 8, borderRadius: 99, background: T.lineSoft, overflow: "hidden", flexShrink: 0 }}>
+                <div style={{ width: `${(r.points / maxPoints) * 100}%`, height: "100%", background: level.color, borderRadius: 99,
+                  transition: "width 500ms cubic-bezier(.22,1,.36,1)" }} />
+              </div>
+              <div style={{ textAlign: "right", minWidth: 70, flexShrink: 0 }}>
+                <div className="pd-num" style={{ fontSize: 16, fontWeight: 700, color: T.ink }}>{r.points}</div>
+                <div style={{ fontSize: 10, color: T.ink3 }}>{r.tasksDone} task{r.tasksDone !== 1 ? "s" : ""}</div>
+              </div>
+            </Card>
+          );
+        })}
+        {rows.length === 0 && <Empty text="Nobody's completed a task yet — the board is wide open." />}
+      </div>
+    </div>
+  );
+};
+
+/* ============================================================================
+ * CHAT — General plus one channel per existing group. Not a separate
+ * "channels" concept: group_id null is General, group_id set is that group.
+ * ==========================================================================*/
+const ChatView = ({ workspaceId, groups, members, myUserId, myMemberId, readOnly }) => {
+  const [channelId, setChannelId] = useState(null); // null = General
+  const [messages, setMessages] = useState([]);
+  const [draft, setDraft] = useState("");
+  const [loading, setLoading] = useState(true);
+  const listRef = useRef(null);
+  const channels = [{ id: null, name: "General" }, ...groups];
+
+  const load = () => {
+    db.fetchChatMessages(channelId).then((msgs) => {
+      setMessages(msgs);
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    setLoading(true);
+    load();
+    /* Polling, not Realtime — matches the notification center's cadence
+     * decision (see App.jsx's notification effect) but faster, since chat
+     * reads as broken at 60s in a way a notification bell doesn't. */
+    const iv = setInterval(load, 4000);
+    return () => clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channelId, workspaceId]);
+
+  useEffect(() => {
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
+  }, [messages]);
+
+  const send = async () => {
+    const body = draft.trim();
+    if (!body) return;
+    setDraft("");
+    try {
+      const msg = await db.sendChatMessage(channelId, body, myMemberId);
+      setMessages((ms) => [...ms, msg]);
+    } catch (e) {
+      setDraft(body); // give the text back so nothing typed is lost
+    }
+  };
+  const remove = async (id) => {
+    setMessages((ms) => ms.filter((m) => m.id !== id));
+    db.deleteChatMessage(id).catch(load);
+  };
+
+  return (
+    <div className="pd-fade-in">
+      <PageHead kicker="Team & group chat" title="Chat"
+        sub="General is everyone in this workspace; each group below gets its own channel." />
+
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 16 }}>
+        {channels.map((c) => {
+          const on = channelId === c.id;
+          return (
+            <button key={c.id ?? "general"} onClick={() => setChannelId(c.id)} className="pd-press" style={{
+              display: "inline-flex", alignItems: "center", gap: 6,
+              minHeight: 32, padding: "0 13px", borderRadius: 99, cursor: "pointer",
+              fontSize: 12, fontWeight: on ? 600 : 450,
+              color: on ? "#243305" : T.ink3,
+              background: on ? "#EFFCC9" : T.card,
+              border: `1px solid ${on ? "#C9E88A" : T.line}`,
+            }}>
+              <Hash size={11} /> {c.name}
+            </button>
+          );
+        })}
+      </div>
+
+      <Card style={{ padding: 0, display: "flex", flexDirection: "column", height: 520 }}>
+        <div ref={listRef} className="pd-scroll" style={{ flex: 1, overflowY: "auto", padding: 18, display: "flex", flexDirection: "column", gap: 12 }}>
+          {loading ? (
+            <div style={{ fontSize: 12, color: T.ink3 }}>Loading…</div>
+          ) : messages.length === 0 ? (
+            <Empty text="No messages yet — say something." />
+          ) : messages.map((m) => {
+            const author = members.find((x) => x.id === m.authorMemberId);
+            const isMe = m.authorId === myUserId;
+            return (
+              <div key={m.id} className="pd-msg-row" style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+                <div style={{ width: 28, height: 28, borderRadius: 99, flexShrink: 0, display: "grid", placeItems: "center",
+                  background: T.cardSoft, border: `1px solid ${T.line}`, fontSize: 11, fontWeight: 600, color: T.ink2 }}>
+                  {(author?.name ?? "?").slice(0, 1).toUpperCase()}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 7 }}>
+                    <span style={{ fontSize: 12.5, fontWeight: 600, color: T.ink }}>{author?.name ?? "Someone"}</span>
+                    <span className="pd-num" style={{ fontSize: 10.5, color: T.ink3 }}>{relativeTime(m.at)}</span>
+                    {isMe && (
+                      <button onClick={() => remove(m.id)} className="pd-msg-del" style={{
+                        marginLeft: "auto", background: "none", border: "none",
+                        cursor: "pointer", color: T.ink3, fontSize: 10.5, padding: 0,
+                      }}>Delete</button>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 13, color: T.ink2, lineHeight: 1.5, marginTop: 2, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                    {m.body}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {!readOnly && (
+          <div style={{ display: "flex", gap: 10, padding: 14, borderTop: `1px solid ${T.lineSoft}` }}>
+            <input style={{ ...inputStyle, minHeight: 40 }} value={draft}
+              placeholder={`Message #${channels.find((c) => c.id === channelId)?.name ?? "General"}`}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
+            <Btn small disabled={!draft.trim()} onClick={send}><Send size={13} /></Btn>
+          </div>
+        )}
+      </Card>
     </div>
   );
 };

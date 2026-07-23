@@ -280,6 +280,42 @@ export async function declineInvite(membershipId) {
   if (error) throw new Error(error.message);
 }
 
+/* ---------------------------------- chat -----------------------------------
+ * A message with group_id null is the workspace-wide "General" channel;
+ * group_id set scopes it to that existing team_members group. No separate
+ * channels table — groups already are the team-subdivision concept this
+ * would otherwise duplicate. */
+const rowToMessage = (r) => ({
+  id: r.id, workspaceId: r.workspace_id, groupId: r.group_id ?? null,
+  authorId: r.author_id, authorMemberId: r.author_member_id ?? null,
+  body: r.body, at: r.created_at,
+});
+
+export async function fetchChatMessages(groupId, limit = 100) {
+  let q = scoped(supabase.from("chat_messages").select("*"));
+  q = groupId ? q.eq("group_id", groupId) : q.is("group_id", null);
+  const rows = await q.order("created_at", { ascending: false }).limit(limit).then(throwIfError);
+  return rows.reverse().map(rowToMessage); // oldest first for a chat feed
+}
+
+export async function sendChatMessage(groupId, body, authorMemberId = null) {
+  const now = nowIso();
+  const { data: userData } = await supabase.auth.getUser();
+  const row = {
+    id: "cm-" + uid(), workspace_id: ws(), group_id: groupId || null,
+    author_id: userData?.user?.id, author_member_id: authorMemberId,
+    body, updated_at: now, created_at: now, device_id: getDeviceId(),
+  };
+  await supabase.from("chat_messages").insert(row).then(throwIfError);
+  return rowToMessage(row);
+}
+
+export async function deleteChatMessage(id) {
+  await supabase.from("chat_messages")
+    .update({ deleted_at: nowIso(), updated_at: nowIso(), device_id: getDeviceId() })
+    .eq("id", id).then(throwIfError);
+}
+
 /* ------------------------------- bootstrap -------------------------------- */
 export async function fetchBootstrap() {
   const [companies, members, links, groups, projects, tasks, transitions, handoffs, reflections, exceptions, sessions, events] =
