@@ -99,23 +99,22 @@ const rowToMembership = (r) => ({
  * account's email, then lists the workspaces the account can now see. RLS
  * does the filtering, so this returns exactly what you're a member of. */
 export async function fetchWorkspaces() {
-  /* Claim first — an invite accepted a second ago should show up in the very
-   * same load, not only after a manual refresh. A failure here is not fatal:
-   * it just means no new invites got attached, and the workspaces you already
-   * belong to still load fine.
+  /* Claim first — an invite linked a second ago should show up in the very
+   * same load, not only after a manual refresh. A failure here is not
+   * fatal: it just means no new invites got linked, and the workspaces you
+   * already belong to still load fine.
    *
    * supabase.rpc() returns a PostgrestFilterBuilder — thenable (it has
    * .then, so `await` works) but not a real Promise, so it has no .catch().
    * The two-argument form of .then() is the one method every thenable is
    * guaranteed to have, so it's the portable way to swallow a failure here.
    *
-   * claim_workspace_invites() returns how many invites it just attached —
-   * the app surfaces that as a toast so joining a workspace this way isn't
-   * completely silent, which it otherwise would be: there is no invite email
-   * and no accept step, so this count is the only signal a newly-linked
-   * person gets that anything happened at all. */
-  const claimedCount = await supabase.rpc("claim_workspace_invites")
-    .then((res) => res.data ?? 0, () => 0);
+   * Since schema_v6, this only LINKS a matching invite to this account —
+   * it no longer activates it. Joining now requires acceptWorkspaceInvite(),
+   * surfaced through the notification center (fetchNotifications() below),
+   * not a toast here — a toast can't wait for you to come back and decide,
+   * a notification can. */
+  await supabase.rpc("claim_workspace_invites").then(null, () => {});
 
   const [workspaces, memberships] = await Promise.all([
     notDeleted(supabase.from("workspaces").select("*")).then(throwIfError),
@@ -133,7 +132,7 @@ export async function fetchWorkspaces() {
      * solo user's single workspace should never move around on them. */
     .sort((a, b) =>
       a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === "personal" ? -1 : 1);
-  return { list, claimedCount };
+  return list;
 }
 
 export async function fetchMemberships(workspaceId) {
@@ -234,6 +233,51 @@ export async function removeMembership(id) {
   await supabase.from("workspace_members")
     .update({ status: "removed", deleted_at: now, updated_at: now, device_id: getDeviceId() })
     .eq("id", id).then(throwIfError);
+}
+
+/* ------------------------------ notifications ------------------------------
+ * User-scoped, not workspace-scoped — the whole point of an invite_pending
+ * row is to reach someone who isn't an active member of that workspace yet,
+ * so this deliberately does not go through ws()/scoped() like every other
+ * read in this file. */
+const rowToNotification = (r) => ({
+  id: r.id, workspaceId: r.workspace_id ?? null, kind: r.kind,
+  title: r.title, body: r.body ?? "",
+  actionMembershipId: r.action_membership_id ?? null,
+  actionTaskId: r.action_task_id ?? null,
+  actionProjectId: r.action_project_id ?? null,
+  readAt: r.read_at ?? null, at: r.created_at,
+});
+
+export async function fetchNotifications() {
+  const rows = await supabase.from("notifications").select("*")
+    .is("dismissed_at", null).order("created_at", { ascending: false }).limit(50)
+    .then(throwIfError);
+  return rows.map(rowToNotification);
+}
+
+export async function markNotificationRead(id) {
+  await supabase.from("notifications").update({ read_at: nowIso() }).eq("id", id).then(throwIfError);
+}
+
+/* Swipe/dismiss. Tombstoned like everything else here — dismissing hides it
+ * from fetchNotifications() without erasing the record. */
+export async function dismissNotification(id) {
+  await supabase.from("notifications").update({ dismissed_at: nowIso() }).eq("id", id).then(throwIfError);
+}
+
+/* Both go through RPCs rather than a plain update, because the row being
+ * changed (workspace_members) isn't gated by "is this yours" RLS the way
+ * notifications are — see schema_v6.sql's accept/decline functions for why
+ * this needed a SECURITY DEFINER function instead of a looser policy. */
+export async function acceptInvite(membershipId) {
+  const { data, error } = await supabase.rpc("accept_workspace_invite", { p_membership_id: membershipId });
+  if (error) throw new Error(error.message);
+  return data; // the workspace_id, so the caller can switch straight to it
+}
+export async function declineInvite(membershipId) {
+  const { error } = await supabase.rpc("decline_workspace_invite", { p_membership_id: membershipId });
+  if (error) throw new Error(error.message);
 }
 
 /* ------------------------------- bootstrap -------------------------------- */

@@ -142,6 +142,13 @@ const MARK_SCOPE_META = {
   team:   { label: "Everyone" },
 };
 
+/* A little variety so an on-time completion doesn't say the exact same
+ * thing every time — small, cheap piece of the "playful" ask. */
+const CELEBRATION_MESSAGES = [
+  "Nice — task done", "Sand stack rising", "One down, on time",
+  "Clean finish", "That's the way", "Momentum builds",
+];
+
 /* ---------------- engine reducer: tasks + immutable logs ------------------
  * Pure and exhaustively guarded: illegal transitions are structural no-ops,
  * reflections are append-only, and the only delete path refuses anything
@@ -704,8 +711,23 @@ const GlobalStyle = () => (
       30%, 50%, 70% { transform: translateX(-3px); } 40%, 60% { transform: translateX(3px); } }
     @keyframes pdToast { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
     .pd-toast { animation: pdToast 240ms cubic-bezier(.22,1,.36,1) both; }
+    /* Confetti skips prefers-reduced-motion at the JS level (fireCelebration
+     * never sets the trigger at all), so no pieces exist to animate for that
+     * case — nothing extra needed here. */
+    @keyframes pdConfetti {
+      0% { transform: translate(0, 0) rotate(0deg); opacity: 1; }
+      100% { transform: translate(var(--pd-drift), 105vh) rotate(var(--pd-rot)); opacity: 0; }
+    }
+    /* Very slow, low-amplitude — reads as "slowly spreading" rather than an
+     * obvious animation, which is the point: mold shouldn't visibly pulse,
+     * it should just look faintly alive if you watch it a while. */
+    @keyframes pdMoldCreep {
+      0%, 100% { transform: scale(1); filter: saturate(1); }
+      50% { transform: scale(1.035); filter: saturate(1.15); }
+    }
+    .pd-mold-creep { animation: pdMoldCreep 9s ease-in-out infinite; }
     @media (prefers-reduced-motion: reduce) {
-      .pd-rise, .pd-press, .pd-fade-in, .pd-pop-in, .pd-sand-fill, .pd-shake, .pd-toast { animation: none !important; transition: none !important; }
+      .pd-rise, .pd-press, .pd-fade-in, .pd-pop-in, .pd-sand-fill, .pd-shake, .pd-toast, .pd-mold-creep { animation: none !important; transition: none !important; }
       .pd-rise:hover { transform: none; }
     }
     input, select, textarea { font-family: inherit; color: inherit; }
@@ -739,12 +761,51 @@ const Mesh = ({ mesh, children, style = {}, className = "" }) => (
   </div>
 );
 
+/* Real mold isn't a smooth two-stop gradient — it's blotchy, uneven, with
+ * darker spore-clusters at irregular spots and an olive-black undertone
+ * rather than flat gray. Fixed coordinates (not randomized per render) so it
+ * doesn't jitter or reflow on re-render; it still reads as organic because
+ * the positions themselves are irregular rather than symmetric. */
+const MOLD_BLOTCHES = [
+  { x: 10, y: 15, r: 46, c: "rgba(46,54,34,0.60)" },
+  { x: 82, y: 10, r: 38, c: "rgba(34,42,26,0.50)" },
+  { x: 58, y: 72, r: 55, c: "rgba(42,50,30,0.55)" },
+  { x: 18, y: 85, r: 34, c: "rgba(28,35,20,0.45)" },
+  { x: 92, y: 58, r: 40, c: "rgba(40,48,28,0.50)" },
+  { x: 38, y: 42, r: 30, c: "rgba(52,60,40,0.35)" },
+];
+const moldBackground = () => ({
+  backgroundColor: "#93968A",
+  backgroundImage: MOLD_BLOTCHES.map((b) =>
+    `radial-gradient(${b.r}% ${b.r}% at ${b.x}% ${b.y}%, ${b.c} 0%, transparent 68%)`
+  ).join(", "),
+});
+/* The sand stack / bar widgets — full-strength blotches, grain, and a very
+ * slow creep so the degraded state reads as something spreading rather than
+ * a static gray fill. */
+const MoldSurface = ({ children, style = {}, className = "" }) => (
+  <div className={`pd-mold-creep ${className}`} style={{ position: "relative", overflow: "hidden", ...moldBackground(), ...style }}>
+    <GrainOverlay opacity={0.4} />
+    <div style={{ position: "relative", height: "100%" }}>{children}</div>
+  </div>
+);
+/* The section-wide ambient wash — same texture, much fainter, sitting behind
+ * an entire degraded project's page rather than being the focal element.
+ * No z-index: same DOM-order trick Mesh/GrainOverlay already use elsewhere
+ * in this file — an absolutely-positioned, z-index:auto div painted first,
+ * with the real content following it in a position:relative wrapper, paints
+ * underneath without needing to reason about stacking contexts. */
+const MoldAmbient = () => (
+  <div aria-hidden className="pd-mold-creep" style={{
+    position: "absolute", inset: 0, pointerEvents: "none", opacity: 0.16, ...moldBackground(),
+  }} />
+);
+
 /* ============================================================================
  * SAND STACK VISUALS — grainy fill rises with completion; molds when degraded.
  * Fill animates via translateY/translateX (GPU) — never height/width.
  * ==========================================================================*/
 const SandStackColumn = ({ stack, theme, height = 260 }) => {
-  const mesh = stack.degraded ? MOLD_MESH : theme.mesh;
   const pct = Math.round(stack.fillPercent);
   return (
     <div style={{ width: "100%" }}>
@@ -757,10 +818,17 @@ const SandStackColumn = ({ stack, theme, height = 260 }) => {
           position: "absolute", inset: 0,
           transform: `translateY(${100 - stack.fillPercent}%)`,
         }}>
-          <Mesh mesh={mesh} style={{ position: "absolute", inset: 0 }}>
-            <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3,
-              background: "rgba(255,255,255,0.5)", filter: "blur(1px)" }} />
-          </Mesh>
+          {stack.degraded ? (
+            <MoldSurface style={{ position: "absolute", inset: 0 }}>
+              <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3,
+                background: "rgba(255,255,255,0.5)", filter: "blur(1px)" }} />
+            </MoldSurface>
+          ) : (
+            <Mesh mesh={theme.mesh} style={{ position: "absolute", inset: 0 }}>
+              <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3,
+                background: "rgba(255,255,255,0.5)", filter: "blur(1px)" }} />
+            </Mesh>
+          )}
         </div>
         <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column",
           alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
@@ -777,9 +845,9 @@ const SandStackColumn = ({ stack, theme, height = 260 }) => {
       </div>
       {stack.degraded && (
         <div className="pd-shake" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10,
-          padding: "9px 12px", borderRadius: 11, background: "#FDECEA", border: "1px solid #F5C6BE" }}>
-          <Flame size={13} style={{ color: "#B91C1C", flexShrink: 0 }} />
-          <span style={{ fontSize: 11.5, color: "#7F1D1D", lineHeight: 1.45 }}>
+          padding: "9px 12px", borderRadius: 11, background: T.dangerBg, border: `1px solid ${T.dangerLine}` }}>
+          <Flame size={13} style={{ color: T.danger, flexShrink: 0 }} />
+          <span style={{ fontSize: 11.5, color: T.danger, lineHeight: 1.45 }}>
             {stack.degradationSources.length} missed task{stack.degradationSources.length > 1 ? "s" : ""} molding the stack.
             Premium color returns only by completing them.
           </span>
@@ -789,21 +857,20 @@ const SandStackColumn = ({ stack, theme, height = 260 }) => {
   );
 };
 
-const SandBar = ({ stack, theme }) => {
-  const mesh = stack.degraded ? MOLD_MESH : theme.mesh;
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 130 }}>
-      <div style={{ position: "relative", flex: 1, height: 10, borderRadius: 99, overflow: "hidden",
-        background: T.lineSoft, border: `1px solid ${T.lineSoft}` }}>
-        <div className="pd-sand-fill" style={{ position: "absolute", inset: 0, transform: `translateX(${stack.fillPercent - 100}%)` }}>
-          <Mesh mesh={mesh} style={{ position: "absolute", inset: 0 }} />
-        </div>
+const SandBar = ({ stack, theme }) => (
+  <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 130 }}>
+    <div style={{ position: "relative", flex: 1, height: 10, borderRadius: 99, overflow: "hidden",
+      background: T.lineSoft, border: `1px solid ${T.lineSoft}` }}>
+      <div className="pd-sand-fill" style={{ position: "absolute", inset: 0, transform: `translateX(${stack.fillPercent - 100}%)` }}>
+        {stack.degraded
+          ? <MoldSurface style={{ position: "absolute", inset: 0 }} />
+          : <Mesh mesh={theme.mesh} style={{ position: "absolute", inset: 0 }} />}
       </div>
-      <span className="pd-num" style={{ fontSize: 11.5, fontWeight: 600, minWidth: 34, textAlign: "right",
-        color: stack.degraded ? "#B91C1C" : T.ink2 }}>{Math.round(stack.fillPercent)}%</span>
     </div>
-  );
-};
+    <span className="pd-num" style={{ fontSize: 11.5, fontWeight: 600, minWidth: 34, textAlign: "right",
+      color: stack.degraded ? T.danger : T.ink2 }}>{Math.round(stack.fillPercent)}%</span>
+  </div>
+);
 
 /* ------------------------------- PRIMITIVES ------------------------------- */
 const Card = ({ children, className = "", style = {}, onClick, soft }) => (
@@ -1077,6 +1144,42 @@ const ToastHost = ({ toasts }) => (
   </div>
 );
 
+/* --------------------------------- CONFETTI ---------------------------------
+ * Dependency-free — a handful of divs with a randomized fall/drift/rotate
+ * CSS animation, self-clearing after it finishes. `trigger` is a fresh key
+ * each time (uid()), which is what lets the same celebration fire twice in a
+ * row — a plain boolean wouldn't re-trigger the effect on a second identical
+ * value. */
+const CONFETTI_COLORS = ["#C6F04D", "#7CB518", "#0284C7", "#D97706", "#7C5CDB", "#0E9F6E"];
+const Confetti = ({ trigger, big }) => {
+  const [pieces, setPieces] = useState([]);
+  useEffect(() => {
+    if (!trigger) return;
+    const count = big ? 70 : 26;
+    setPieces(Array.from({ length: count }, (_, i) => ({
+      id: i, left: Math.random() * 100, delay: Math.random() * 0.35,
+      duration: 1.7 + Math.random() * 1.3, color: CONFETTI_COLORS[i % CONFETTI_COLORS.length],
+      rotate: Math.round(Math.random() * 520 - 260), drift: Math.round((Math.random() - 0.5) * 220),
+      w: 5 + Math.random() * 6, h: 8 + Math.random() * 8,
+    })));
+    const t = setTimeout(() => setPieces([]), 3200);
+    return () => clearTimeout(t);
+  }, [trigger, big]);
+  if (!pieces.length) return null;
+  return (
+    <div aria-hidden style={{ position: "fixed", inset: 0, zIndex: 200, pointerEvents: "none", overflow: "hidden" }}>
+      {pieces.map((p) => (
+        <span key={p.id} style={{
+          position: "absolute", top: -20, left: `${p.left}%`, width: p.w, height: p.h,
+          background: p.color, borderRadius: 2,
+          animation: `pdConfetti ${p.duration}s cubic-bezier(.24,.7,.4,1) ${p.delay}s forwards`,
+          "--pd-drift": `${p.drift}px`, "--pd-rot": `${p.rotate}deg`,
+        }} />
+      ))}
+    </div>
+  );
+};
+
 /* =============================== MAIN APP ================================= */
 export default function PuroductiveApp({ session }) {
   const [companies, setCompanies] = useState([]);
@@ -1125,11 +1228,33 @@ export default function PuroductiveApp({ session }) {
   const myMembership = memberships.find((m) => (m.email || "").toLowerCase() === (session?.user?.email || "").toLowerCase());
   const myMemberId = myMembership?.memberId ?? null;
 
+  /* --------------------------- notifications -------------------------------
+   * User-scoped, not workspace-scoped, so this lives at the top level rather
+   * than inside the per-workspace load effect below — a pending invite to a
+   * workspace you haven't joined yet has to be visible no matter which
+   * workspace you're currently looking at. */
+  const [notifications, setNotifications] = useState([]);
+  const [notifCenterOpen, setNotifCenterOpen] = useState(false);
+  const loadNotifications = () => {
+    db.fetchNotifications().then(setNotifications).catch(() => {});
+  };
+
   /* ------------------------------ the board ------------------------------- */
   const [board, setBoard] = useState({
     posts: [], media: [], comments: [], pollOptions: [], pollVotes: [], requests: [], requestEvents: [],
   });
   const [mediaUrls, setMediaUrls] = useState({});
+
+  /* ------------------------------ celebration -------------------------------
+   * "big" is a project's sand stack filling completely; the small version is
+   * any single on-time task completion. Confetti respects reduced-motion —
+   * the toast still fires either way, only the animation is skipped. */
+  const [celebration, setCelebration] = useState(null);
+  const celebratedProjectsRef = useRef(new Set());
+  const fireCelebration = (big = false) => {
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    setCelebration({ key: uid(), big });
+  };
 
   const toast = (msg, kind = "ok") => {
     const id = uid();
@@ -1150,16 +1275,8 @@ export default function PuroductiveApp({ session }) {
   useEffect(() => {
     let cancelled = false;
     const load = (retriesLeft = 1) => {
-      db.fetchWorkspaces().then(({ list, claimedCount }) => {
+      db.fetchWorkspaces().then((list) => {
         if (cancelled) return;
-        /* This is the only signal a newly-invited person gets that anything
-         * happened — there is no invite email and no accept step, the
-         * account just gets silently linked on its first sign-in. Without
-         * this toast that linking is invisible, which is exactly what made
-         * the invite flow look broken even when it had actually worked. */
-        if (claimedCount > 0) {
-          toast(`You've been added to ${claimedCount} new workspace${claimedCount > 1 ? "s" : ""}`);
-        }
         if (!list.length) {
           /* The v4 trigger gives every new signup a personal workspace, so an
            * empty list means this account predates the migration. Say so
@@ -1261,6 +1378,17 @@ export default function PuroductiveApp({ session }) {
         seenReflectionIds.current = new Set(data.reflections.map((r) => r.id));
         seenHandoffStatus.current = new Map(data.handoffs.map((h) => [h.id, h.status]));
         dispatch({ type: "INIT", tasks: data.tasks, transitions: data.transitions, reflections: data.reflections, handoffs: data.handoffs });
+        /* Seed with whatever's already at 100% on load, so opening the app
+         * doesn't itself read as "you just finished all of these" — only a
+         * completion that happens *after* this point should celebrate. */
+        celebratedProjectsRef.current = new Set(
+          data.projects
+            .filter((p) => {
+              const pTasks = data.tasks.filter((t) => t.projectId === p.id);
+              return pTasks.length && computeSandStack(p, pTasks).fillPercent >= 100;
+            })
+            .map((p) => p.id)
+        );
         setLoadError(null);
         setLoading(false);
       }).catch((err) => {
@@ -1381,6 +1509,17 @@ export default function PuroductiveApp({ session }) {
     toast(ok ? "Native notifications enabled" : "Notifications blocked — using in-app chime only", ok ? "ok" : "error");
   };
 
+  /* ---------------- notification center: load + light polling ------------- */
+  useEffect(() => {
+    loadNotifications();
+    /* Not realtime — a teammate inviting you while you have the app open
+     * shows up within a minute rather than instantly. Matches the existing
+     * reminder loop's cadence above rather than adding a second mechanism
+     * (a Supabase Realtime subscription) for what's a low-frequency event. */
+    const iv = setInterval(loadNotifications, 60_000);
+    return () => clearInterval(iv);
+  }, []);
+
   /* ---------------- ENGINE 7 wiring: report export ------------------------ */
   const exportProject = (proj) => {
     const compiled = compileProjectReport({
@@ -1402,6 +1541,23 @@ export default function PuroductiveApp({ session }) {
     if (due) dispatch({ type: "SWEEP" });
   }, [engine.tasks]);
 
+  /* -------- PROJECT COMPLETION: fires once per project, the moment its ---
+   * sand stack first reaches 100%. Runs at the top level rather than inside
+   * ProjectDetail so it still fires when the task that finished it wasn't
+   * completed from that project's own screen (e.g. from the dashboard). */
+  useEffect(() => {
+    for (const p of projects) {
+      const pTasks = engine.tasks.filter((t) => t.projectId === p.id);
+      if (!pTasks.length || celebratedProjectsRef.current.has(p.id)) continue;
+      const stack = computeSandStack(p, pTasks);
+      if (stack.fillPercent >= 100 && !stack.degraded) {
+        celebratedProjectsRef.current.add(p.id);
+        fireCelebration(true);
+        toast(`🎉 "${p.name}" complete — full sand stack`);
+      }
+    }
+  }, [engine.tasks, projects]);
+
   /* ---------------- Guarded transition helper (the machine's API) -------- */
   const tryTransition = (taskId, event, extras = {}) => {
     const t = engine.tasks.find((x) => x.id === taskId);
@@ -1422,7 +1578,12 @@ export default function PuroductiveApp({ session }) {
     }
     dispatch({ type: "TRANSITION", taskId, event, ...extras });
     if (event === "COMPLETE" && (t.state !== "overdue" || engine.reflections.some((r) => r.taskId === t.id))) {
-      toast(t.state === "overdue" ? "Completed late — sand restored" : "Task completed");
+      if (t.state === "overdue") {
+        toast("Completed late — sand restored");
+      } else {
+        fireCelebration(false);
+        toast(CELEBRATION_MESSAGES[Math.floor(Math.random() * CELEBRATION_MESSAGES.length)]);
+      }
     }
     if (event === "REASSIGN") toast(`Handed off to ${members.find((m) => m.id === extras.toAssigneeId)?.name}`);
     if (event === "FAIL_ATTEMPT") toast("Moved to Retry Pending — reassign or reschedule", "error");
@@ -1572,6 +1733,52 @@ export default function PuroductiveApp({ session }) {
     setMemberships((ms) => ms.filter((x) => x.id !== m.id));
     try { await db.removeMembership(m.id); toast(`${m.email} removed from this workspace`); }
     catch (e) { toast(`Sync failed: ${e.message}`, "error"); }
+  };
+
+  /* --------------------------- notification center -------------------------- */
+  const dismissNotif = (id) => {
+    setNotifications((ns) => ns.filter((n) => n.id !== id));
+    db.dismissNotification(id).catch(() => {});
+  };
+  const acceptInviteNotif = async (n) => {
+    try {
+      const newWsId = await db.acceptInvite(n.actionMembershipId);
+      dismissNotif(n.id);
+      toast("Invite accepted — switching you over");
+      /* The freshly-active membership means fetchWorkspaces() will now
+       * include this workspace where it didn't before; re-fetching is
+       * simpler and less error-prone than hand-assembling a Workspace
+       * object client-side from a bare id. */
+      const list = await db.fetchWorkspaces();
+      setWorkspaces(list);
+      switchWorkspace(newWsId);
+    } catch (e) {
+      toast(`Could not accept: ${e.message}`, "error");
+    }
+  };
+  const declineInviteNotif = async (n) => {
+    try {
+      await db.declineInvite(n.actionMembershipId);
+      dismissNotif(n.id);
+      toast("Invite declined");
+    } catch (e) {
+      toast(`Could not decline: ${e.message}`, "error");
+    }
+  };
+  /* Clicking the body of a notification (not its Accept/Decline buttons)
+   * jumps straight to whatever it's about — the "allow user to... directly
+   * jump to the tasks" half of the ask. Invite notifications have nothing to
+   * jump to yet (there's nothing to open until it's accepted), so this is a
+   * no-op for those; Accept/Decline are the whole interaction. */
+  const openNotification = (n) => {
+    db.markNotificationRead(n.id).catch(() => {});
+    setNotifications((ns) => ns.map((x) => (x.id === n.id ? { ...x, readAt: new Date().toISOString() } : x)));
+    if (n.actionTaskId) {
+      const t = engine.tasks.find((x) => x.id === n.actionTaskId);
+      if (t) { setOpenProjectId(t.projectId); setView("projects"); setNotifCenterOpen(false); }
+    } else if (n.actionProjectId) {
+      setOpenProjectId(n.actionProjectId); setView("projects"); setNotifCenterOpen(false);
+    }
   };
 
   /* ------------------------------- the board -------------------------------
@@ -1791,6 +1998,7 @@ export default function PuroductiveApp({ session }) {
       display: "flex", flexDirection: isMobile ? "column" : "row" }}>
       <GlobalStyle />
       <ToastHost toasts={toasts} />
+      <Confetti trigger={celebration?.key} big={celebration?.big} />
 
       {/* --------------------------- MOBILE TOP BAR ------------------------- */}
       {isMobile && (
@@ -1832,8 +2040,19 @@ export default function PuroductiveApp({ session }) {
                 <div style={{ fontSize: 10, color: T.ink3, letterSpacing: "0.14em", textTransform: "uppercase", marginTop: 1 }}>Workspace OS</div>
               </div>
             </div>
-            {isMobile && <IconBtn label="Close menu" onClick={() => setSidebarOpen(false)}><X size={15} /></IconBtn>}
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <NotificationBell count={notifications.filter((n) => !n.readAt).length}
+                onClick={() => setNotifCenterOpen((o) => !o)} />
+              {isMobile && <IconBtn label="Close menu" onClick={() => setSidebarOpen(false)}><X size={15} /></IconBtn>}
+            </div>
           </div>
+
+          {notifCenterOpen && (
+            <NotificationCenter notifications={notifications}
+              onClose={() => setNotifCenterOpen(false)}
+              onOpen={openNotification} onDismiss={dismissNotif}
+              onAccept={acceptInviteNotif} onDecline={declineInviteNotif} />
+          )}
 
           <WorkspaceSwitcher workspaces={workspaces} activeId={workspaceId} myRole={myRole}
             onSwitch={switchWorkspace} onCreate={() => setModal({ kind: "workspace" })} />
@@ -2064,6 +2283,124 @@ export default function PuroductiveApp({ session }) {
   );
 }
 
+/* ============================================================================
+ * NOTIFICATION CENTER — persistent, not a toast that vanishes.
+ *
+ * Toasts (ToastHost, further down) are for "this thing you just did worked" —
+ * transient, self-explaining, gone in a few seconds. Notifications are for
+ * things that happened that you need to actually act on or come back to
+ * later: a pending invite, work someone else finished. They stay until you
+ * dismiss them, and dismissing is the swipe-off gesture rather than a timer.
+ * ==========================================================================*/
+const relativeTime = (iso) => {
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+};
+
+const NotificationBell = ({ count, onClick }) => (
+  <button onClick={onClick} className="pd-press" aria-label="Notifications" style={{
+    position: "relative", width: 32, height: 32, borderRadius: 10, cursor: "pointer",
+    display: "grid", placeItems: "center", background: T.card, border: `1px solid ${T.line}`,
+  }}>
+    <Bell size={15} style={{ color: T.ink2 }} />
+    {count > 0 && (
+      <span className="pd-num" style={{
+        position: "absolute", top: -4, right: -4, minWidth: 16, height: 16, padding: "0 3px",
+        borderRadius: 99, background: T.danger, color: "#FFFFFF", fontSize: 9.5, fontWeight: 700,
+        display: "grid", placeItems: "center", border: `1.5px solid ${T.card}`,
+      }}>{count > 9 ? "9+" : count}</span>
+    )}
+  </button>
+);
+
+/* One row, draggable horizontally — past the threshold on release, it
+ * dismisses; short of it, it snaps back. The visible ✕ button covers the
+ * same action for anyone not on a touch/drag-capable input. */
+const NotificationRow = ({ n, onOpen, onDismiss, onAccept, onDecline }) => {
+  const [dragX, setDragX] = useState(0);
+  const dragRef = useRef(null);
+  const DISMISS_AT = 90;
+
+  const onPointerDown = (e) => {
+    dragRef.current = { startX: e.clientX, active: true };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onPointerMove = (e) => {
+    if (!dragRef.current?.active) return;
+    setDragX(e.clientX - dragRef.current.startX);
+  };
+  const endDrag = () => {
+    if (!dragRef.current) return;
+    dragRef.current.active = false;
+    if (Math.abs(dragX) > DISMISS_AT) onDismiss(n.id);
+    else setDragX(0);
+  };
+
+  const isInvite = n.kind === "invite_pending";
+  const opacity = Math.max(0, 1 - Math.abs(dragX) / 260);
+
+  return (
+    <div style={{ position: "relative", overflow: "hidden", borderRadius: 13, marginBottom: 7 }}>
+      {/* Revealed behind the row while dragging, in the direction being dragged. */}
+      <div aria-hidden style={{ position: "absolute", inset: 0, display: "flex",
+        alignItems: "center", justifyContent: dragX > 0 ? "flex-start" : "flex-end",
+        padding: "0 16px", background: T.dangerBg, color: T.danger }}>
+        <Trash2 size={14} />
+      </div>
+      <div
+        onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+        onPointerUp={endDrag} onPointerCancel={endDrag}
+        style={{
+          position: "relative", padding: "11px 12px", borderRadius: 13,
+          background: n.readAt ? T.card : T.cardSoft, border: `1px solid ${n.readAt ? T.line : T.limeDeep}`,
+          transform: `translateX(${dragX}px)`, opacity,
+          transition: dragRef.current?.active ? "none" : "transform 200ms cubic-bezier(.22,1,.36,1), opacity 200ms",
+          cursor: "grab", touchAction: "pan-y",
+        }}>
+        <div onClick={() => !isInvite && onOpen(n)} style={{ cursor: isInvite ? "default" : "pointer" }}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+            {!n.readAt && <span style={{ width: 6, height: 6, borderRadius: 99, background: T.limeDeep, marginTop: 5, flexShrink: 0 }} />}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: T.ink }}>{n.title}</div>
+              {n.body && <div style={{ fontSize: 11.5, color: T.ink2, marginTop: 2, lineHeight: 1.5 }}>{n.body}</div>}
+              <div className="pd-num" style={{ fontSize: 10.5, color: T.ink3, marginTop: 4 }}>{relativeTime(n.at)}</div>
+            </div>
+            <IconBtn label="Dismiss" onClick={() => onDismiss(n.id)}><X size={12} /></IconBtn>
+          </div>
+        </div>
+        {isInvite && (
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <Btn small onClick={() => onAccept(n)}><Check size={13} /> Accept</Btn>
+            <Btn small ghost onClick={() => onDecline(n)}>Decline</Btn>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const NotificationCenter = ({ notifications, onClose, onOpen, onDismiss, onAccept, onDecline }) => (
+  <div style={{ marginBottom: 18 }}>
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 2px", marginBottom: 8 }}>
+      <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3 }}>
+        Notifications
+      </span>
+      <button onClick={onClose} className="pd-press" style={{ background: "none", border: "none", cursor: "pointer",
+        fontSize: 11, color: T.ink3, padding: 0 }}>Close</button>
+    </div>
+    <div className="pd-scroll" style={{ maxHeight: 320, overflowY: "auto" }}>
+      {notifications.length === 0
+        ? <div style={{ padding: "14px 12px", fontSize: 12, color: T.ink3 }}>Nothing waiting on you.</div>
+        : notifications.map((n) => (
+            <NotificationRow key={n.id} n={n} onOpen={onOpen} onDismiss={onDismiss} onAccept={onAccept} onDecline={onDecline} />
+          ))}
+    </div>
+  </div>
+);
+
 /* ---------------------- WORKSPACE SWITCHER (sidebar) -----------------------
  * Collapsed to a single row until clicked — a solo user has exactly one
  * workspace and shouldn't be made to look at a list of one. */
@@ -2266,7 +2603,13 @@ const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tr
   const reflections = engine.reflections.filter((r) => r.projectId === project.id);
   const history = engine.transitions.filter((tr) => tasks.some((t) => t.id === tr.taskId)).slice(-6).reverse();
   return (
-    <div className="pd-fade-in">
+    /* position: relative + MoldAmbient painted first is what makes "apply
+     * the [degraded] effect to the entire UI when in that specific project
+     * section" true — the whole page, not just the sand stack widget, reads
+     * as being in trouble. */
+    <div className="pd-fade-in" style={{ position: "relative" }}>
+      {stack.degraded && <MoldAmbient />}
+      <div style={{ position: "relative" }}>
       <button onClick={onBack} className="pd-press" style={{
         display: "inline-flex", alignItems: "center", gap: 6, marginBottom: 18, cursor: "pointer",
         background: "none", border: "none", fontSize: 12.5, fontWeight: 600, color: T.ink3, padding: 0,
@@ -2345,6 +2688,7 @@ const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tr
           ))}
           {tasks.length === 0 && <Empty text="No tasks yet — add the first one." />}
         </div>
+      </div>
       </div>
     </div>
   );
