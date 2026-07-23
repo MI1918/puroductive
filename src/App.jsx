@@ -143,6 +143,101 @@ const MARK_SCOPE_META = {
   team:   { label: "Everyone" },
 };
 
+/* ============================================================================
+ * APP TOUR — a first-run onboarding carousel, not a DOM-spotlight tour.
+ * Deliberately content-only (no getBoundingClientRect/positioning against
+ * real nav elements): a spotlight tour that highlights actual buttons is
+ * fragile the moment the sidebar collapses on mobile or anything shifts a
+ * few pixels, and this content ships without the ability to visually check
+ * it against a live layout. A slide deck degrades gracefully instead — it's
+ * always just a centered card regardless of viewport.
+ * ==========================================================================*/
+const TOUR_STEPS = [
+  { icon: Layers, mesh: THEME_PRESETS[0].mesh, title: "Welcome to Puroductive",
+    body: "A cross-company task supervisor that acts like a strict coach — miss a deadline and it shows, finish on time and it celebrates. Everything lives inside a workspace: your Personal one is private, and you can create Team workspaces to actually collaborate. This is a quick tour of where everything is." },
+  { icon: LayoutGrid, mesh: THEME_PRESETS[0].mesh, title: "Dashboard — the sand stack",
+    body: "Every project fills a “sand stack” as weighted tasks get completed. Miss a deadline and the stack turns moldy — literally — until you catch up. Blunt on purpose: one glance tells you what's actually on track." },
+  { icon: FolderKanban, mesh: THEME_PRESETS[1].mesh, title: "Projects & tasks",
+    body: "Tasks move through a strict state machine — pending, in progress, completed, or overdue → retry. An overdue task can't just be marked done: it forces a permanent “what went wrong” reflection first. Tasks can be individual or team-owned, and any task can be marked to stand out on the calendar." },
+  { icon: Building2, mesh: THEME_PRESETS[2].mesh, title: "Companies, Team & People",
+    body: "Companies and Team are your roster — names you can assign work to, no account needed. People & access is different: who can actually sign into this workspace, with roles from Viewer up to Owner. Invite someone by email and they get a real notification to accept, not a silent auto-join." },
+  { icon: MessageSquare, mesh: THEME_PRESETS[3].mesh, title: "The Board",
+    body: "Share a photo or an update and pick what you want back: ask “what are your thoughts,” send a task request someone can accept or pass along (either way, permanently logged), run a poll, or post something as accomplished." },
+  { icon: Bell, mesh: THEME_PRESETS[4].mesh, title: "Notifications",
+    body: "The bell in the sidebar holds things that need your attention — pending invites and anything else worth coming back to. Unlike a toast, these stick around until you deal with them. Tap one to jump straight to what it's about, or swipe it away." },
+  { icon: Trophy, mesh: THEME_PRESETS[0].mesh, title: "The leaderboard",
+    body: "Completing tasks earns points — on time is worth double late. Nothing here is a separate score to game, it's the same task data as everywhere else in the app, just ranked. Streaks reward consecutive on-time days." },
+  { icon: MessageCircle, mesh: THEME_PRESETS[1].mesh, title: "Chat",
+    body: "General is everyone in the workspace. Every group you set up under Team gets its own channel automatically — no separate setup needed." },
+  { icon: CalendarDays, mesh: THEME_PRESETS[3].mesh, title: "Calendar",
+    body: "Today is always highlighted. Mark holidays, travel, or leave — leave asks for a reason, so month-end reporting can break it down — and connect Google Calendar for two-way sync: create an event here, it shows up there, and back." },
+  { icon: BarChart3, mesh: THEME_PRESETS[2].mesh, title: "Reports, Gantt & the rest",
+    body: "Reports compares you against your own best month, nobody else's. Gantt gives you the timeline view across projects. And the sun/moon icon near your name switches the whole app to dark mode, any time. That's the tour — reopen it later from the ? next to the notification bell." },
+];
+
+const AppTour = ({ onClose }) => {
+  const [step, setStep] = useState(0);
+  const isMobile = useIsMobile();
+  const cur = TOUR_STEPS[step];
+  const Icon = cur.icon;
+  const last = step === TOUR_STEPS.length - 1;
+
+  useEffect(() => {
+    const h = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [onClose]);
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 70, display: "flex", alignItems: "center", justifyContent: "center",
+      padding: 20, background: "rgba(22,24,29,0.4)", backdropFilter: "blur(6px)" }}>
+      <div className="pd-pop-in" style={{
+        width: "100%", maxWidth: isMobile ? "100%" : 440, borderRadius: 22, background: T.card,
+        border: `1px solid ${T.line}`, boxShadow: T.shadowLg, overflow: "hidden",
+      }}>
+        <Mesh mesh={cur.mesh} style={{ padding: "30px 28px 22px" }}>
+          <button onClick={onClose} aria-label="Skip tour" className="pd-press" style={{
+            position: "absolute", top: 16, right: 16, width: 30, height: 30, borderRadius: 9,
+            background: "rgba(255,255,255,0.55)", border: "none", cursor: "pointer",
+            display: "grid", placeItems: "center", color: "#16181D",
+          }}><X size={14} /></button>
+          <div style={{ width: 46, height: 46, borderRadius: 13, display: "grid", placeItems: "center",
+            background: "rgba(255,255,255,0.55)", marginBottom: 14 }}>
+            <Icon size={22} style={{ color: "#16181D" }} />
+          </div>
+          <h2 style={{ margin: 0, fontFamily: T.fontDisplay, fontSize: 19, fontWeight: 700, color: "#16181D", letterSpacing: "-0.02em" }}>
+            {cur.title}
+          </h2>
+        </Mesh>
+        <div style={{ padding: "22px 28px 26px" }}>
+          <p style={{ margin: 0, fontSize: 13.5, color: T.ink2, lineHeight: 1.6 }}>{cur.body}</p>
+
+          <div style={{ display: "flex", justifyContent: "center", gap: 5, margin: "20px 0" }}>
+            {TOUR_STEPS.map((_, i) => (
+              <span key={i} style={{
+                width: i === step ? 16 : 6, height: 6, borderRadius: 99, transition: "width 200ms ease-out",
+                background: i === step ? T.limeDeep : T.lineSoft,
+              }} />
+            ))}
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <button onClick={onClose} className="pd-press" style={{
+              background: "none", border: "none", cursor: "pointer", fontSize: 12, color: T.ink3, padding: "8px 4px",
+            }}>Skip tour</button>
+            <div style={{ display: "flex", gap: 8 }}>
+              {step > 0 && <Btn small ghost onClick={() => setStep((s) => s - 1)}>Back</Btn>}
+              {last
+                ? <Btn small onClick={onClose}><Check size={13} /> Get started</Btn>
+                : <Btn small onClick={() => setStep((s) => s + 1)}>Next <ChevronRight size={13} /></Btn>}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 /* A little variety so an on-time completion doesn't say the exact same
  * thing every time — small, cheap piece of the "playful" ask. */
 const CELEBRATION_MESSAGES = [
@@ -1287,6 +1382,18 @@ export default function PuroductiveApp({ session }) {
     applyTheme(next);
   };
 
+  /* --------------------------------- tour ----------------------------------
+   * Keyed by user id (not just a flat flag) so a second person signing into
+   * the same browser still gets their own first run, same reasoning as the
+   * per-workspace localStorage key used elsewhere. Shown automatically once
+   * loading finishes; re-openable any time via the ? button in the sidebar. */
+  const [showTour, setShowTour] = useState(false);
+  const tourStorageKey = session?.user?.id ? `pd.tourSeen.${session.user.id}` : null;
+  const dismissTour = () => {
+    setShowTour(false);
+    if (tourStorageKey) localStorage.setItem(tourStorageKey, "1");
+  };
+
   /* --------------------------- workspaces (v4) ----------------------------
    * The workspace is chosen before any data loads, because every query is
    * filtered by it. `null` means "still discovering which workspaces this
@@ -1605,6 +1712,16 @@ export default function PuroductiveApp({ session }) {
     const iv = setInterval(loadNotifications, 60_000);
     return () => clearInterval(iv);
   }, []);
+
+  /* Checked exactly once per mount (the ref guard), not on every workspace
+   * switch — `loading` also flips true→false on a switch, which would
+   * otherwise re-trigger this every time. */
+  const tourCheckedRef = useRef(false);
+  useEffect(() => {
+    if (loading || tourCheckedRef.current || !tourStorageKey) return;
+    tourCheckedRef.current = true;
+    if (!localStorage.getItem(tourStorageKey)) setShowTour(true);
+  }, [loading, tourStorageKey]);
 
   /* ------------------------- Google Calendar sync -------------------------- */
   const connectGoogle = async () => {
@@ -2150,6 +2267,7 @@ export default function PuroductiveApp({ session }) {
       <GlobalStyle />
       <ToastHost toasts={toasts} />
       <Confetti trigger={celebration?.key} big={celebration?.big} />
+      {showTour && <AppTour onClose={dismissTour} />}
 
       {/* --------------------------- MOBILE TOP BAR ------------------------- */}
       {isMobile && (
@@ -2194,6 +2312,7 @@ export default function PuroductiveApp({ session }) {
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <NotificationBell count={notifications.filter((n) => !n.readAt).length}
                 onClick={() => setNotifCenterOpen((o) => !o)} />
+              <IconBtn label="Show the app tour" onClick={() => setShowTour(true)}><HelpCircle size={15} /></IconBtn>
               {isMobile && <IconBtn label="Close menu" onClick={() => setSidebarOpen(false)}><X size={15} /></IconBtn>}
             </div>
           </div>
