@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient.js";
 import * as db from "./lib/db.js";
+import { getInitialTheme, applyTheme } from "./lib/theme.js";
 
 /* ============================================================================
  * PURODUCTIVE — Phase 3: Logic Engines wired into the light fintech UI.
@@ -30,16 +31,24 @@ import * as db from "./lib/db.js";
  * ==========================================================================*/
 
 /* ------------------------------- DESIGN TOKENS --------------------------- */
+/* Every value below is a CSS custom property, not a literal color — see
+ * src/lib/theme.js for the light/dark definitions. Toggling the `data-theme`
+ * attribute on <html> re-themes every one of these at once, everywhere they
+ * appear, with no React re-render and no prop threading. The one deliberate
+ * exception is the "ink button" pattern (Btn's `ink` variant): that always
+ * wants a fixed dark surface with white text regardless of theme, so it uses
+ * fixed dark-surface and white-text colors instead of these tokens — using
+ * T.ink there would flip its background to a light color in dark mode while
+ * the text stayed white, making it unreadable. */
 const T = {
-  bg: "#F7F7F4", card: "#FFFFFF", cardSoft: "#FCFCFA",
-  line: "#E9E9E3", lineSoft: "#F0F0EB",
-  ink: "#16181D", ink2: "#5A5F69", ink3: "#9AA0AA",
-  lime: "#C6F04D", limeDeep: "#7CB518", danger: "#D9482B",
+  bg: "var(--bg)", card: "var(--card)", cardSoft: "var(--card-soft)",
+  line: "var(--line)", lineSoft: "var(--line-soft)",
+  ink: "var(--ink)", ink2: "var(--ink2)", ink3: "var(--ink3)",
+  lime: "var(--lime)", limeDeep: "var(--lime-deep)", danger: "var(--danger)",
+  dangerBg: "var(--danger-bg)", dangerLine: "var(--danger-line)",
   fontDisplay: "'Sora', 'Inter', system-ui, sans-serif",
   fontBody: "'Inter', system-ui, sans-serif",
-  shadowSm: "0 1px 2px rgba(22,24,29,0.04), 0 2px 8px rgba(22,24,29,0.04)",
-  shadowMd: "0 1px 2px rgba(22,24,29,0.05), 0 8px 24px -8px rgba(22,24,29,0.09)",
-  shadowLg: "0 2px 4px rgba(22,24,29,0.05), 0 24px 48px -16px rgba(22,24,29,0.14)",
+  shadowSm: "var(--shadow-sm)", shadowMd: "var(--shadow-md)", shadowLg: "var(--shadow-lg)",
 };
 
 const GRAIN =
@@ -72,7 +81,7 @@ export const TRANSITIONS = {
   completed:     {},
 };
 const STATE_META = {
-  pending:       { label: "Pending",       color: "#8A8F99", bg: "#F3F3EE" },
+  pending:       { label: "Pending",       color: "#8A8F99", bg: T.cardSoft },
   in_progress:   { label: "In progress",   color: "#0284C7", bg: "#EAF6FE" },
   retry_pending: { label: "Retry pending", color: "#B45309", bg: "#FDF3E3" },
   overdue:       { label: "Overdue",       color: "#B91C1C", bg: "#FDECEA" },
@@ -114,7 +123,7 @@ export const isLeaveType = (type) => !!EXCEPTION_META[type]?.leave;
  * one gets a different response affordance underneath it. */
 const POST_KIND_META = {
   update:       { label: "Update", blurb: "Just sharing — no response needed",
-                  icon: MessageSquare, bg: "#F3F3EE", color: "#5A5F69", posted: "Posted to the board" },
+                  icon: MessageSquare, bg: T.cardSoft, color: T.ink2, posted: "Posted to the board" },
   discussion:   { label: "What are your thoughts?", blurb: "Open it up for everyone's opinion",
                   icon: HelpCircle, bg: "#EAF6FE", color: "#0284C7", posted: "Asked the team for thoughts" },
   task_request: { label: "Task request", blurb: "Ask someone to take this on — they can accept or pass it along",
@@ -674,13 +683,17 @@ const GlobalStyle = () => (
   <style>{`
     @import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Inter:wght@400;450;500;600&display=swap');
     * { box-sizing: border-box; }
-    ::selection { background: #C6F04D; color: #16181D; }
+    /* body { background } lives in src/lib/theme.js's THEME_CSS instead —
+     * that one mounts before sign-in too, this one doesn't. */
+    /* Selection text stays a fixed dark color on purpose — it's always sat
+     * on the bright lime highlight, in either theme, so it never needs to
+     * flip. */
+    ::selection { background: var(--lime); color: #16181D; }
     .pd-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
-    .pd-scroll::-webkit-scrollbar-thumb { background: #DEDED7; border-radius: 8px; }
+    .pd-scroll::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 8px; }
     .pd-num { font-variant-numeric: tabular-nums; }
     .pd-rise { transition: transform 200ms cubic-bezier(.22,1,.36,1), box-shadow 240ms ease-out; will-change: transform; }
     .pd-rise:hover { transform: translateY(-2px); box-shadow: ${T.shadowLg}; }
-    .pd-press:active { transform: scale(0.98); }
     .pd-fade-in { animation: pdFade 320ms cubic-bezier(.22,1,.36,1) both; }
     .pd-pop-in  { animation: pdPop 240ms cubic-bezier(.22,1,.36,1) both; }
     .pd-sand-fill { transition: transform 700ms cubic-bezier(.22,1,.36,1); will-change: transform; }
@@ -695,10 +708,14 @@ const GlobalStyle = () => (
       .pd-rise, .pd-press, .pd-fade-in, .pd-pop-in, .pd-sand-fill, .pd-shake, .pd-toast { animation: none !important; transition: none !important; }
       .pd-rise:hover { transform: none; }
     }
-    input, select, textarea { font-family: inherit; }
+    input, select, textarea { font-family: inherit; color: inherit; }
     input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible {
-      outline: 2px solid #7CB518; outline-offset: 2px;
+      outline: 2px solid var(--lime-deep); outline-offset: 2px;
     }
+    /* Playful, bouncier press than the flat scale(0.98) alone — a hint of
+     * overshoot on release rather than a dead stop. */
+    .pd-press { transition: transform 140ms cubic-bezier(.34,1.56,.64,1); }
+    .pd-press:active { transform: scale(0.96); transition-duration: 60ms; }
   `}</style>
 );
 
@@ -733,7 +750,7 @@ const SandStackColumn = ({ stack, theme, height = 260 }) => {
     <div style={{ width: "100%" }}>
       <div style={{
         position: "relative", height, borderRadius: 18, overflow: "hidden",
-        background: "#EFEFEA", border: `1px solid ${T.line}`,
+        background: T.lineSoft, border: `1px solid ${T.line}`,
         boxShadow: "inset 0 2px 6px rgba(22,24,29,0.06)",
       }}>
         <div className="pd-sand-fill" style={{
@@ -777,7 +794,7 @@ const SandBar = ({ stack, theme }) => {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 130 }}>
       <div style={{ position: "relative", flex: 1, height: 10, borderRadius: 99, overflow: "hidden",
-        background: "#EFEFEA", border: `1px solid ${T.lineSoft}` }}>
+        background: T.lineSoft, border: `1px solid ${T.lineSoft}` }}>
         <div className="pd-sand-fill" style={{ position: "absolute", inset: 0, transform: `translateX(${stack.fillPercent - 100}%)` }}>
           <Mesh mesh={mesh} style={{ position: "absolute", inset: 0 }} />
         </div>
@@ -805,11 +822,15 @@ const Btn = ({ children, onClick, ghost, danger, small, ink = false, type = "but
       transition: "transform 120ms ease-out, box-shadow 160ms ease-out, background 150ms ease-out",
       opacity: disabled ? 0.45 : 1,
       ...(danger
-        ? { background: "#FDF1EE", color: T.danger, border: "1px solid #F3CFC6" }
+        ? { background: T.dangerBg, color: T.danger, border: `1px solid ${T.dangerLine}` }
         : ghost
-        ? { background: "#FFFFFF", color: T.ink2, border: `1px solid ${T.line}`, boxShadow: T.shadowSm }
+        ? { background: T.card, color: T.ink2, border: `1px solid ${T.line}`, boxShadow: T.shadowSm }
         : ink
-        ? { background: T.ink, color: "#FFFFFF", border: "none", boxShadow: T.shadowMd }
+        /* Literal, not T.ink — this is a fixed "always-dark surface, white
+         * text" button style. T.ink flips to a LIGHT color in dark mode,
+         * which would turn this into a light button with invisible white
+         * text on it. */
+        ? { background: "#16181D", color: "#FFFFFF", border: "none", boxShadow: T.shadowMd }
         : { color: "#243305", border: "1px solid rgba(36,51,5,0.12)",
             boxShadow: "0 2px 6px rgba(124,181,24,0.25), 0 10px 24px -10px rgba(124,181,24,0.5)",
             ...meshBackground(["#E9FBB7", "#C6F04D", "#A4E24B"]) }),
@@ -823,7 +844,7 @@ const Chip = ({ children, accent, bg, color }) => (
     display: "inline-flex", alignItems: "center", gap: 5, padding: "4px 10px", borderRadius: 999,
     fontSize: 11, fontWeight: 500, whiteSpace: "nowrap",
     color: color ?? (accent || T.ink2),
-    background: bg ?? (accent ? `${accent}14` : "#F3F3EE"),
+    background: bg ?? (accent ? `${accent}14` : T.cardSoft),
     border: `1px solid ${accent ? accent + "33" : T.line}`,
   }}>{children}</span>
 );
@@ -833,13 +854,13 @@ const Label = ({ children }) => (
 );
 const inputStyle = {
   width: "100%", minHeight: 46, padding: "0 14px", borderRadius: 12, fontSize: 14,
-  color: T.ink, background: "#FFFFFF", border: `1px solid ${T.line}`,
+  color: T.ink, background: T.card, border: `1px solid ${T.line}`,
   boxShadow: "inset 0 1px 2px rgba(22,24,29,0.03)",
 };
 const IconBtn = ({ children, onClick, label, danger }) => (
   <button onClick={(e) => { e.stopPropagation(); onClick(); }} aria-label={label} title={label} className="pd-press" style={{
     width: 32, height: 32, borderRadius: 10, cursor: "pointer", display: "grid", placeItems: "center",
-    background: "#FFFFFF", border: `1px solid ${T.line}`, boxShadow: T.shadowSm,
+    background: T.card, border: `1px solid ${T.line}`, boxShadow: T.shadowSm,
     color: danger ? T.danger : T.ink2, flexShrink: 0,
   }}>{children}</button>
 );
@@ -862,7 +883,7 @@ const Modal = ({ title, subtitle, onClose, children, wide, locked, tone }) => {
     }}>
       <div className="pd-pop-in pd-scroll" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" style={{
         width: "100%", maxWidth: isMobile ? "100%" : wide ? 660 : 520, maxHeight: isMobile ? "92vh" : "90vh", overflowY: "auto",
-        borderRadius: isMobile ? "22px 22px 0 0" : 22, background: "#FFFFFF",
+        borderRadius: isMobile ? "22px 22px 0 0" : 22, background: T.card,
         border: tone === "danger" ? "1px solid #F3CFC6" : `1px solid ${T.line}`,
         boxShadow: T.shadowLg, padding: isMobile ? 18 : 28,
       }}>
@@ -874,7 +895,7 @@ const Modal = ({ title, subtitle, onClose, children, wide, locked, tone }) => {
           {!locked && onClose && (
             <button onClick={onClose} aria-label="Close" className="pd-press" style={{
               width: 34, height: 34, borderRadius: 10, cursor: "pointer", display: "grid", placeItems: "center",
-              background: "#F5F5F0", border: `1px solid ${T.line}`, color: T.ink2,
+              background: T.lineSoft, border: `1px solid ${T.line}`, color: T.ink2,
             }}><X size={15} /></button>
           )}
         </div>
@@ -901,9 +922,9 @@ const InterventionModal = ({ task, project, onSubmit }) => {
       title="Deadline missed — supervisor intervention"
       subtitle="This alert cannot be dismissed. Complete the reflection to continue working.">
       <div style={{ display: "flex", gap: 12, padding: "13px 15px", borderRadius: 13, marginBottom: 20,
-        background: "#FDECEA", border: "1px solid #F5C6BE" }}>
-        <Ban size={17} style={{ color: "#B91C1C", flexShrink: 0, marginTop: 1 }} />
-        <div style={{ fontSize: 13, lineHeight: 1.55, color: "#7F1D1D" }}>
+        background: T.dangerBg, border: `1px solid ${T.dangerLine}` }}>
+        <Ban size={17} style={{ color: T.danger, flexShrink: 0, marginTop: 1 }} />
+        <div style={{ fontSize: 13, lineHeight: 1.55, color: T.danger }}>
           <strong>{task.title}</strong> in <strong>{project?.name}</strong> passed its deadline
           ({task.deadline}). The sand stack is now degraded. This reflection is logged permanently
           into the final project report.
@@ -952,7 +973,7 @@ const ReassignModal = ({ task, members, companies, onConfirm, onClose }) => {
                 <button key={m.id} onClick={() => setToId(m.id)} className="pd-press" style={{
                   display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", borderRadius: 13,
                   cursor: "pointer", textAlign: "left",
-                  background: on ? "#F4FBE3" : "#FFFFFF",
+                  background: on ? "#F4FBE3" : T.card,
                   border: `1px solid ${on ? "#C9E88A" : T.line}`,
                   transition: "background 140ms ease-out",
                 }}>
@@ -1038,9 +1059,15 @@ const ToastHost = ({ toasts }) => (
     {toasts.map((t) => (
       <div key={t.id} className="pd-toast" style={{
         display: "flex", alignItems: "center", gap: 10, padding: "11px 16px", borderRadius: 13,
-        background: t.kind === "error" ? "#FDECEA" : "#16181D",
-        color: t.kind === "error" ? "#7F1D1D" : "#FFFFFF",
-        border: t.kind === "error" ? "1px solid #F5C6BE" : "none",
+        /* The success pill is a fixed dark-surface/white-text style, same
+         * reasoning as Btn's `ink` variant — it reads fine as a dark chip on
+         * either a light or dark page, so it doesn't need to flip with the
+         * theme. The error pill DOES use theme tokens: a literal light-pink
+         * error background would look washed out and low-contrast sitting
+         * on a dark page. */
+        background: t.kind === "error" ? T.dangerBg : "#16181D",
+        color: t.kind === "error" ? T.danger : "#FFFFFF",
+        border: t.kind === "error" ? `1px solid ${T.dangerLine}` : "none",
         boxShadow: T.shadowLg, fontSize: 12.5, fontWeight: 500, maxWidth: 360,
       }}>
         {t.kind === "error" ? <AlertTriangle size={14} /> : <Check size={14} style={{ color: T.lime }} />}
@@ -1072,6 +1099,15 @@ export default function PuroductiveApp({ session }) {
   const [loadError, setLoadError] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const isMobile = useIsMobile();
+  /* Named colorMode, not theme — `theme` is already taken throughout this
+   * file for the per-company accent (mesh colors), which is a completely
+   * different axis from light/dark mode. */
+  const [colorMode, setColorMode] = useState(getInitialTheme);
+  const toggleColorMode = () => {
+    const next = colorMode === "dark" ? "light" : "dark";
+    setColorMode(next);
+    applyTheme(next);
+  };
 
   /* --------------------------- workspaces (v4) ----------------------------
    * The workspace is chosen before any data loads, because every query is
@@ -1760,7 +1796,7 @@ export default function PuroductiveApp({ session }) {
       {isMobile && (
         <header style={{
           position: "sticky", top: 0, zIndex: 25, display: "flex", alignItems: "center", justifyContent: "space-between",
-          padding: "12px 16px", background: "#FFFFFF", borderBottom: `1px solid ${T.line}`,
+          padding: "12px 16px", background: T.card, borderBottom: `1px solid ${T.line}`,
         }}>
           <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
             <Mesh mesh={THEME_PRESETS[0].mesh} style={{ width: 28, height: 28, borderRadius: 8, display: "grid", placeItems: "center", border: "1px solid rgba(36,51,5,0.1)" }}>
@@ -1781,7 +1817,7 @@ export default function PuroductiveApp({ session }) {
           position: isMobile ? "fixed" : "sticky", top: 0, left: 0, height: "100vh", width: 232, flexShrink: 0,
           zIndex: 30, overflowY: "auto",
           display: "flex", flexDirection: "column", padding: "26px 16px",
-          borderRight: `1px solid ${T.line}`, background: "#FFFFFF",
+          borderRight: `1px solid ${T.line}`, background: T.card,
         }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 11, padding: "0 8px", marginBottom: 30 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 11 }}>
@@ -1852,7 +1888,12 @@ export default function PuroductiveApp({ session }) {
             <span style={{ fontSize: 11, color: T.ink3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
               {session?.user?.email}
             </span>
-            <IconBtn label="Sign out" onClick={() => supabase.auth.signOut()}><LogOut size={13.5} /></IconBtn>
+            <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+              <IconBtn label={colorMode === "dark" ? "Switch to light mode" : "Switch to dark mode"} onClick={toggleColorMode}>
+                <span style={{ fontSize: 13, lineHeight: 1 }}>{colorMode === "dark" ? "☀️" : "🌙"}</span>
+              </IconBtn>
+              <IconBtn label="Sign out" onClick={() => supabase.auth.signOut()}><LogOut size={13.5} /></IconBtn>
+            </div>
           </div>
         </aside>
       )}
@@ -2391,7 +2432,7 @@ const TaskForm = ({ projectId, members, groups, onSave, onClose }) => {
                 <button key={key} type="button" onClick={() => setF({ ...f, scope: key })} className="pd-press" style={{
                   display: "flex", alignItems: "center", gap: 9, padding: "11px 13px", borderRadius: 11,
                   cursor: "pointer", textAlign: "left",
-                  background: on ? "#F4FBE3" : "#FFFFFF", border: `1px solid ${on ? "#C9E88A" : T.line}`,
+                  background: on ? "#F4FBE3" : T.card, border: `1px solid ${on ? "#C9E88A" : T.line}`,
                 }}>
                   <Icon size={15} style={{ color: on ? T.limeDeep : T.ink3, flexShrink: 0 }} />
                   <div style={{ minWidth: 0 }}>
@@ -2543,8 +2584,8 @@ const CompanyCard = ({ company: c, projectCount, memberCount, onEdit, onDelete }
       </div>
       {confirming ? (
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 12,
-          background: "#FDECEA", border: "1px solid #F5C6BE" }}>
-          <span style={{ flex: 1, fontSize: 11.5, color: "#7F1D1D" }}>Remove {c.name}? Projects/members keep their history.</span>
+          background: T.dangerBg, border: `1px solid ${T.dangerLine}` }}>
+          <span style={{ flex: 1, fontSize: 11.5, color: T.danger }}>Remove {c.name}? Projects/members keep their history.</span>
           <Btn small ghost onClick={() => setConfirming(false)}>Cancel</Btn>
           <Btn small danger onClick={onDelete}>Confirm</Btn>
         </div>
@@ -2669,8 +2710,8 @@ const MemberCard = ({ m, companies, engine, onEdit, onDelete }) => {
       </div>
       {confirming ? (
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 12,
-          background: "#FDECEA", border: "1px solid #F5C6BE" }}>
-          <span style={{ flex: 1, fontSize: 11.5, color: "#7F1D1D" }}>Remove {m.name}? Past task history is kept.</span>
+          background: T.dangerBg, border: `1px solid ${T.dangerLine}` }}>
+          <span style={{ flex: 1, fontSize: 11.5, color: T.danger }}>Remove {m.name}? Past task history is kept.</span>
           <Btn small ghost onClick={() => setConfirming(false)}>Cancel</Btn>
           <Btn small danger onClick={onDelete}>Confirm</Btn>
         </div>
@@ -2735,7 +2776,7 @@ const MemberForm = ({ data, companies, groups, onSave, onClose }) => {
                 <button key={c.id} type="button" onClick={() => toggleCompany(c.id)} className="pd-press" style={{
                   display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderRadius: 11,
                   cursor: "pointer", textAlign: "left",
-                  background: on ? "#F4FBE3" : "#FFFFFF", border: `1px solid ${on ? "#C9E88A" : T.line}`,
+                  background: on ? "#F4FBE3" : T.card, border: `1px solid ${on ? "#C9E88A" : T.line}`,
                 }}>
                   <CircleDot size={11} style={{ color: c.theme.primary }} />
                   <span style={{ flex: 1, fontSize: 12.5, color: T.ink }}>{c.name}</span>
@@ -2784,7 +2825,7 @@ const GroupsManageModal = ({ groups, onSave, onDelete, onClose }) => {
       <div style={{ display: "grid", gap: 10, marginBottom: 18 }}>
         {[...groups].sort((a, b) => a.sortOrder - b.sortOrder).map((g) => (
           <div key={g.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px",
-            borderRadius: 11, border: `1px solid ${T.line}`, background: "#FFFFFF" }}>
+            borderRadius: 11, border: `1px solid ${T.line}`, background: T.card }}>
             {editingId === g.id ? (
               <input autoFocus style={{ ...inputStyle, minHeight: 34, flex: 1 }} value={editText}
                 onChange={(e) => setEditText(e.target.value)}
@@ -2881,7 +2922,7 @@ const BoardView = ({ board, mediaUrls, available, members, projects, companies, 
               minHeight: 32, padding: "0 13px", borderRadius: 99, cursor: "pointer",
               fontSize: 12, fontWeight: on ? 600 : 450,
               color: on ? "#243305" : T.ink3,
-              background: on ? "#EFFCC9" : "#FFFFFF",
+              background: on ? "#EFFCC9" : T.card,
               border: `1px solid ${on ? "#C9E88A" : T.line}`,
             }}>{label}</button>
           );
@@ -2971,7 +3012,7 @@ const PostCard = ({ post, board, mediaUrls, members, projects, myUserId, myMembe
               return (
                 <div key={c.id} style={{ display: "flex", gap: 9 }}>
                   <div style={{ width: 24, height: 24, borderRadius: 99, flexShrink: 0, display: "grid", placeItems: "center",
-                    background: "#FFFFFF", border: `1px solid ${T.line}`, fontSize: 10, fontWeight: 600, color: T.ink3 }}>
+                    background: T.card, border: `1px solid ${T.line}`, fontSize: 10, fontWeight: 600, color: T.ink3 }}>
                     {(who?.name ?? "?").slice(0, 1).toUpperCase()}
                   </div>
                   <div style={{ flex: 1, minWidth: 0 }}>
@@ -3039,7 +3080,7 @@ const PollPanel = ({ post, board, myUserId, readOnly, onVote }) => {
               position: "relative", overflow: "hidden", display: "flex", alignItems: "center", gap: 10,
               minHeight: 40, padding: "0 13px", borderRadius: 10, textAlign: "left",
               cursor: readOnly ? "default" : "pointer",
-              border: `1px solid ${on ? "#B3A0F2" : T.line}`, background: "#FFFFFF",
+              border: `1px solid ${on ? "#B3A0F2" : T.line}`, background: T.card,
             }}>
             {/* the fill bar sits behind the label rather than beside it, so a
               * long option name never squeezes the percentage off the row */}
@@ -3076,8 +3117,8 @@ const TaskRequestPanel = ({ request, board, members, myMemberId, readOnly, showT
     accepted:    { label: "Accepted", bg: "#F2FADF", color: "#3F6212" },
     declined:    { label: "Declined — unassigned", bg: "#FDECEA", color: "#B91C1C" },
     transferred: { label: "Transferred", bg: "#EAF6FE", color: "#0284C7" },
-    cancelled:   { label: "Cancelled", bg: "#F3F3EE", color: "#5A5F69" },
-  }[request.status] ?? { label: request.status, bg: "#F3F3EE", color: "#5A5F69" };
+    cancelled:   { label: "Cancelled", bg: T.cardSoft, color: T.ink2 },
+  }[request.status] ?? { label: request.status, bg: T.cardSoft, color: T.ink2 };
 
   return (
     <div style={{ margin: "0 18px 15px", padding: 15, borderRadius: 13,
@@ -3202,7 +3243,7 @@ const PostComposer = ({ members, projects, tasks, onSave, onClose }) => {
                 <button key={key} type="button" onClick={() => setKind(key)} className="pd-press" style={{
                   display: "flex", alignItems: "center", gap: 11, padding: "11px 13px", borderRadius: 11,
                   cursor: "pointer", textAlign: "left",
-                  background: on ? meta.bg : "#FFFFFF", border: `1px solid ${on ? meta.color + "44" : T.line}`,
+                  background: on ? meta.bg : T.card, border: `1px solid ${on ? meta.color + "44" : T.line}`,
                 }}>
                   <Icon size={15} style={{ color: on ? meta.color : T.ink3, flexShrink: 0 }} />
                   <div style={{ flex: 1, minWidth: 0 }}>
@@ -3471,7 +3512,7 @@ const PeopleView = ({ memberships, members, workspace, myRole, myEmail, onInvite
                     .map(([key, meta]) => <option key={key} value={key}>{meta.label}</option>)}
                 </select>
               ) : (
-                <Chip bg={m.role === "viewer" ? "#F3F3EE" : "#F2FADF"} color={m.role === "viewer" ? "#5A5F69" : "#3F6212"}>
+                <Chip bg={m.role === "viewer" ? T.cardSoft : "#F2FADF"} color={m.role === "viewer" ? T.ink2 : "#3F6212"}>
                   {m.role === "viewer" ? <Eye size={10} /> : <ShieldCheck size={10} />} {ROLE_META[m.role].label}
                 </Chip>
               )}
@@ -3533,7 +3574,7 @@ const ClockTicker = ({ since }) => {
 const EVENT_TYPE_META = {
   meeting: { label: "Meeting", icon: Video, color: "#0284C7", bg: "#EAF6FE" },
   visit: { label: "Visit", icon: MapPin, color: "#B45309", bg: "#FDF3E3" },
-  other: { label: "Other", icon: CalendarClock, color: "#5A5F69", bg: "#F3F3EE" },
+  other: { label: "Other", icon: CalendarClock, color: T.ink2, bg: T.cardSoft },
 };
 
 const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, tasks, alertsOn, enableAlerts,
@@ -3622,7 +3663,7 @@ const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, 
                 const meta = STATE_META[t.state];
                 return (
                   <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 11, flexWrap: "wrap",
-                    padding: "10px 13px", borderRadius: 10, background: "#FFFFFF", border: `1px solid ${t.isMarked ? "#F3D19E" : T.line}` }}>
+                    padding: "10px 13px", borderRadius: 10, background: T.card, border: `1px solid ${t.isMarked ? "#F3D19E" : T.line}` }}>
                     {t.isMarked && <Star size={12} style={{ color: "#D97706", fill: "#D97706", flexShrink: 0 }} />}
                     <div style={{ flex: 1, minWidth: 140 }}>
                       <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{t.title}</div>
@@ -3630,7 +3671,7 @@ const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, 
                         {p?.name ?? "—"} · {who}{t.markLabel ? ` · ${t.markLabel}` : ""}
                       </div>
                     </div>
-                    <Chip bg={t.scope === "team" ? "#EAF6FE" : "#F3F3EE"} color={t.scope === "team" ? "#0284C7" : "#5A5F69"}>
+                    <Chip bg={t.scope === "team" ? "#EAF6FE" : T.cardSoft} color={t.scope === "team" ? "#0284C7" : T.ink2}>
                       {t.scope === "team" ? <Users size={10} /> : <UserCheck size={10} />} {t.scope === "team" ? "Team" : "Individual"}
                     </Chip>
                     <Chip bg={meta.bg} color={meta.color}>{meta.label}</Chip>
@@ -3682,7 +3723,7 @@ const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, 
                   boxShadow: isToday ? "0 0 0 4px rgba(124,181,24,0.22)"
                     : marked.length ? "0 0 0 2px rgba(217,119,6,0.16)" : "none",
                   opacity: sunday && !ex && !dayEvents.length && !dayTasks.length && !dayDeadlines.length ? 0.45 : 1,
-                  background: "#FFFFFF",
+                  background: T.card,
                   ...(ex ? meshBackground(exMeta.mesh) : isToday ? meshBackground(["#F6FEE7", "#EFFCC9", "#E4F9AC"]) : {}),
                 }}>
                 {(ex || isToday) && <GrainOverlay opacity={0.2} radius={12} />}
@@ -3818,7 +3859,7 @@ const CalendarEventForm = ({ data, defaultDate, companies, projects, members, on
                 <button key={m.id} type="button" onClick={() => toggleAttendee(m.id)} className="pd-press" style={{
                   display: "flex", alignItems: "center", gap: 10, padding: "8px 11px", borderRadius: 10,
                   cursor: "pointer", textAlign: "left",
-                  background: on ? "#F4FBE3" : "#FFFFFF", border: `1px solid ${on ? "#C9E88A" : T.line}`,
+                  background: on ? "#F4FBE3" : T.card, border: `1px solid ${on ? "#C9E88A" : T.line}`,
                 }}>
                   <span style={{ flex: 1, fontSize: 12.5, color: T.ink }}>{m.name}</span>
                   {on && <Check size={13} style={{ color: T.limeDeep }} />}
@@ -3868,7 +3909,7 @@ const MarkDayModal = ({ date, existing, members, onSave, onClear, onClose }) => 
                 <button key={key} type="button" onClick={() => setF({ ...f, type: key })} className="pd-press" style={{
                   display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10,
                   cursor: "pointer", textAlign: "left",
-                  background: on ? meta.bg : "#FFFFFF", border: `1px solid ${on ? meta.color + "44" : T.line}`,
+                  background: on ? meta.bg : T.card, border: `1px solid ${on ? meta.color + "44" : T.line}`,
                 }}>
                   <Icon size={14} style={{ color: on ? meta.color : T.ink3, flexShrink: 0 }} />
                   <span style={{ flex: 1, fontSize: 12.5, fontWeight: on ? 600 : 450, color: on ? meta.color : T.ink2 }}>
@@ -4105,7 +4146,7 @@ const BarPair = ({ week, cur, prev, max, mesh }) => (
     <div style={{ display: "flex", alignItems: "flex-end", gap: 4, height: 110, width: "100%", justifyContent: "center" }}>
       {[{ v: prev, ghost: true }, { v: cur, ghost: false }].map(({ v, ghost }, i) => (
         <div key={i} style={{ position: "relative", width: 16, height: "100%", borderRadius: 6, overflow: "hidden",
-          background: "#EFEFEA", border: `1px solid ${T.lineSoft}` }}>
+          background: T.lineSoft, border: `1px solid ${T.lineSoft}` }}>
           <div className="pd-sand-fill" style={{ position: "absolute", inset: 0,
             transform: `translateY(${100 - (max ? (v / max) * 100 : 0)}%)` }}>
             {ghost
@@ -4227,7 +4268,7 @@ const GanttView = ({ companies, scopedProjects, members, tasks }) => {
             <button key={key} onClick={() => toggleState(key)} className="pd-press" style={{
               minHeight: 30, padding: "0 12px", borderRadius: 9, cursor: "pointer", fontSize: 11.5, fontWeight: 600,
               border: `1px solid ${activeStates.has(key) ? meta.color + "55" : T.line}`,
-              background: activeStates.has(key) ? meta.bg : "#FFFFFF",
+              background: activeStates.has(key) ? meta.bg : T.card,
               color: activeStates.has(key) ? meta.color : T.ink3,
             }}>{meta.label}</button>
           ))}
@@ -4237,7 +4278,7 @@ const GanttView = ({ companies, scopedProjects, members, tasks }) => {
             <button key={key} onClick={() => setRange(key)} className="pd-press" style={{
               minHeight: 30, padding: "0 12px", borderRadius: 9, cursor: "pointer", fontSize: 11.5, fontWeight: 600,
               border: `1px solid ${range === key ? "rgba(36,51,5,0.12)" : T.line}`,
-              background: range === key ? "#F2FADF" : "#FFFFFF",
+              background: range === key ? "#F2FADF" : T.card,
               color: range === key ? "#3F6212" : T.ink3,
             }}>{label}</button>
           ))}
@@ -4342,7 +4383,7 @@ const ReportsView = ({ sessions, tasks, exceptions, projects, companies, onExpor
       <PageHead kicker="Self-competition" title="Monthly Report"
         sub="You are only ever racing your previous month."
         action={
-          <div style={{ display: "flex", gap: 6, background: "#FFFFFF", border: `1px solid ${T.line}`, borderRadius: 12, padding: 4, boxShadow: T.shadowSm }}>
+          <div style={{ display: "flex", gap: 6, background: T.card, border: `1px solid ${T.line}`, borderRadius: 12, padding: 4, boxShadow: T.shadowSm }}>
             {[{ o: 0, l: "This month" }, { o: -1, l: "Last month" }].map(({ o, l }) => (
               <button key={o} onClick={() => setOffset(o)} className="pd-press" style={{
                 minHeight: 34, padding: "0 14px", borderRadius: 9, cursor: "pointer", fontSize: 12.5, fontWeight: 600,

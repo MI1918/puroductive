@@ -1,30 +1,60 @@
 import React, { useEffect, useState } from "react";
 import { supabase } from "../lib/supabaseClient.js";
+import { getInitialTheme, applyTheme } from "../lib/theme.js";
 
+/* Every color here is a CSS variable, not a literal — see src/lib/theme.js.
+ * That's what makes dark mode apply to the sign-in screen automatically
+ * without this file needing its own light/dark branching logic. */
 const styles = {
   page: {
     minHeight: "100vh", display: "grid", placeItems: "center",
-    background: "#F7F7F4", fontFamily: "'Inter', system-ui, sans-serif", padding: 20,
+    background: "var(--bg)", fontFamily: "'Inter', system-ui, sans-serif", padding: 20,
   },
   card: {
-    width: "100%", maxWidth: 380, background: "#FFFFFF", borderRadius: 22, padding: 32,
-    border: "1px solid #E9E9E3", boxShadow: "0 2px 4px rgba(22,24,29,0.05), 0 24px 48px -16px rgba(22,24,29,0.14)",
+    width: "100%", maxWidth: 380, background: "var(--card)", borderRadius: 22, padding: 32,
+    border: "1px solid var(--line)", boxShadow: "var(--shadow-lg)", position: "relative",
   },
-  title: { fontFamily: "'Sora', system-ui, sans-serif", fontSize: 22, fontWeight: 700, margin: "0 0 4px", color: "#16181D" },
-  sub: { fontSize: 13, color: "#5A5F69", margin: "0 0 22px", lineHeight: 1.5 },
-  label: { display: "block", fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: "#9AA0AA", marginBottom: 6 },
+  themeToggle: {
+    position: "absolute", top: 16, right: 16, width: 34, height: 34, borderRadius: 10,
+    border: "1px solid var(--line)", background: "var(--card-soft)", cursor: "pointer",
+    display: "grid", placeItems: "center", fontSize: 15, lineHeight: 1,
+  },
+  title: { fontFamily: "'Sora', system-ui, sans-serif", fontSize: 22, fontWeight: 700, margin: "0 0 4px", color: "var(--ink)" },
+  sub: { fontSize: 13, color: "var(--ink2)", margin: "0 0 22px", lineHeight: 1.5 },
+  label: { display: "block", fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--ink3)", marginBottom: 6 },
   input: {
     width: "100%", minHeight: 44, padding: "0 14px", borderRadius: 12, fontSize: 14,
-    border: "1px solid #E9E9E3", marginBottom: 16, boxSizing: "border-box",
+    border: "1px solid var(--line)", marginBottom: 16, boxSizing: "border-box",
+    background: "var(--card)", color: "var(--ink)",
   },
   button: {
     width: "100%", minHeight: 46, borderRadius: 12, border: "none", cursor: "pointer",
+    /* Deliberately literal, not var(--ink) — this is a fixed "always dark
+     * surface" button style, and var(--ink) flips to a LIGHT color in dark
+     * mode, which would turn this into a light button with invisible white
+     * text on it. See the identical note on Btn's `ink` variant in App.jsx. */
     background: "#16181D", color: "#FFFFFF", fontSize: 14, fontWeight: 600, marginTop: 4,
   },
-  switchRow: { textAlign: "center", marginTop: 18, fontSize: 12.5, color: "#5A5F69" },
-  switchLink: { color: "#16181D", fontWeight: 600, cursor: "pointer", background: "none", border: "none", padding: 0, textDecoration: "underline" },
-  error: { fontSize: 12.5, color: "#B91C1C", background: "#FDECEA", border: "1px solid #F5C6BE", borderRadius: 10, padding: "10px 12px", marginBottom: 16 },
-  notice: { fontSize: 12.5, color: "#3F6212", background: "#F2FADF", border: "1px solid #C9E88A", borderRadius: 10, padding: "10px 12px", marginBottom: 16 },
+  switchRow: { textAlign: "center", marginTop: 18, fontSize: 12.5, color: "var(--ink2)" },
+  switchLink: { color: "var(--ink)", fontWeight: 600, cursor: "pointer", background: "none", border: "none", padding: 0, textDecoration: "underline" },
+  error: { fontSize: 12.5, color: "var(--danger)", background: "var(--danger-bg)", border: "1px solid var(--danger-line)", borderRadius: 10, padding: "10px 12px", marginBottom: 16 },
+  notice: { fontSize: 12.5, color: "var(--lime-deep)", background: "var(--card-soft)", border: "1px solid var(--line)", borderRadius: 10, padding: "10px 12px", marginBottom: 16 },
+};
+
+const ThemeToggle = () => {
+  const [colorMode, setColorMode] = useState(getInitialTheme);
+  const flip = () => {
+    const next = colorMode === "dark" ? "light" : "dark";
+    setColorMode(next);
+    applyTheme(next);
+  };
+  return (
+    <button type="button" style={styles.themeToggle} onClick={flip}
+      aria-label={colorMode === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+      title={colorMode === "dark" ? "Switch to light mode" : "Switch to dark mode"}>
+      {colorMode === "dark" ? "☀️" : "🌙"}
+    </button>
+  );
 };
 
 const LoginForm = () => {
@@ -61,6 +91,7 @@ const LoginForm = () => {
   return (
     <div style={styles.page}>
       <form style={styles.card} onSubmit={submit}>
+        <ThemeToggle />
         <h1 style={styles.title}>Puroductive</h1>
         <p style={styles.sub}>{mode === "signin" ? "Sign in to your workspace." : "Create your workspace account."}</p>
         {error && <div style={styles.error}>{error}</div>}
