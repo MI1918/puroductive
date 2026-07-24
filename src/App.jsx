@@ -9,6 +9,7 @@ import {
   ChevronsUpDown, Eye, Send, Layers, Palmtree, MessageSquare, Image as ImageIcon,
   BarChart2, HelpCircle, PartyPopper, ArrowRightLeft, Paperclip,
   Crown, Medal, Zap, MessageCircle, Hash,
+  GripVertical, Pause, Camera, Copy, KeyRound, Smartphone, Award,
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient.js";
 import * as db from "./lib/db.js";
@@ -76,7 +77,11 @@ export const isPast = (ymd) => !!ymd && new Date(ymd + "T23:59:59") < new Date()
  * ==========================================================================*/
 export const TRANSITIONS = {
   pending:       { START: "in_progress", FAIL_ATTEMPT: "retry_pending", DEADLINE_PASSED: "overdue" },
-  in_progress:   { COMPLETE: "completed", FAIL_ATTEMPT: "retry_pending", DEADLINE_PASSED: "overdue" },
+  /* PAUSE (item 2) is a deliberate stop, not a failure — it hands the
+   * "currently active" slot back to the queue without touching retryCount
+   * or reassignment, so a paused CNC task can sit behind a newly-inserted
+   * grinding step and simply wait its turn again. */
+  in_progress:   { COMPLETE: "completed", PAUSE: "pending", FAIL_ATTEMPT: "retry_pending", DEADLINE_PASSED: "overdue" },
   retry_pending: { REASSIGN: "pending", RESCHEDULE: "pending", COMPLETE: "completed", DEADLINE_PASSED: "overdue" },
   overdue:       { COMPLETE: "completed", FAIL_ATTEMPT: "retry_pending" },
   completed:     {},
@@ -272,6 +277,18 @@ export function engineReducer(s, a) {
       let interventions = s.interventions;
       const patch = { state: next };
 
+      /* Per-task duration (item 2) — self-contained on this one task, never
+       * touching any other task's numbers. START stamps when the clock
+       * starts; leaving in_progress by any path (PAUSE, COMPLETE, a failed
+       * attempt, or a deadline sweep) folds whatever ran since then into
+       * the accumulated total and stops the clock, so pausing and resuming
+       * (possibly more than once) still adds up to one honest total. */
+      if (a.event === "START") patch.startedAt = new Date().toISOString();
+      if (t.state === "in_progress" && t.startedAt) {
+        const ranMinutes = Math.round((Date.now() - new Date(t.startedAt).getTime()) / 60000);
+        patch.activeMinutes = (t.activeMinutes ?? 0) + Math.max(0, ranMinutes);
+        patch.startedAt = null;
+      }
       if (a.event === "FAIL_ATTEMPT") patch.retryCount = t.retryCount + 1;
       if (a.event === "REASSIGN") {
         if (!a.toAssigneeId) return s; // guard: handoff must carry a target
@@ -355,6 +372,26 @@ export function engineReducer(s, a) {
               markScope: a.markScope ?? null, markTargetId: a.markTargetId ?? null }
           : x)),
       };
+
+    /* Drag-reorder (item 2). Also outside TRANSITIONS — like MARK_TASK, this
+     * is a position, not a lifecycle event, and must never write a
+     * transition log or touch state. Either field may be omitted. */
+    case "SET_QUEUE_ORDER":
+      return {
+        ...s,
+        tasks: s.tasks.map((x) => (x.id === a.taskId
+          ? {
+              ...x,
+              ...(a.queueOrder !== undefined ? { queueOrder: a.queueOrder } : {}),
+              ...(a.personalQueueOrder !== undefined ? { personalQueueOrder: a.personalQueueOrder } : {}),
+            }
+          : x)),
+      };
+
+    /* The optional completion photo (item 3) — a side-channel field, same
+     * reasoning as SET_QUEUE_ORDER: not a lifecycle event, no transition log. */
+    case "SET_TASK_PHOTO":
+      return { ...s, tasks: s.tasks.map((x) => (x.id === a.taskId ? { ...x, completionPhotoPath: a.path } : x)) };
 
     /* The ONLY delete path — and it refuses anything not completed. */
     case "ARCHIVE_COMPLETED_TASK": {
@@ -622,6 +659,46 @@ export function levelForPoints(points) {
   const idx = LEVEL_TIERS.indexOf(level);
   const next = LEVEL_TIERS[idx + 1] ?? null;
   return { ...level, next, toNext: next ? next.min - points : 0 };
+}
+
+/* ============================================================================
+ * TASK QUEUES (item 2, schema_v9) — two independent fractional orderings:
+ * queue_order (a project's own pipeline) and personal_queue_order (an
+ * assignee's cross-project queue). Both are plain floats, so inserting
+ * between two neighbors is just averaging their order values — see
+ * nextQueueOrder/betweenQueueOrder below, used by drag-reorder and by new
+ * tasks joining the tail of both queues automatically.
+ * ==========================================================================*/
+export function nextQueueOrder(existingOrders) {
+  const max = existingOrders.length ? Math.max(...existingOrders) : 0;
+  return max + 1000;
+}
+export function betweenQueueOrder(prevOrder, nextOrder) {
+  if (prevOrder == null) return nextOrder == null ? 1000 : nextOrder / 2;
+  if (nextOrder == null) return prevOrder + 1000;
+  return (prevOrder + nextOrder) / 2;
+}
+/* Resolves the single task that should auto-start once `completed` finishes
+ * — personal queue wins over project queue when a task sits in both (so
+ * "MY workflow" takes precedence), and at most one task is ever returned. */
+export function findNextQueuedTask(tasks, completed) {
+  if (completed.assigneeId && completed.personalQueueOrder != null) {
+    const candidates = tasks.filter((x) =>
+      x.assigneeId === completed.assigneeId && x.state === "pending" &&
+      x.personalQueueOrder != null && x.personalQueueOrder > completed.personalQueueOrder);
+    if (candidates.length) {
+      return candidates.reduce((a, b) => (a.personalQueueOrder < b.personalQueueOrder ? a : b));
+    }
+  }
+  if (completed.queueOrder != null) {
+    const candidates = tasks.filter((x) =>
+      x.projectId === completed.projectId && x.state === "pending" &&
+      x.queueOrder != null && x.queueOrder > completed.queueOrder);
+    if (candidates.length) {
+      return candidates.reduce((a, b) => (a.queueOrder < b.queueOrder ? a : b));
+    }
+  }
+  return null;
 }
 
 /* Open (non-completed) tasks whose deadline falls on this YYYY-MM-DD. */
@@ -1437,6 +1514,16 @@ export default function PuroductiveApp({ session }) {
     db.fetchGoogleConnection().then(setGoogleConnection).catch(() => {});
   };
 
+  /* ------------------- clock automation tokens (item 1, v10) ---------------
+   * `freshAutomationToken` only ever holds the most recently generated raw
+   * token — cleared the moment the user dismisses it (or generates another),
+   * since it's shown exactly once by design. */
+  const [automationTokens, setAutomationTokens] = useState([]);
+  const [freshAutomationToken, setFreshAutomationToken] = useState(null);
+  const loadAutomationTokens = () => {
+    db.listAutomationTokens().then(setAutomationTokens).catch(() => {});
+  };
+
   /* ------------------------------ celebration -------------------------------
    * "big" is a project's sand stack filling completely; the small version is
    * any single on-time task completion. Confetti respects reduced-motion —
@@ -1566,6 +1653,8 @@ export default function PuroductiveApp({ session }) {
         setEvents(data.events);
         setMemberships(mems);
         loadGoogleConnection();
+        loadAutomationTokens();
+        setFreshAutomationToken(null);
         seenTaskIds.current = new Set(data.tasks.map((t) => t.id));
         seenTransitionIds.current = new Set(data.transitions.map((t) => t.id));
         seenReflectionIds.current = new Set(data.reflections.map((r) => r.id));
@@ -1786,6 +1875,31 @@ export default function PuroductiveApp({ session }) {
     window.history.replaceState({}, "", clean);
   }, []);
 
+  /* item 5 — true background sync (schema_v11.sql's cron job), independent
+   * of both the manual button above and the while-open poll. */
+  const toggleGoogleAutoSync = async (on) => {
+    if (!googleConnection) return;
+    setGoogleConnection((c) => (c ? { ...c, autoSync: on } : c));
+    try { await db.setGoogleAutoSync(googleConnection.id, on); }
+    catch (e) { toast(`Sync failed: ${e.message}`, "error"); loadGoogleConnection(); }
+  };
+
+  /* -------------------- clock automation tokens (item 1) ------------------ */
+  const generateAutomationToken = async (label) => {
+    try {
+      const { token, record } = await db.createAutomationToken(label || "Clock automation");
+      setAutomationTokens((ts) => [record, ...ts]);
+      setFreshAutomationToken({ token, record });
+    } catch (e) {
+      toast(`Could not create token: ${e.message}`, "error");
+    }
+  };
+  const revokeAutomationToken = async (id) => {
+    setAutomationTokens((ts) => ts.filter((t) => t.id !== id));
+    try { await db.revokeAutomationToken(id); toast("Token revoked"); }
+    catch (e) { toast(`Sync failed: ${e.message}`, "error"); loadAutomationTokens(); }
+  };
+
   /* ---------------- ENGINE 7 wiring: report export ------------------------ */
   const exportProject = (proj) => {
     const compiled = compileProjectReport({
@@ -1850,9 +1964,44 @@ export default function PuroductiveApp({ session }) {
         fireCelebration(false);
         toast(CELEBRATION_MESSAGES[Math.floor(Math.random() * CELEBRATION_MESSAGES.length)]);
       }
+      // Auto-advance the queue (item 2) — exactly one "next" task, personal
+      // queue taking precedence over the project pipeline. `engine.tasks`
+      // here is still pre-dispatch, but that's fine: the candidate is a
+      // different task whose own pending state isn't touched by t's own
+      // COMPLETE, and React batches this second dispatch right after the
+      // first.
+      const nextUp = findNextQueuedTask(engine.tasks, t);
+      if (nextUp) {
+        dispatch({ type: "TRANSITION", taskId: nextUp.id, event: "START" });
+        toast(`Next up: "${nextUp.title}"`);
+      }
     }
     if (event === "REASSIGN") toast(`Handed off to ${members.find((m) => m.id === extras.toAssigneeId)?.name}`);
     if (event === "FAIL_ATTEMPT") toast("Moved to Retry Pending — reassign or reschedule", "error");
+    if (event === "PAUSE") toast(`Paused "${t.title}" — it'll wait its turn in the queue`);
+  };
+
+  /* Drag-reorder writes (item 2) — a position, not a state-machine event;
+   * see SET_QUEUE_ORDER's comment in engineReducer. */
+  const reorderTask = (taskId, patch) => {
+    dispatch({ type: "SET_QUEUE_ORDER", taskId, ...patch });
+    db.updateTaskQueueOrder(taskId, patch).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+  };
+
+  /* Completing with an optional photo (item 3) — the transition itself
+   * fires immediately either way (so completing never waits on an upload);
+   * the photo, if any, attaches as a side-channel patch once it's up. */
+  const completeTaskWithPhoto = async (task, file) => {
+    tryTransition(task.id, "COMPLETE");
+    setModal(null);
+    if (!file) return;
+    try {
+      const path = await db.uploadTaskCompletionPhoto(task.id, file);
+      await db.attachTaskCompletionPhoto(task.id, path);
+      dispatch({ type: "SET_TASK_PHOTO", taskId: task.id, path });
+    } catch (e) {
+      toast(`Photo upload failed: ${e.message}`, "error");
+    }
   };
 
   /* Attempted delete → completed tasks archive; anything else is refused
@@ -1884,8 +2033,26 @@ export default function PuroductiveApp({ session }) {
     }
     setModal(null);
   };
+  /* New tasks join the tail of both queues automatically (item 2) — a
+   * project-pipeline position, and (only if assigned) a personal-queue
+   * position. Reordering only ever happens afterwards, via an explicit
+   * drag. */
+  const withQueuePositions = (task) => {
+    const projectOrders = engine.tasks
+      .filter((t) => t.projectId === task.projectId).map((t) => t.queueOrder).filter((v) => v != null);
+    let personalQueueOrder = null;
+    if (task.assigneeId) {
+      const personalOrders = engine.tasks
+        .filter((t) => t.assigneeId === task.assigneeId).map((t) => t.personalQueueOrder).filter((v) => v != null);
+      personalQueueOrder = nextQueueOrder(personalOrders);
+    }
+    return {
+      ...task, queueOrder: nextQueueOrder(projectOrders), personalQueueOrder,
+      activeMinutes: 0, startedAt: null, completionPhotoPath: null,
+    };
+  };
   /* Task inserts are picked up by the engine.tasks persistence watcher above. */
-  const addTask = (task) => { dispatch({ type: "ADD_TASK", task }); setModal(null); };
+  const addTask = (task) => { dispatch({ type: "ADD_TASK", task: withQueuePositions(task) }); setModal(null); };
 
   /* ------------------------- companies CRUD ------------------------------- */
   const saveCompany = (data) => {
@@ -2132,13 +2299,13 @@ export default function PuroductiveApp({ session }) {
   const acceptRequest = async (req) => {
     const projectId = req.projectId || projects[0]?.id;
     if (!projectId) { toast("Create a project first — an accepted task has to live somewhere", "error"); return; }
-    const task = {
+    const task = withQueuePositions({
       id: "t-" + uid(), projectId, title: req.title, state: "pending",
       scope: "individual", assigneeId: req.assigneeMemberId || null, assigneeGroupId: null,
       deadline: req.deadline || null, weight: req.weight ?? 1,
       retryCount: 0, completedAt: null, completedLate: false,
       isMarked: false, markLabel: "", markScope: null, markTargetId: null,
-    };
+    });
     try {
       /* The task row must exist in Postgres before the request can point at
        * it — task_requests.task_id is a foreign key. Normally new tasks reach
@@ -2296,20 +2463,26 @@ export default function PuroductiveApp({ session }) {
           display: "flex", flexDirection: "column", padding: "26px 16px",
           borderRight: `1px solid ${T.line}`, background: T.card,
         }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 11, padding: "0 8px", marginBottom: 30 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 11 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "0 8px", marginBottom: 30 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 11, minWidth: 0 }}>
               <Mesh mesh={THEME_PRESETS[0].mesh} style={{
-                width: 36, height: 36, borderRadius: 11, display: "grid", placeItems: "center",
+                width: 36, height: 36, borderRadius: 11, display: "grid", placeItems: "center", flexShrink: 0,
                 boxShadow: "0 4px 14px -4px rgba(124,181,24,0.55)", border: "1px solid rgba(36,51,5,0.1)",
               }}>
                 <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 17, color: "#243305", display: "grid", placeItems: "center", height: "100%" }}>P</span>
               </Mesh>
-              <div>
-                <div style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 16, letterSpacing: "-0.02em" }}>Puroductive</div>
-                <div style={{ fontSize: 10, color: T.ink3, letterSpacing: "0.14em", textTransform: "uppercase", marginTop: 1 }}>Workspace OS</div>
+              {/* minWidth:0 + truncation here (not flexShrink:0) is what stops
+                * this text from refusing to shrink and pushing the bell/help
+                * buttons out past the sidebar's fixed width — a flex item's
+                * default min-width is its content size, not 0. */}
+              <div style={{ minWidth: 0, overflow: "hidden" }}>
+                <div style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 16, letterSpacing: "-0.02em",
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>Puroductive</div>
+                <div style={{ fontSize: 10, color: T.ink3, letterSpacing: "0.14em", textTransform: "uppercase", marginTop: 1,
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>Workspace OS</div>
               </div>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
               <NotificationBell count={notifications.filter((n) => !n.readAt).length}
                 onClick={() => setNotifCenterOpen((o) => !o)} />
               <IconBtn label="Show the app tour" onClick={() => setShowTour(true)}><HelpCircle size={15} /></IconBtn>
@@ -2402,8 +2575,10 @@ export default function PuroductiveApp({ session }) {
           </Card>
         )}
         {view === "dashboard" && (
-          <Dashboard {...{ companies, projects, members, engine, theme }}
-            openProject={(id) => { setOpenProjectId(id); setView("projects"); }} />
+          <Dashboard {...{ companies, projects, members, engine, theme, myMemberId, tryTransition }}
+            openProject={(id) => { setOpenProjectId(id); setView("projects"); }}
+            onComplete={(t) => setModal({ kind: "completeTask", task: t })}
+            onReorder={reorderTask} />
         )}
         {view === "companies" && (
           <CompaniesView companies={companies} projects={projects} members={members}
@@ -2423,6 +2598,8 @@ export default function PuroductiveApp({ session }) {
             onReassign={(t) => setModal({ kind: "reassign", taskId: t.id })}
             onReschedule={(t) => setModal({ kind: "reschedule", taskId: t.id })}
             onMark={(t) => setModal({ kind: "markTask", task: t })}
+            onComplete={(t) => setModal({ kind: "completeTask", task: t })}
+            onReorder={reorderTask}
             onAddTask={() => setModal({ kind: "task", projectId: openProject.id })}
             onExport={() => exportProject(openProject)} />
         )}
@@ -2467,6 +2644,10 @@ export default function PuroductiveApp({ session }) {
             events={events} projects={projects} companies={companies} members={members} groups={groups}
             googleConnection={googleConnection} googleSyncing={googleSyncing}
             onConnectGoogle={connectGoogle} onDisconnectGoogle={disconnectGoogleHandler} onSyncGoogleNow={syncGoogleNow}
+            onToggleGoogleAutoSync={toggleGoogleAutoSync}
+            automationTokens={automationTokens} freshAutomationToken={freshAutomationToken}
+            onGenerateAutomationToken={generateAutomationToken} onRevokeAutomationToken={revokeAutomationToken}
+            onDismissFreshToken={() => setFreshAutomationToken(null)}
             onAddEvent={(date) => setModal({ kind: "event", data: null, date })}
             onEditEvent={(ev) => setModal({ kind: "event", data: ev })}
             onDeleteEvent={deleteEvent}
@@ -2546,6 +2727,11 @@ export default function PuroductiveApp({ session }) {
       {!interventionTask && modal?.kind === "markTask" && (
         <MarkTaskModal task={modal.task} members={members} groups={groups}
           onSave={(mark) => saveTaskMark(modal.task.id, mark)} onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "completeTask" && (
+        <CompleteTaskModal task={modal.task}
+          onComplete={(file) => completeTaskWithPhoto(modal.task, file)}
+          onClose={() => setModal(null)} />
       )}
       {!interventionTask && modal?.kind === "workspace" && (
         <WorkspaceForm onSave={addWorkspace} onClose={() => setModal(null)} />
@@ -2766,33 +2952,129 @@ const OpenHandoffsPanel = ({ handoffs, tasks, members }) => {
   );
 };
 
+/* ------------------------------ MY QUEUE ITEM ------------------------------
+ * One row in the personal queue (item 2) — the active task gets the live
+ * duration badge plus Pause/Complete; anything still pending gets a Start
+ * button and is drag-reorderable via the parent DragQueueList. */
+const MyQueueItem = ({ task, projects, active, onStart, onPause, onComplete }) => {
+  const p = projects.find((x) => x.id === task.projectId);
+  return (
+    <Card style={{
+      padding: "14px 16px", marginBottom: 10, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+      border: active ? `1.5px solid ${T.limeDeep}` : `1px solid ${T.line}`,
+      boxShadow: active ? "0 0 0 3px rgba(124,181,24,0.14)" : "none",
+    }}>
+      {!active && <GripVertical size={14} style={{ color: T.ink3, flexShrink: 0, cursor: "grab" }} />}
+      <div style={{ flex: 1, minWidth: 140 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{task.title}</span>
+          {active && <TaskDurationBadge task={task} />}
+        </div>
+        <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
+          {p?.name ?? "—"}{task.estimatedMinutes ? ` · est. ${task.estimatedMinutes} min` : ""}
+        </div>
+      </div>
+      {active ? (
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn small ghost onClick={onPause}><Pause size={13} /> Pause</Btn>
+          <Btn small onClick={onComplete}><Check size={13} /> Complete</Btn>
+        </div>
+      ) : (
+        <Btn small ghost onClick={onStart}><Play size={13} /> Start</Btn>
+      )}
+    </Card>
+  );
+};
+
 /* =============================== DASHBOARD ================================ */
-const Dashboard = ({ companies, projects, members, engine, theme, openProject }) => {
+const Dashboard = ({ companies, projects, members, engine, theme, openProject, myMemberId, tryTransition, onComplete, onReorder }) => {
   const active = projects.filter((p) => p.status === "active");
   const overdue = engine.tasks.filter((t) => t.state === "overdue");
   const retrying = engine.tasks.filter((t) => t.state === "retry_pending");
   const openHandoffs = engine.handoffs.filter((h) => h.status === "pending");
   const attention = overdue.length + retrying.length;
+
+  const myRow = myMemberId
+    ? computeLeaderboard(engine.tasks, members, monthWindow(0).start.toISOString()).find((r) => r.member.id === myMemberId)
+    : null;
+  const myQueueTasks = myMemberId
+    ? engine.tasks.filter((t) => t.assigneeId === myMemberId && (t.state === "pending" || t.state === "in_progress"))
+    : [];
+  const myActiveTask = myQueueTasks.find((t) => t.state === "in_progress");
+  const myPendingQueue = myQueueTasks.filter((t) => t.state === "pending");
+
   return (
     <div className="pd-fade-in">
       <Mesh mesh={attention > 0 ? MOLD_MESH : theme.mesh} style={{
         borderRadius: 24, padding: "32px 36px", marginBottom: 22,
         border: "1px solid rgba(22,24,29,0.07)", boxShadow: T.shadowMd,
       }}>
-        <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.15em", textTransform: "uppercase",
-          color: attention > 0 ? MOLD_INK : theme.ink, opacity: 0.65, marginBottom: 12 }}>
-          Cross-company overview
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.15em", textTransform: "uppercase",
+              color: attention > 0 ? MOLD_INK : theme.ink, opacity: 0.65, marginBottom: 12 }}>
+              Cross-company overview
+            </div>
+            <h1 style={{ margin: 0, fontFamily: T.fontDisplay, fontSize: 38, fontWeight: 700, letterSpacing: "-0.035em",
+              lineHeight: 1.05, color: attention > 0 ? MOLD_INK : theme.ink }}>
+              {attention > 0
+                ? <>Attention required.<br />{attention} task{attention > 1 ? "s" : ""} in the danger loop.</>
+                : <>Good day.<br />Everything is under supervision.</>}
+            </h1>
+            <p style={{ margin: "12px 0 0", fontSize: 13.5, color: attention > 0 ? MOLD_INK : theme.ink, opacity: 0.7 }}>
+              {active.length} live projects · {overdue.length} overdue · {retrying.length} retry pending · {openHandoffs.length} open handoffs
+            </p>
+          </div>
+          {/* item 7 — your points, always visible regardless of the
+            * leaderboard-competition toggle (item 6): that toggle only
+            * hides you from the ranking, not your own number. */}
+          {myRow && (
+            <div style={{ textAlign: "right", flexShrink: 0 }}>
+              <div style={{ fontSize: 10.5, fontWeight: 600, letterSpacing: "0.1em", textTransform: "uppercase",
+                color: attention > 0 ? MOLD_INK : theme.ink, opacity: 0.65 }}>Your points</div>
+              <div className="pd-num" style={{ fontFamily: T.fontDisplay, fontSize: 30, fontWeight: 700,
+                color: attention > 0 ? MOLD_INK : theme.ink }}>{myRow.points}</div>
+              <div style={{ display: "flex", gap: 6, marginTop: 4, justifyContent: "flex-end" }}>
+                <Chip bg="rgba(255,255,255,0.5)" color={levelForPoints(myRow.points).color}>
+                  <Award size={10} /> {levelForPoints(myRow.points).label}
+                </Chip>
+              </div>
+            </div>
+          )}
         </div>
-        <h1 style={{ margin: 0, fontFamily: T.fontDisplay, fontSize: 38, fontWeight: 700, letterSpacing: "-0.035em",
-          lineHeight: 1.05, color: attention > 0 ? MOLD_INK : theme.ink }}>
-          {attention > 0
-            ? <>Attention required.<br />{attention} task{attention > 1 ? "s" : ""} in the danger loop.</>
-            : <>Good day.<br />Everything is under supervision.</>}
-        </h1>
-        <p style={{ margin: "12px 0 0", fontSize: 13.5, color: attention > 0 ? MOLD_INK : theme.ink, opacity: 0.7 }}>
-          {active.length} live projects · {overdue.length} overdue · {retrying.length} retry pending · {openHandoffs.length} open handoffs
-        </p>
       </Mesh>
+
+      {/* --------------------------- MY QUEUE (item 2) ----------------------
+        * A YouTube-Music-style personal queue: whatever's active runs with a
+        * live timer, drag the rest into the order you actually want to work
+        * them — completing the active one auto-starts the next. */}
+      {myQueueTasks.length > 0 && (
+        <>
+          <SectionHead title="My queue" />
+          <div style={{ marginBottom: 32 }}>
+            {myActiveTask && (
+              <MyQueueItem task={myActiveTask} projects={projects} active
+                onPause={() => tryTransition(myActiveTask.id, "PAUSE")}
+                onComplete={() => onComplete(myActiveTask)} />
+            )}
+            {myPendingQueue.length > 0 && (
+              <div style={{ marginTop: myActiveTask ? 10 : 0 }}>
+                {!myActiveTask && myPendingQueue.length > 1 && (
+                  <p style={{ margin: "0 0 8px", fontSize: 11, color: T.ink3 }}>
+                    <GripVertical size={11} style={{ verticalAlign: -1 }} /> Drag to reorder — like a music queue.
+                  </p>
+                )}
+                <DragQueueList items={myPendingQueue} orderKey="personalQueueOrder"
+                  onReorder={(taskId, personalQueueOrder) => onReorder(taskId, { personalQueueOrder })}
+                  renderItem={(t) => (
+                    <MyQueueItem task={t} projects={projects}
+                      onStart={() => tryTransition(t.id, "START")} />
+                  )} />
+              </div>
+            )}
+          </div>
+        </>
+      )}
 
       <SectionHead title="Project sand stacks" />
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 16 }}>
@@ -2872,8 +3154,55 @@ const ProjectsList = ({ projects, companies, engine, onOpen, onCreate }) => (
   </div>
 );
 
+/* ---------------------------- DRAG-TO-REORDER QUEUE ------------------------
+ * Generic — used for the project pipeline above (orderKey="queueOrder") and
+ * the personal "My Queue" dashboard panel (orderKey="personalQueueOrder").
+ * Plain HTML5 drag events, no dependency, in the same hand-rolled-pointer
+ * spirit as NotificationRow's swipe-to-dismiss elsewhere in this file.
+ * Dropping a row moves the dragged item to just above the drop target; the
+ * new order value is the midpoint between that target and its own previous
+ * neighbor (see betweenQueueOrder), so nothing else in the list is touched. */
+const DragQueueList = ({ items, orderKey, onReorder, renderItem }) => {
+  const dragIdRef = useRef(null);
+  const [overId, setOverId] = useState(null);
+  const sorted = [...items].sort((a, b) => (a[orderKey] ?? Infinity) - (b[orderKey] ?? Infinity));
+
+  const handleDrop = (targetId) => {
+    const draggedId = dragIdRef.current;
+    dragIdRef.current = null;
+    setOverId(null);
+    if (!draggedId || draggedId === targetId) return;
+    const withoutDragged = sorted.filter((x) => x.id !== draggedId);
+    const insertAt = withoutDragged.findIndex((x) => x.id === targetId);
+    if (insertAt === -1) return;
+    const prev = withoutDragged[insertAt - 1];
+    const next = withoutDragged[insertAt];
+    onReorder(draggedId, betweenQueueOrder(prev?.[orderKey] ?? null, next?.[orderKey] ?? null));
+  };
+
+  return (
+    <div style={{ display: "grid", gap: 10 }}>
+      {sorted.map((item) => (
+        <div key={item.id}
+          draggable
+          onDragStart={(e) => { dragIdRef.current = item.id; e.dataTransfer.effectAllowed = "move"; }}
+          onDragOver={(e) => { e.preventDefault(); if (overId !== item.id) setOverId(item.id); }}
+          onDragLeave={() => setOverId((id) => (id === item.id ? null : id))}
+          onDrop={(e) => { e.preventDefault(); handleDrop(item.id); }}
+          style={{
+            borderRadius: 14,
+            boxShadow: overId === item.id && dragIdRef.current !== item.id ? `0 0 0 2px ${T.limeDeep}` : "none",
+            opacity: dragIdRef.current === item.id ? 0.5 : 1,
+          }}>
+          {renderItem(item)}
+        </div>
+      ))}
+    </div>
+  );
+};
+
 /* ============================ PROJECT DETAIL ============================== */
-const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onAddTask, onExport }) => {
+const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onComplete, onReorder, onAddTask, onExport }) => {
   const isMobile = useIsMobile();
   const c = companies.find((x) => x.id === project.companyId);
   const theme = c?.theme ?? THEME_PRESETS[0];
@@ -2957,14 +3286,25 @@ const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tr
           )}
         </div>
 
-        {/* RIGHT — tasks with state-machine actions */}
-        <div style={{ display: "grid", gap: 10 }}>
-          {tasks.map((t) => (
-            <TaskRow key={t.id} t={t} members={members} groups={groups}
-              tryTransition={tryTransition} attemptDelete={attemptDelete}
-              onReassign={onReassign} onReschedule={onReschedule} onMark={onMark}
-              hasReflection={engine.reflections.some((r) => r.taskId === t.id)} />
-          ))}
+        {/* RIGHT — tasks with state-machine actions. Drag-reordered by
+          * queue_order (item 2) — this project's own pipeline order, e.g.
+          * R.M. cutting → CNC machining, independent of who's assigned each
+          * step. Dropping a row moves it to just above the one it's dropped
+          * on. */}
+        <div>
+          {tasks.length > 1 && (
+            <p style={{ margin: "0 0 8px", fontSize: 11, color: T.ink3 }}>
+              <GripVertical size={11} style={{ verticalAlign: -1 }} /> Drag to reorder this project's pipeline — completing one auto-starts the next.
+            </p>
+          )}
+          <DragQueueList items={tasks} orderKey="queueOrder"
+            onReorder={(taskId, queueOrder) => onReorder(taskId, { queueOrder })}
+            renderItem={(t) => (
+              <TaskRow t={t} members={members} groups={groups}
+                tryTransition={tryTransition} attemptDelete={attemptDelete}
+                onReassign={onReassign} onReschedule={onReschedule} onMark={onMark} onComplete={onComplete}
+                hasReflection={engine.reflections.some((r) => r.taskId === t.id)} />
+            )} />
           {tasks.length === 0 && <Empty text="No tasks yet — add the first one." />}
         </div>
       </div>
@@ -2974,14 +3314,15 @@ const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tr
 };
 
 /* ------------------------------- TASK ROW --------------------------------- */
-const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign, onReschedule, onMark, hasReflection }) => {
+const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onComplete, hasReflection }) => {
   const meta = STATE_META[t.state];
   const acts = [];
   if (TRANSITIONS[t.state].START) acts.push({ k: "START", label: "Start", icon: Play, run: () => tryTransition(t.id, "START") });
   if (TRANSITIONS[t.state].COMPLETE) acts.push({
-    k: "COMPLETE", icon: Check, run: () => tryTransition(t.id, "COMPLETE"),
+    k: "COMPLETE", icon: Check, run: () => onComplete(t),
     label: t.state === "overdue" ? (hasReflection ? "Complete (late)" : "Complete — reflection first") : "Complete",
   });
+  if (TRANSITIONS[t.state].PAUSE) acts.push({ k: "PAUSE", label: "Pause", icon: Pause, run: () => tryTransition(t.id, "PAUSE") });
   if (TRANSITIONS[t.state].FAIL_ATTEMPT) acts.push({ k: "FAIL", label: "No answer / failed", icon: PhoneMissed, run: () => tryTransition(t.id, "FAIL_ATTEMPT", { note: "Attempt failed" }) });
   if (TRANSITIONS[t.state].REASSIGN) acts.push({ k: "REASSIGN", label: "Reassign", icon: UserCheck, run: () => onReassign(t) });
   if (TRANSITIONS[t.state].RESCHEDULE) acts.push({ k: "RESCHEDULE", label: "Reschedule", icon: CalendarClock, run: () => onReschedule(t) });
@@ -2992,6 +3333,7 @@ const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign,
       borderLeft: `3px solid ${t.state === "overdue" ? "#DC2626" : t.state === "retry_pending" ? "#D97706" : t.state === "completed" ? "#84CC16" : T.line}`,
     }}>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+        <GripVertical size={14} style={{ color: T.ink3, marginTop: 3, flexShrink: 0, cursor: "grab" }} />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
             <span style={{ fontSize: 13.5, fontWeight: 600, color: t.state === "completed" ? T.ink3 : T.ink,
@@ -3000,10 +3342,24 @@ const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign,
             {t.scope === "team" && <Chip bg="#EAF6FE" color="#0284C7"><Users size={10} /> Team</Chip>}
             {t.isMarked && <Chip bg="#FDF3E3" color="#B45309"><Star size={10} /> Marked</Chip>}
             {t.completedLate && <Chip bg="#FDF3E3" color="#B45309">Completed late</Chip>}
+            {t.completionPhotoPath && (
+              <button type="button" className="pd-press" onClick={async (e) => {
+                e.stopPropagation();
+                try {
+                  const urls = await db.signMediaUrls([t.completionPhotoPath], 3600, "task-media");
+                  const url = urls[t.completionPhotoPath];
+                  if (url) window.open(url, "_blank", "noopener");
+                } catch { /* signing failed — nothing to open */ }
+              }} style={{ background: "none", border: "none", padding: 0, cursor: "pointer" }}>
+                <Chip bg="#EAF6FE" color="#0284C7"><Camera size={10} /> View photo</Chip>
+              </button>
+            )}
             {t.retryCount > 0 && t.state !== "completed" && <Chip>{t.retryCount} failed attempt{t.retryCount > 1 ? "s" : ""}</Chip>}
+            {t.state === "in_progress" && <TaskDurationBadge task={t} />}
           </div>
           <div className="pd-num" style={{ fontSize: 11.5, color: T.ink3, marginTop: 5 }}>
             {taskAudience(t, members, groups)}{t.deadline ? ` · due ${t.deadline}` : ""} · weight {t.weight}
+            {t.estimatedMinutes ? ` · est. ${t.estimatedMinutes} min` : ""}
             {t.isMarked && t.markLabel ? ` · ${t.markLabel}` : ""}
           </div>
         </div>
@@ -3031,7 +3387,7 @@ const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign,
 const TaskForm = ({ projectId, members, groups, onSave, onClose }) => {
   const [f, setF] = useState({
     title: "", scope: "individual", assigneeId: members[0]?.id ?? "",
-    assigneeGroupId: groups[0]?.id ?? "", deadline: "", weight: 1,
+    assigneeGroupId: groups[0]?.id ?? "", deadline: "", weight: 1, estimatedMinutes: "",
   });
   const team = f.scope === "team";
   return (
@@ -3087,6 +3443,9 @@ const TaskForm = ({ projectId, members, groups, onSave, onClose }) => {
           <div><Label>Weight</Label>
             <input type="number" min={1} max={10} style={inputStyle} value={f.weight}
               onChange={(e) => setF({ ...f, weight: Math.max(1, Math.min(10, +e.target.value || 1)) })} /></div>
+          <div><Label>Est. duration (min, optional)</Label>
+            <input type="number" min={1} style={inputStyle} value={f.estimatedMinutes} placeholder="e.g. 18"
+              onChange={(e) => setF({ ...f, estimatedMinutes: e.target.value })} /></div>
         </div>
         {team && (
           <p style={{ margin: 0, fontSize: 11.5, color: T.ink3, lineHeight: 1.55 }}>
@@ -3102,6 +3461,7 @@ const TaskForm = ({ projectId, members, groups, onSave, onClose }) => {
             assigneeId: team ? null : (f.assigneeId || null),
             assigneeGroupId: team ? (f.assigneeGroupId || null) : null,
             deadline: f.deadline || null, weight: f.weight,
+            estimatedMinutes: f.estimatedMinutes ? Math.max(1, +f.estimatedMinutes) : null,
             retryCount: 0, completedAt: null, completedLate: false,
             isMarked: false, markLabel: "", markScope: null, markTargetId: null,
           })}><Check size={15} /> Add task</Btn>
@@ -3365,7 +3725,7 @@ const MemberCard = ({ m, companies, engine, onEdit, onDelete }) => {
 const MemberForm = ({ data, companies, groups, onSave, onClose }) => {
   const [f, setF] = useState(data ?? {
     name: "", roles: [], phone: "", email: "", notes: "",
-    external: false, defaultDelegate: false, groupId: null,
+    external: false, defaultDelegate: false, groupId: null, competesOnLeaderboard: true,
   });
   const [rolesText, setRolesText] = useState((data?.roles ?? []).join(", "));
   const [companyIds, setCompanyIds] = useState(data?.companyIds ?? []);
@@ -3422,7 +3782,16 @@ const MemberForm = ({ data, companies, groups, onSave, onClose }) => {
             <input type="checkbox" checked={f.defaultDelegate} onChange={(e) => setF({ ...f, defaultDelegate: e.target.checked })} />
             Default delegate (handoff target)
           </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: T.ink2, cursor: "pointer" }}>
+            <input type="checkbox" checked={f.competesOnLeaderboard}
+              onChange={(e) => setF({ ...f, competesOnLeaderboard: e.target.checked })} />
+            Competes on leaderboard
+          </label>
         </div>
+        <p style={{ margin: 0, fontSize: 11, color: T.ink3, lineHeight: 1.5 }}>
+          Turn this off for roster entries who don't have access to Puroductive (the working force)
+          so only people actually competing here — the board room force — show up in rankings.
+        </p>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
           <Btn ghost onClick={onClose}>Cancel</Btn>
           <Btn disabled={!f.name.trim()} onClick={() => onSave(
@@ -4194,6 +4563,31 @@ const ClockTicker = ({ since }) => {
   return <span className="pd-num">{p(Math.floor(s / 3600))}:{p(Math.floor((s % 3600) / 60))}:{p(s % 60)}</span>;
 };
 
+/* Per-task duration (item 2) — same live-ticking idea as ClockTicker, but
+ * counting a task's OWN accumulated active_minutes + whatever's run since
+ * its current started_at, entirely independent of any other task. Turns
+ * amber past its estimate rather than stopping — an overrun keeps counting
+ * up instead of resetting, and never touches any other task's numbers. */
+const TaskDurationBadge = ({ task }) => {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!task.startedAt) return;
+    const iv = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(iv);
+  }, [task.startedAt]);
+  const runningMinutes = task.startedAt ? (now - new Date(task.startedAt).getTime()) / 60000 : 0;
+  const totalMinutes = (task.activeMinutes ?? 0) + runningMinutes;
+  const overrun = task.estimatedMinutes && totalMinutes > task.estimatedMinutes;
+  const m = Math.floor(totalMinutes);
+  const s = Math.floor((totalMinutes - m) * 60);
+  return (
+    <Chip bg={overrun ? "#FDF3E3" : T.cardSoft} color={overrun ? "#B45309" : T.ink2}>
+      <Play size={9} /> <span className="pd-num">{m}:{String(s).padStart(2, "0")}</span>
+      {task.estimatedMinutes ? ` / ${task.estimatedMinutes}m` : ""}
+    </Chip>
+  );
+};
+
 const EVENT_TYPE_META = {
   meeting: { label: "Meeting", icon: Video, color: "#0284C7", bg: "#EAF6FE" },
   visit: { label: "Visit", icon: MapPin, color: "#B45309", bg: "#FDF3E3" },
@@ -4204,38 +4598,132 @@ const EVENT_TYPE_META = {
  * Connect is a full-page redirect to Google (no way around that — a consent
  * screen can't render in an iframe or a fetch response), so this card is
  * mostly status + a couple of buttons, not a form. */
-const GoogleCalendarCard = ({ connection, syncing, onConnect, onDisconnect, onSyncNow }) => (
-  <Card style={{ padding: "16px 20px", marginBottom: 20, display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-    <div style={{ width: 38, height: 38, borderRadius: 11, flexShrink: 0, display: "grid", placeItems: "center",
-      background: connection ? "#F2FADF" : T.cardSoft, color: connection ? "#3F6212" : T.ink3 }}>
-      <CalendarDays size={17} />
+const GoogleCalendarCard = ({ connection, syncing, onConnect, onDisconnect, onSyncNow, onToggleAutoSync }) => (
+  <Card style={{ padding: "16px 20px", marginBottom: 20 }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+      <div style={{ width: 38, height: 38, borderRadius: 11, flexShrink: 0, display: "grid", placeItems: "center",
+        background: connection ? "#F2FADF" : T.cardSoft, color: connection ? "#3F6212" : T.ink3 }}>
+        <CalendarDays size={17} />
+      </div>
+      <div style={{ flex: 1, minWidth: 200 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>
+          {connection ? "Google Calendar connected" : "Google Calendar not connected"}
+        </div>
+        <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
+          {connection
+            ? `${connection.googleEmail ?? "Connected"}${connection.lastSyncedAt ? ` · last synced ${relativeTime(connection.lastSyncedAt)}` : " · not yet synced"}`
+            : "Two-way sync — events created here appear in Google, and vice versa."}
+        </div>
+      </div>
+      {connection ? (
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn small ghost disabled={syncing} onClick={onSyncNow}>
+            {syncing ? "Syncing…" : <><RotateCcw size={13} /> Sync now</>}
+          </Btn>
+          <Btn small danger onClick={onDisconnect}>Disconnect</Btn>
+        </div>
+      ) : (
+        <Btn small onClick={onConnect}><CalendarPlus size={14} /> Connect Google Calendar</Btn>
+      )}
     </div>
-    <div style={{ flex: 1, minWidth: 200 }}>
-      <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>
-        {connection ? "Google Calendar connected" : "Google Calendar not connected"}
-      </div>
-      <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
-        {connection
-          ? `${connection.googleEmail ?? "Connected"}${connection.lastSyncedAt ? ` · last synced ${relativeTime(connection.lastSyncedAt)}` : " · not yet synced"}`
-          : "Two-way sync — events created here appear in Google, and vice versa. Runs while this tab is open."}
-      </div>
-    </div>
-    {connection ? (
-      <div style={{ display: "flex", gap: 8 }}>
-        <Btn small ghost disabled={syncing} onClick={onSyncNow}>
-          {syncing ? "Syncing…" : <><RotateCcw size={13} /> Sync now</>}
-        </Btn>
-        <Btn small danger onClick={onDisconnect}>Disconnect</Btn>
-      </div>
-    ) : (
-      <Btn small onClick={onConnect}><CalendarPlus size={14} /> Connect Google Calendar</Btn>
+    {/* item 5 — background auto-sync is additive to the two mechanisms
+      * that already exist: the manual "Sync now" above, and the while-the-
+      * tab-is-open 3-minute poll. This toggle is the only one that keeps
+      * working with nobody looking at the app at all (pg_cron, every 15
+      * minutes — see schema_v11.sql). */}
+    {connection && (
+      <label style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 14, paddingTop: 14,
+        borderTop: `1px solid ${T.lineSoft}`, cursor: "pointer" }}>
+        <input type="checkbox" checked={connection.autoSync} onChange={(e) => onToggleAutoSync(e.target.checked)} />
+        <div>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: T.ink }}>Auto-sync in the background</div>
+          <div style={{ fontSize: 11, color: T.ink3, marginTop: 1 }}>
+            Keeps syncing every 15 minutes even when nobody has Puroductive open. Manual "Sync now" still works either way.
+          </div>
+        </div>
+      </label>
     )}
   </Card>
 );
 
+/* ------------------------- CLOCK AUTOMATION (item 1) ------------------------
+ * Personal webhook tokens for phone-side clock-in/out — Apple Shortcuts can
+ * call these natively on arrive/leave; Samsung's own Routines app can react
+ * to location but can't call a URL, so Android needs one bridge app
+ * (Tasker, Automate, or IFTTT) doing the same Location trigger → HTTP call. */
+const ClockAutomationCard = ({ tokens, freshToken, onGenerate, onRevoke, onDismissFresh }) => {
+  const [label, setLabel] = useState("");
+  const functionsBase = "https://pdmhggkiamgodaqhdddd.supabase.co/functions/v1/clock-webhook";
+  const urlFor = (token, action) => `${functionsBase}?token=${token}&action=${action}`;
+  return (
+    <Card style={{ padding: "16px 20px", marginBottom: 20 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+        <div style={{ width: 38, height: 38, borderRadius: 11, flexShrink: 0, display: "grid", placeItems: "center",
+          background: T.cardSoft, color: T.ink3 }}>
+          <Smartphone size={17} />
+        </div>
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>Clock-in automation</div>
+          <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
+            Auto clock in/out on arrival — native via Apple Shortcuts, or Tasker/Automate/IFTTT on Android.
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <input style={{ ...inputStyle, width: 150 }} placeholder="Label, e.g. My phone"
+            value={label} onChange={(e) => setLabel(e.target.value)} />
+          <Btn small onClick={() => { onGenerate(label); setLabel(""); }}><KeyRound size={13} /> Generate token</Btn>
+        </div>
+      </div>
+
+      {freshToken && (
+        <div style={{ marginTop: 16, padding: "14px 16px", borderRadius: 12, background: "#FFFCF6", border: "1px solid #F3D19E" }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "#78350F", marginBottom: 10 }}>
+            Copy these now — for security, the token isn't shown again after you leave this screen.
+          </div>
+          {[["Clock in", "in"], ["Clock out", "out"]].map(([actionLabel, action]) => (
+            <div key={action} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <Chip>{actionLabel}</Chip>
+              <code className="pd-num" style={{ flex: 1, minWidth: 0, fontSize: 10.5, color: T.ink2,
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {urlFor(freshToken.token, action)}
+              </code>
+              <IconBtn label={`Copy ${actionLabel} URL`}
+                onClick={() => navigator.clipboard?.writeText(urlFor(freshToken.token, action))}>
+                <Copy size={13} />
+              </IconBtn>
+            </div>
+          ))}
+          <div style={{ fontSize: 11, color: T.ink3, lineHeight: 1.7, marginTop: 8 }}>
+            <strong>Apple Shortcuts:</strong> Automations → Arrive/Leave at a location → Get Contents of URL (paste the Clock In / Clock Out URL). Fully native.<br />
+            <strong>Android:</strong> Samsung's Modes/Routines app can trigger on location but can't call a URL directly — use Tasker, Automate, or IFTTT instead (Location trigger + an HTTP/Webhooks action hitting the same URL).
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <Btn small ghost onClick={onDismissFresh}>Done — I've saved these</Btn>
+          </div>
+        </div>
+      )}
+
+      {tokens.length > 0 && (
+        <div style={{ marginTop: 16, display: "grid", gap: 8 }}>
+          {tokens.map((t) => (
+            <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderRadius: 10, border: `1px solid ${T.line}` }}>
+              <KeyRound size={13} style={{ color: T.ink3, flexShrink: 0 }} />
+              <div style={{ flex: 1, minWidth: 0, fontSize: 12, color: T.ink2 }}>
+                {t.label} · {t.lastUsedAt ? `last used ${relativeTime(t.lastUsedAt)}` : "never used yet"}
+              </div>
+              <IconBtn label="Revoke" danger onClick={() => onRevoke(t.id)}><Trash2 size={12} /></IconBtn>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+};
+
 const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, tasks, alertsOn, enableAlerts,
   events, projects, companies, members, groups, googleConnection, googleSyncing,
-  onConnectGoogle, onDisconnectGoogle, onSyncGoogleNow,
+  onConnectGoogle, onDisconnectGoogle, onSyncGoogleNow, onToggleGoogleAutoSync,
+  automationTokens, freshAutomationToken, onGenerateAutomationToken, onRevokeAutomationToken, onDismissFreshToken,
   onAddEvent, onEditEvent, onDeleteEvent, onMarkDay, onOpenDay, onOpenProject }) => {
   const isMobile = useIsMobile();
   const stats = computeMonthlyStats({ sessions, tasks, exceptions }, 0);
@@ -4261,7 +4749,11 @@ const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, 
         </div>} />
 
       <GoogleCalendarCard connection={googleConnection} syncing={googleSyncing}
-        onConnect={onConnectGoogle} onDisconnect={onDisconnectGoogle} onSyncNow={onSyncGoogleNow} />
+        onConnect={onConnectGoogle} onDisconnect={onDisconnectGoogle} onSyncNow={onSyncGoogleNow}
+        onToggleAutoSync={onToggleGoogleAutoSync} />
+
+      <ClockAutomationCard tokens={automationTokens} freshToken={freshAutomationToken}
+        onGenerate={onGenerateAutomationToken} onRevoke={onRevokeAutomationToken} onDismissFresh={onDismissFreshToken} />
 
       {/* Clock + month stats strip */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14, marginBottom: 20 }}>
@@ -4623,6 +5115,55 @@ const MarkDayModal = ({ date, existing, members, onSave, onClear, onClose }) => 
  * Item 3's "any specific task that I want to mark". The mark is a display
  * flag only — it never touches the state machine — and carries who it's aimed
  * at so a note left for one person doesn't read as a note to everybody. */
+/* ------------------------- COMPLETE TASK MODAL (v9) ------------------------
+ * item 3 — the photo is entirely optional; "Complete" fires with or without
+ * one, so this never adds friction to the common case of a task that
+ * doesn't need a photo. */
+const CompleteTaskModal = ({ task, onComplete, onClose }) => {
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const onPick = (e) => {
+    const picked = e.target.files?.[0];
+    if (!picked) return;
+    setFile(picked);
+    setPreview(URL.createObjectURL(picked));
+  };
+  return (
+    <Modal title="Mark complete" subtitle={task.title} onClose={onClose}>
+      <div style={{ display: "grid", gap: 18 }}>
+        <div>
+          <Label>Photo (optional)</Label>
+          <p style={{ margin: "4px 0 10px", fontSize: 11.5, color: T.ink3, lineHeight: 1.5 }}>
+            Attach one to track progress in reports — most tasks don't need it.
+          </p>
+          {preview ? (
+            <div style={{ position: "relative" }}>
+              <img src={preview} alt="" style={{ width: "100%", maxHeight: 220, objectFit: "cover", borderRadius: 12, border: `1px solid ${T.line}`, display: "block" }} />
+              <div style={{ position: "absolute", top: 8, right: 8 }}>
+                <IconBtn onClick={() => { setFile(null); setPreview(null); }} label="Remove photo" danger><X size={13} /></IconBtn>
+              </div>
+            </div>
+          ) : (
+            <label className="pd-press" style={{
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+              padding: "22px", borderRadius: 12, border: `1.5px dashed ${T.line}`, cursor: "pointer", color: T.ink3, fontSize: 12.5,
+            }}>
+              <Camera size={16} /> Choose a photo
+              <input type="file" accept="image/*" style={{ display: "none" }} onChange={onPick} />
+            </label>
+          )}
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+          <Btn ghost onClick={onClose}>Cancel</Btn>
+          <Btn onClick={() => onComplete(file)}>
+            <Check size={14} /> {file ? "Complete with photo" : "Complete"}
+          </Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
 const MarkTaskModal = ({ task, members, groups, onSave, onClose }) => {
   const [f, setF] = useState({
     markLabel: task.markLabel ?? "",
@@ -5019,10 +5560,21 @@ const GanttView = ({ companies, scopedProjects, members, tasks }) => {
 const RANK_ICON = [Crown, Medal, Medal]; // 1st, 2nd, 3rd — everyone else just gets a number
 const RANK_COLOR = ["#D97706", "#8A8F99", "#B45309"];
 
+/* Sunday-start, same convention monthWindow's own day grid already uses. */
+function weekWindowStart() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - d.getDay());
+  return d;
+}
+
 const LeaderboardView = ({ tasks, members }) => {
-  const [windowKey, setWindowKey] = useState("month"); // month | allTime
-  const sinceIso = windowKey === "month" ? monthWindow(0).start.toISOString() : null;
-  const rows = computeLeaderboard(tasks, members, sinceIso).filter((r) => r.tasksDone > 0 || r.member.roles?.length);
+  const [windowKey, setWindowKey] = useState("month"); // week | month | allTime
+  const sinceIso = windowKey === "week" ? weekWindowStart().toISOString()
+    : windowKey === "month" ? monthWindow(0).start.toISOString() : null;
+  const rows = computeLeaderboard(tasks, members, sinceIso)
+    .filter((r) => r.member.competesOnLeaderboard)
+    .filter((r) => r.tasksDone > 0 || r.member.roles?.length);
   const leader = rows[0];
   const maxPoints = Math.max(1, ...rows.map((r) => r.points));
 
@@ -5032,7 +5584,7 @@ const LeaderboardView = ({ tasks, members }) => {
         sub="Points come straight from completed task weight — on time counts double. Nothing here is a separate score to game."
         action={
           <div style={{ display: "flex", gap: 6, background: T.card, border: `1px solid ${T.line}`, borderRadius: 12, padding: 4, boxShadow: T.shadowSm }}>
-            {[["month", "This month"], ["allTime", "All-time"]].map(([key, label]) => {
+            {[["week", "This week"], ["month", "This month"], ["allTime", "All-time"]].map(([key, label]) => {
               const on = windowKey === key;
               return (
                 <button key={key} onClick={() => setWindowKey(key)} className="pd-press" style={{
@@ -5091,7 +5643,7 @@ const LeaderboardView = ({ tasks, members }) => {
                 <div style={{ fontSize: 13.5, fontWeight: 600, color: T.ink }}>{r.member.name}</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 3 }}>
                   <Chip bg={level.color + "1A"} color={level.color}>{level.label}</Chip>
-                  {streak > 1 && <Chip bg="#FDF3E3" color="#B45309"><Zap size={10} /> {streak}-day streak</Chip>}
+                  {streak > 0 && <Chip bg="#FDF3E3" color="#B45309"><Zap size={10} /> {streak}-day streak</Chip>}
                 </div>
               </div>
               {/* Points bar — same visual language as StatBar in Reports, so the

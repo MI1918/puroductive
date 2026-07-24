@@ -50,6 +50,7 @@ const rowToMember = (r, companyIds) => {
     id: r.id, name: r.name, roles: extra.roles ?? [], phone: extra.phone ?? "—", email: extra.email ?? "—",
     notes: r.notes ?? "", external: !!r.is_external, defaultDelegate: !!r.is_default_delegate,
     groupId: r.group_id ?? null, companyIds,
+    competesOnLeaderboard: r.competes_on_leaderboard === undefined ? true : !!r.competes_on_leaderboard,
   };
 };
 const rowToGroup = (r) => ({ id: r.id, name: r.name, sortOrder: r.sort_order });
@@ -70,6 +71,9 @@ const rowToTask = (r) => ({
   scope: r.scope ?? "individual", assigneeGroupId: r.assignee_group_id ?? null,
   isMarked: !!r.is_marked, markLabel: r.mark_label ?? "",
   markScope: r.mark_scope ?? null, markTargetId: r.mark_target_id ?? null,
+  queueOrder: r.queue_order ?? null, personalQueueOrder: r.personal_queue_order ?? null,
+  estimatedMinutes: r.estimated_minutes ?? null, activeMinutes: r.active_minutes ?? 0,
+  startedAt: r.started_at ?? null, completionPhotoPath: r.completion_photo_path ?? null,
 });
 const rowToTransition = (r) => ({
   id: r.id, taskId: r.task_id, from: r.from_state, to: r.to_state, event: r.event, note: r.note, at: r.created_at,
@@ -323,6 +327,7 @@ export async function deleteChatMessage(id) {
 const rowToGoogleConnection = (r) => ({
   id: r.id, workspaceId: r.workspace_id, googleEmail: r.google_email ?? null,
   connectedAt: r.connected_at, lastSyncedAt: r.last_synced_at ?? null,
+  autoSync: !!r.auto_sync,
 });
 
 /* Same non-2xx error-body gotcha as sendWorkspaceInviteEmail() — see that
@@ -369,6 +374,61 @@ export async function disconnectGoogleCalendar(id) {
   await supabase.from("google_calendar_connections")
     .update({ deleted_at: nowIso(), updated_at: nowIso() })
     .eq("id", id).then(throwIfError);
+}
+/* item 5 — the true-background toggle (schema_v11.sql). google-calendar-cron
+ * (pg_cron, every 15 min) picks up any connection with this on, independent
+ * of whether anyone has the app open — see the while-open 3-minute poll in
+ * App.jsx, which is separate and keeps running regardless of this flag. */
+export async function setGoogleAutoSync(id, on) {
+  await supabase.from("google_calendar_connections")
+    .update({ auto_sync: on ? 1 : 0, updated_at: nowIso() })
+    .eq("id", id).then(throwIfError);
+}
+
+/* ------------------------- clock automation tokens (v10) -------------------
+ * item 1 — personal webhook tokens for phone-side clock-in/out automation
+ * (Apple Shortcuts natively, Android via Tasker/Automate/IFTTT). The raw
+ * token only ever exists client-side at generation time; only its SHA-256
+ * hash is stored, computed here with the same algorithm clock-webhook uses
+ * server-side so the two can compare. */
+async function sha256Hex(input) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+const rowToAutomationToken = (r) => ({
+  id: r.id, workspaceId: r.workspace_id, label: r.label,
+  lastUsedAt: r.last_used_at ?? null, createdAt: r.created_at,
+});
+
+export async function listAutomationTokens() {
+  // automation_tokens has no deleted_at column (revoked_at is its tombstone
+  // instead), so this uses inWorkspace() rather than scoped().
+  const rows = await inWorkspace(supabase.from("automation_tokens").select("*"))
+    .order("created_at", { ascending: false }).then(throwIfError);
+  return rows.filter((r) => !r.revoked_at).map(rowToAutomationToken);
+}
+
+/* Returns { token, record } — `token` (the raw, usable webhook value) is
+ * shown to the user exactly once by the caller and never requested again;
+ * only `record` (no raw token) is ever re-fetched afterwards. */
+export async function createAutomationToken(label, memberId = null) {
+  const raw = Array.from(crypto.getRandomValues(new Uint8Array(24)))
+    .map((b) => b.toString(16).padStart(2, "0")).join("");
+  const tokenHash = await sha256Hex(raw);
+  const now = nowIso();
+  const { data: userData } = await supabase.auth.getUser();
+  const row = {
+    id: "at-" + uid(), workspace_id: ws(), user_id: userData?.user?.id,
+    member_id: memberId, label: label?.trim() || "Clock automation", token_hash: tokenHash,
+    updated_at: now, created_at: now,
+  };
+  await supabase.from("automation_tokens").insert(row).then(throwIfError);
+  return { token: raw, record: rowToAutomationToken(row) };
+}
+
+export async function revokeAutomationToken(id) {
+  await supabase.from("automation_tokens")
+    .update({ revoked_at: nowIso(), updated_at: nowIso() }).eq("id", id).then(throwIfError);
 }
 
 /* ------------------------------- bootstrap -------------------------------- */
@@ -437,6 +497,7 @@ export async function insertMember(m) {
     id: m.id, name: m.name, roles_json: JSON.stringify({ roles: m.roles, phone: m.phone, email: m.email }),
     notes: m.notes || null, is_external: m.external ? 1 : 0, is_default_delegate: m.defaultDelegate ? 1 : 0,
     group_id: m.groupId || null, workspace_id: ws(),
+    competes_on_leaderboard: m.competesOnLeaderboard === false ? 0 : 1,
     updated_at: now, created_at: now, device_id: getDeviceId(),
   }).then(throwIfError);
 }
@@ -444,7 +505,8 @@ export async function updateMember(m) {
   await supabase.from("team_members").update({
     name: m.name, roles_json: JSON.stringify({ roles: m.roles, phone: m.phone, email: m.email }),
     notes: m.notes || null, is_external: m.external ? 1 : 0, is_default_delegate: m.defaultDelegate ? 1 : 0,
-    group_id: m.groupId || null, updated_at: nowIso(), device_id: getDeviceId(),
+    group_id: m.groupId || null, competes_on_leaderboard: m.competesOnLeaderboard === false ? 0 : 1,
+    updated_at: nowIso(), device_id: getDeviceId(),
   }).eq("id", m.id).then(throwIfError);
 }
 export async function softDeleteMember(id) {
@@ -522,6 +584,9 @@ export async function insertTask(t) {
     scope: t.scope ?? "individual", assignee_group_id: t.assigneeGroupId || null,
     is_marked: t.isMarked ? 1 : 0, mark_label: t.markLabel || null,
     mark_scope: t.markScope || null, mark_target_id: t.markTargetId || null,
+    queue_order: t.queueOrder ?? null, personal_queue_order: t.personalQueueOrder ?? null,
+    estimated_minutes: t.estimatedMinutes ?? null, active_minutes: t.activeMinutes ?? 0,
+    started_at: t.startedAt ?? null, completion_photo_path: t.completionPhotoPath ?? null,
     workspace_id: ws(), updated_at: now, created_at: now, device_id: getDeviceId(),
   }).then(throwIfError);
 }
@@ -530,6 +595,7 @@ export async function updateTaskState(t) {
     state: t.state, assignee_id: t.assigneeId, deadline: t.deadline,
     retry_count: t.retryCount, completed_at: t.completedAt, completed_late: t.completedLate ? 1 : 0,
     scope: t.scope ?? "individual", assignee_group_id: t.assigneeGroupId || null,
+    active_minutes: t.activeMinutes ?? 0, started_at: t.startedAt ?? null,
     updated_at: nowIso(), device_id: getDeviceId(),
   }).eq("id", t.id).then(throwIfError);
 }
@@ -543,8 +609,35 @@ export async function updateTaskMark(t) {
     updated_at: nowIso(), device_id: getDeviceId(),
   }).eq("id", t.id).then(throwIfError);
 }
+/* Drag-reorder writes — deliberately its own call, never round-tripping the
+ * whole state machine payload above it. Either field may be omitted (a task
+ * dragged in a project pipeline that isn't personally queued, or vice versa). */
+export async function updateTaskQueueOrder(taskId, { queueOrder, personalQueueOrder } = {}) {
+  const patch = { updated_at: nowIso(), device_id: getDeviceId() };
+  if (queueOrder !== undefined) patch.queue_order = queueOrder;
+  if (personalQueueOrder !== undefined) patch.personal_queue_order = personalQueueOrder;
+  await supabase.from("tasks").update(patch).eq("id", taskId).then(throwIfError);
+}
 export async function softDeleteTask(taskId) {
   await supabase.from("tasks").update({ deleted_at: nowIso(), updated_at: nowIso(), device_id: getDeviceId() })
+    .eq("id", taskId).then(throwIfError);
+}
+
+/* ------------------------- task completion photo (v9) ----------------------
+ * Optional — most tasks never call this. Mirrors uploadPostMedia's path
+ * convention ('<workspace>/<parent>/<file>') against the separate
+ * 'task-media' bucket, so the same storage RLS shape (schema_v9.sql) applies. */
+export async function uploadTaskCompletionPhoto(taskId, file) {
+  const workspaceId = ws();
+  const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+  const path = `${workspaceId}/${taskId}/${uid()}.${ext}`;
+  const { error } = await supabase.storage.from("task-media")
+    .upload(path, file, { cacheControl: "3600", upsert: false });
+  if (error) throw new Error(`Photo upload failed: ${error.message}`);
+  return path;
+}
+export async function attachTaskCompletionPhoto(taskId, path) {
+  await supabase.from("tasks").update({ completion_photo_path: path, updated_at: nowIso(), device_id: getDeviceId() })
     .eq("id", taskId).then(throwIfError);
 }
 
@@ -738,9 +831,9 @@ export async function insertPostMedia(postId, items) {
 /* The bucket is private, so rendering an image means minting a short-lived
  * signed URL. Batched because a feed of ten posts would otherwise fire fifty
  * separate requests. */
-export async function signMediaUrls(paths, expiresIn = 3600) {
+export async function signMediaUrls(paths, expiresIn = 3600, bucket = "post-media") {
   if (!paths.length) return {};
-  const { data, error } = await supabase.storage.from("post-media").createSignedUrls(paths, expiresIn);
+  const { data, error } = await supabase.storage.from(bucket).createSignedUrls(paths, expiresIn);
   if (error) throw new Error(error.message);
   const out = {};
   for (const row of data ?? []) {
