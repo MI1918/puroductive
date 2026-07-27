@@ -3,6 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#16181D" />
+    <!-- iOS ignores the manifest's icons for "Add to Home Screen" — it only
+         reads this link tag, so it's here explicitly rather than relying on
+         vite-plugin-pwa's manifest injection alone. -->
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>Puroductive</title>
   </head>
   <body>

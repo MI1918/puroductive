@@ -42,7 +42,7 @@ const throwIfError = ({ error, data }) => {
 /* ------------------------------- mappers ---------------------------------- */
 const rowToCompany = (r) => ({
   id: r.id, name: r.name, industry: r.industry, location: r.location,
-  theme: JSON.parse(r.theme_json),
+  theme: JSON.parse(r.theme_json), sortOrder: r.sort_order ?? null,
 });
 const rowToMember = (r, companyIds) => {
   const extra = JSON.parse(r.roles_json);
@@ -63,10 +63,11 @@ const rowToEvent = (r) => ({
 const rowToProject = (r) => ({
   id: r.id, companyId: r.company_id, name: r.name, type: r.type,
   baseline: r.baseline_percent, deadline: r.deadline, locked: !!r.locked_at, status: r.status,
+  sortOrder: r.sort_order ?? null,
 });
 const rowToTask = (r) => ({
   id: r.id, projectId: r.project_id, title: r.title, assigneeId: r.assignee_id,
-  state: r.state, weight: r.weight, deadline: r.deadline, createdAt: r.created_at,
+  state: r.state, weight: r.weight, deadline: r.deadline, deadlineTime: r.deadline_time ?? null, createdAt: r.created_at,
   retryCount: r.retry_count, completedAt: r.completed_at, completedLate: !!r.completed_late,
   scope: r.scope ?? "individual", assigneeGroupId: r.assignee_group_id ?? null,
   isMarked: !!r.is_marked, markLabel: r.mark_label ?? "",
@@ -85,6 +86,12 @@ const rowToHandoff = (r) => ({
 const rowToReflection = (r) => ({
   id: r.id, taskId: r.task_id, projectId: r.project_id,
   whatWentWrong: r.what_went_wrong, rootBottleneck: r.root_bottleneck, correctiveAction: r.corrective_action,
+  at: r.created_at,
+});
+const rowToDeadlineExtension = (r) => ({
+  id: r.id, taskId: r.task_id, projectId: r.project_id,
+  oldDeadline: r.old_deadline, newDeadline: r.new_deadline,
+  whatChanged: r.what_changed, progressSoFar: r.progress_so_far, planToHold: r.plan_to_hold,
   at: r.created_at,
 });
 const rowToException = (r) => ({
@@ -433,7 +440,7 @@ export async function revokeAutomationToken(id) {
 
 /* ------------------------------- bootstrap -------------------------------- */
 export async function fetchBootstrap() {
-  const [companies, members, links, groups, projects, tasks, transitions, handoffs, reflections, exceptions, sessions, events] =
+  const [companies, members, links, groups, projects, tasks, transitions, handoffs, reflections, deadlineExtensions, exceptions, sessions, events] =
     await Promise.all([
       scoped(supabase.from("companies").select("*")).then(throwIfError),
       scoped(supabase.from("team_members").select("*")).then(throwIfError),
@@ -444,6 +451,7 @@ export async function fetchBootstrap() {
       inWorkspace(supabase.from("task_transitions").select("*")).order("created_at").then(throwIfError),
       scoped(supabase.from("handoffs").select("*")).then(throwIfError),
       inWorkspace(supabase.from("reflections").select("*")).then(throwIfError),
+      inWorkspace(supabase.from("deadline_extensions").select("*")).then(throwIfError),
       scoped(supabase.from("calendar_exceptions").select("*")).then(throwIfError),
       scoped(supabase.from("work_sessions").select("*")).then(throwIfError),
       scoped(supabase.from("calendar_events").select("*")).then(throwIfError),
@@ -464,6 +472,7 @@ export async function fetchBootstrap() {
     transitions: transitions.map(rowToTransition),
     handoffs: handoffs.map(rowToHandoff),
     reflections: reflections.map(rowToReflection),
+    deadlineExtensions: deadlineExtensions.map(rowToDeadlineExtension),
     exceptions: exceptions.map(rowToException),
     sessions: sessions.map(rowToSession),
     events: events.map(rowToEvent),
@@ -475,7 +484,7 @@ export async function insertCompany(c) {
   const now = nowIso();
   await supabase.from("companies").insert({
     id: c.id, name: c.name, industry: c.industry || null, location: c.location || null,
-    theme_json: JSON.stringify(c.theme), workspace_id: ws(),
+    theme_json: JSON.stringify(c.theme), sort_order: c.sortOrder ?? null, workspace_id: ws(),
     updated_at: now, created_at: now, device_id: getDeviceId(),
   }).then(throwIfError);
 }
@@ -487,6 +496,12 @@ export async function updateCompany(c) {
 }
 export async function softDeleteCompany(id) {
   await supabase.from("companies").update({ deleted_at: nowIso(), updated_at: nowIso(), device_id: getDeviceId() })
+    .eq("id", id).then(throwIfError);
+}
+/* Drag-reorder — its own call, same shape as updateTaskQueueOrder below,
+ * so a reorder never round-trips the rest of the company's fields. */
+export async function updateCompanyOrder(id, sortOrder) {
+  await supabase.from("companies").update({ sort_order: sortOrder, updated_at: nowIso(), device_id: getDeviceId() })
     .eq("id", id).then(throwIfError);
 }
 
@@ -579,7 +594,7 @@ export async function insertTask(t) {
   const now = nowIso();
   await supabase.from("tasks").insert({
     id: t.id, project_id: t.projectId, title: t.title, assignee_id: t.assigneeId,
-    state: t.state, weight: t.weight, deadline: t.deadline,
+    state: t.state, weight: t.weight, deadline: t.deadline, deadline_time: t.deadlineTime || null,
     retry_count: t.retryCount, completed_at: t.completedAt, completed_late: t.completedLate ? 1 : 0,
     scope: t.scope ?? "individual", assignee_group_id: t.assigneeGroupId || null,
     is_marked: t.isMarked ? 1 : 0, mark_label: t.markLabel || null,
@@ -592,7 +607,7 @@ export async function insertTask(t) {
 }
 export async function updateTaskState(t) {
   await supabase.from("tasks").update({
-    state: t.state, assignee_id: t.assigneeId, deadline: t.deadline,
+    state: t.state, assignee_id: t.assigneeId, deadline: t.deadline, deadline_time: t.deadlineTime || null,
     retry_count: t.retryCount, completed_at: t.completedAt, completed_late: t.completedLate ? 1 : 0,
     scope: t.scope ?? "individual", assignee_group_id: t.assigneeGroupId || null,
     active_minutes: t.activeMinutes ?? 0, started_at: t.startedAt ?? null,
@@ -617,6 +632,20 @@ export async function updateTaskQueueOrder(taskId, { queueOrder, personalQueueOr
   if (queueOrder !== undefined) patch.queue_order = queueOrder;
   if (personalQueueOrder !== undefined) patch.personal_queue_order = personalQueueOrder;
   await supabase.from("tasks").update(patch).eq("id", taskId).then(throwIfError);
+}
+/* Editing a task's own details (title/assignee/weight/duration/deadline) —
+ * deliberately separate from updateTaskState, which owns the state
+ * machine's fields. TaskForm only lets the deadline DATE through here while
+ * it's still unset (once a task has a committed deadline, TaskForm disables
+ * that field and moving it has to go through extendDeadline's reflective
+ * flow instead), but that's a UI policy, not a column restriction here. */
+export async function updateTaskDetails(t) {
+  await supabase.from("tasks").update({
+    title: t.title, assignee_id: t.assigneeId, assignee_group_id: t.assigneeGroupId || null,
+    scope: t.scope ?? "individual", deadline: t.deadline || null, deadline_time: t.deadlineTime || null,
+    weight: t.weight, estimated_minutes: t.estimatedMinutes ?? null,
+    updated_at: nowIso(), device_id: getDeviceId(),
+  }).eq("id", t.id).then(throwIfError);
 }
 export async function softDeleteTask(taskId) {
   await supabase.from("tasks").update({ deleted_at: nowIso(), updated_at: nowIso(), device_id: getDeviceId() })
@@ -671,14 +700,27 @@ export async function insertReflection(r) {
   }).then(throwIfError);
 }
 
+/* ------------------------- deadline extensions (v15) -------------------------
+ * A voluntary, before-the-fact deadline move — distinct from reflections,
+ * which only ever follow an actual miss. No update/delete policy exists on
+ * this table (schema_v15.sql), so once written a row can never change. */
+export async function insertDeadlineExtension(e) {
+  await supabase.from("deadline_extensions").insert({
+    id: e.id, task_id: e.taskId, project_id: e.projectId,
+    old_deadline: e.oldDeadline, new_deadline: e.newDeadline,
+    what_changed: e.whatChanged, progress_so_far: e.progressSoFar, plan_to_hold: e.planToHold,
+    created_at: e.at, workspace_id: ws(),
+  }).then(throwIfError);
+}
+
 /* -------------------------------- projects ----------------------------------- */
 export async function insertProject(p) {
   const now = nowIso();
   await supabase.from("projects").insert({
     id: p.id, company_id: p.companyId, name: p.name, type: p.type,
     baseline_percent: p.baseline, deadline: p.deadline || null,
-    locked_at: p.locked ? now : null, status: p.status ?? "active", workspace_id: ws(),
-    updated_at: now, created_at: now, device_id: getDeviceId(),
+    locked_at: p.locked ? now : null, status: p.status ?? "active", sort_order: p.sortOrder ?? null,
+    workspace_id: ws(), updated_at: now, created_at: now, device_id: getDeviceId(),
   }).then(throwIfError);
 }
 export async function updateProject(p) {
@@ -687,6 +729,16 @@ export async function updateProject(p) {
     locked_at: p.locked ? nowIso() : null, status: p.status ?? "active",
     updated_at: nowIso(), device_id: getDeviceId(),
   }).eq("id", p.id).then(throwIfError);
+}
+export async function softDeleteProject(id) {
+  await supabase.from("projects").update({ deleted_at: nowIso(), updated_at: nowIso(), device_id: getDeviceId() })
+    .eq("id", id).then(throwIfError);
+}
+/* Drag-reorder — its own call, same shape as updateTaskQueueOrder below,
+ * so a reorder never round-trips the rest of the project's fields. */
+export async function updateProjectOrder(id, sortOrder) {
+  await supabase.from("projects").update({ sort_order: sortOrder, updated_at: nowIso(), device_id: getDeviceId() })
+    .eq("id", id).then(throwIfError);
 }
 
 /* --------------------------- calendar exceptions ------------------------------
@@ -730,6 +782,41 @@ export async function insertSession(session) {
 export async function updateSessionLogout(id, logoutAt) {
   await supabase.from("work_sessions").update({ logout_at: logoutAt, updated_at: nowIso(), device_id: getDeviceId() })
     .eq("id", id).then(throwIfError);
+}
+
+/* ------------------------- task notes & comments (v16) ----------------------
+ * Fetched per-project, on demand, when that project's screen opens — unlike
+ * reflections/deadline_extensions above, these aren't needed for the
+ * dashboard-wide engine state, so there's no reason to pull every project's
+ * notes into the initial bootstrap load. */
+const rowToTaskNote = (r) => ({
+  id: r.id, projectId: r.project_id, taskId: r.task_id ?? null, authorId: r.author_id,
+  body: r.body ?? "", photoPath: r.photo_path ?? null, at: r.created_at,
+});
+export async function fetchTaskNotes(projectId) {
+  const rows = await inWorkspace(supabase.from("task_notes").select("*").eq("project_id", projectId))
+    .order("created_at", { ascending: false }).then(throwIfError);
+  return rows.map(rowToTaskNote);
+}
+export async function insertTaskNote(n) {
+  const { data, error } = await supabase.from("task_notes").insert({
+    id: n.id, project_id: n.projectId, task_id: n.taskId || null,
+    body: n.body || "", photo_path: n.photoPath || null,
+    workspace_id: ws(), created_at: n.at,
+  }).select().single();
+  if (error) throw new Error(error.message);
+  return rowToTaskNote(data);
+}
+/* Mirrors uploadTaskCompletionPhoto's path convention against the separate
+ * 'task-notes' bucket (schema_v16.sql). */
+export async function uploadTaskNotePhoto(projectId, file) {
+  const workspaceId = ws();
+  const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+  const path = `${workspaceId}/${projectId}/${uid()}.${ext}`;
+  const { error } = await supabase.storage.from("task-notes")
+    .upload(path, file, { cacheControl: "3600", upsert: false });
+  if (error) throw new Error(`Photo upload failed: ${error.message}`);
+  return path;
 }
 
 /* ============================================================================

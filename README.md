@@ -65,18 +65,60 @@ Run these SQL files **in order** in your Supabase project's SQL editor:
 
    Purely additive — it only creates new tables. If you skip it, everything
    else keeps working and the Board screen tells you it needs running.
-6. In Supabase → Authentication → URL Configuration, set **Site URL** to
+6. [`supabase/schema_v6.sql`](supabase/schema_v6.sql) — the **notification
+   center** and explicit invite accept/decline. Being invited used to
+   silently activate on your next sign-in; now it's a real `notifications`
+   row you act on.
+7. [`supabase/schema_v7.sql`](supabase/schema_v7.sql) — **team/group chat.**
+   `chat_messages`, workspace-wide "General" plus one channel per Team
+   group, no separate "channels" concept needed.
+8. [`supabase/schema_v8.sql`](supabase/schema_v8.sql) — **Google Calendar
+   two-way sync**, the OAuth state/connection tables. Needs the Google Cloud
+   setup in [`google-calendar-setup.md`](google-calendar-setup.md) first —
+   including, if you're onboarding teammates, adding each of them as an
+   OAuth **test user** in Google Cloud Console, or they'll hit Google's own
+   "Access blocked / unverified app" page when they try to connect.
+9. [`supabase/schema_v9.sql`](supabase/schema_v9.sql) — reorderable task
+   queues (project pipeline + personal queue), per-task duration, optional
+   completion photos (`task-media` bucket), and the per-person leaderboard
+   opt-out.
+10. [`supabase/schema_v10.sql`](supabase/schema_v10.sql) — `automation_tokens`
+    for phone-side clock-in/out webhooks (Apple Shortcuts / Tasker / IFTTT).
+11. [`supabase/schema_v11.sql`](supabase/schema_v11.sql) — true background
+    Google Calendar sync via `pg_cron`, independent of the app being open.
+12. [`supabase/schema_v12.sql`](supabase/schema_v12.sql) — fixes a bug where
+    an `invite_pending` notification could outlive the invite it pointed at
+    (e.g. someone removed and re-invited) and permanently fail to accept.
+    Notifications now get dismissed automatically the moment the underlying
+    invite is no longer live.
+13. [`supabase/schema_v13.sql`](supabase/schema_v13.sql) — drag-reorder for
+    Companies and Projects (both previously fixed-order; Projects also
+    gained Edit/Delete in this same update).
+14. [`supabase/schema_v14.sql`](supabase/schema_v14.sql) — an optional time
+    of day (`deadline_time`) on tasks, so something like "join the client
+    meet at 1pm" shows up properly timed on the calendar instead of just as
+    a same-day dot.
+15. [`supabase/schema_v15.sql`](supabase/schema_v15.sql) — task editing, and
+    a **voluntary deadline extension** flow: three reflective questions,
+    answered before the date moves, logged permanently and included in the
+    project report. A task's deadline *date* still can't be silently
+    edited once set — this is the only way to move it before it's missed.
+16. [`supabase/schema_v16.sql`](supabase/schema_v16.sql) — `task_notes`:
+    photo notes and task comments in one table (a note tagged with a task
+    is a comment on it; an untagged one is a quick capture that "Turn into
+    task" can promote later). Adds the `task-notes` storage bucket.
+17. In Supabase → Authentication → URL Configuration, set **Site URL** to
    your deployed URL (e.g. `https://mi1918.github.io/puroductive/`) and add
    it to **Redirect URLs**. This is what was sending confirmation-email links
    to `localhost` instead of the live site — Supabase redirects there by
    default regardless of what the app requests unless this is set. If you
    also develop locally, add `http://localhost:5173/puroductive/` (or
    whatever port Vite prints) to Redirect URLs too.
-7. In Supabase → Authentication → Providers, make sure Email is enabled. By
-   default Supabase requires email confirmation on sign-up; either confirm via
-   the email you receive, or turn "Confirm email" off in Authentication →
-   Settings for faster local testing.
-8. Grab your Project URL and anon/public key from Project Settings → API.
+18. In Supabase → Authentication → Providers, make sure Email is enabled. By
+    default Supabase requires email confirmation on sign-up; either confirm via
+    the email you receive, or turn "Confirm email" off in Authentication →
+    Settings for faster local testing.
+19. Grab your Project URL and anon/public key from Project Settings → API.
 
 ## Workspaces, invites and roles
 
@@ -146,9 +188,12 @@ Then open the printed local URL, sign up for an account, and sign in.
 
 Tables actually read/written by the UI: `companies`, `team_members`
 + `member_company_links`, `member_groups`, `projects`, `tasks`, `task_transitions`,
-`handoffs`, `reflections`, `calendar_exceptions`, `calendar_events`, `work_sessions`,
-`workspaces`, `workspace_members`, `posts`, `post_media`, `post_comments`,
-`poll_options`, `poll_votes`, `task_requests`, `task_request_events`.
+`handoffs`, `reflections`, `deadline_extensions`, `calendar_exceptions`,
+`calendar_events`, `work_sessions`, `workspaces`, `workspace_members`,
+`notifications`, `chat_messages`, `google_oauth_states`,
+`google_calendar_connections`, `automation_tokens`, `task_notes`, `posts`,
+`post_media`, `post_comments`, `poll_options`, `poll_votes`, `task_requests`,
+`task_request_events`.
 
 Present in the schema but **not** used by this UI (no screen exercises them):
 `phase_templates`, `project_phases`, `attachments`, `daily_notes`, `sync_log`,
@@ -178,11 +223,36 @@ supabase/
                             leave tracking; RLS rewritten again (run once)
   schema_v5.sql           — the board: posts, media, comments, polls, task
                             requests + paper trail, storage bucket (run once)
+  schema_v6.sql           — notification center, explicit invite accept/decline
+  schema_v7.sql           — team/group chat
+  schema_v8.sql           — Google Calendar two-way sync tables
+  schema_v9.sql           — reorderable task queues, completion photos,
+                            leaderboard opt-out
+  schema_v10.sql          — clock-in/out automation webhook tokens
+  schema_v11.sql          — background Google Calendar sync (pg_cron)
+  schema_v12.sql          — fixes stale invite_pending notifications
+  schema_v13.sql          — company & project drag-reorder + project edit/delete
+  schema_v14.sql          — optional time-of-day on task deadlines
+  schema_v15.sql          — task editing + voluntary deadline extension log
+  schema_v16.sql          — task notes / photo notes / task comments
+  functions/              — Edge Functions: invite-member, google-oauth-start,
+                            google-oauth-callback, google-calendar-sync,
+                            google-calendar-cron, clock-webhook
   seed.sql               — legacy starter data, predates per-user ownership
 baseline backup/
   ARCHITECTURE.md        — the original local-first core design this UI's
                            engines were ported from (context/history only)
 ```
+
+## Installable as an app (PWA)
+
+`vite-plugin-pwa` (see `vite.config.js`) generates a manifest and service
+worker at build time, so **Add to Home Screen** (Android/iOS) or **Install**
+(desktop Chrome/Edge) work and give Puroductive its own icon and launch
+window instead of just a browser tab. The service worker only precaches this
+build's own JS/CSS/icons for instant repeat loads — it never touches
+Supabase's origin, so every read/write is still live over the network,
+exactly as without it. Icons live in `public/icon-*.png`.
 
 ## Build for deployment
 

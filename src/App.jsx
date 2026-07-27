@@ -163,9 +163,9 @@ const TOUR_STEPS = [
   { icon: LayoutGrid, mesh: THEME_PRESETS[0].mesh, title: "Dashboard — the sand stack",
     body: "Every project fills a “sand stack” as weighted tasks get completed. Miss a deadline and the stack turns moldy — literally — until you catch up. Blunt on purpose: one glance tells you what's actually on track." },
   { icon: FolderKanban, mesh: THEME_PRESETS[1].mesh, title: "Projects & tasks",
-    body: "Tasks move through a strict state machine — pending, in progress, completed, or overdue → retry. An overdue task can't just be marked done: it forces a permanent “what went wrong” reflection first. Tasks can be individual or team-owned, and any task can be marked to stand out on the calendar." },
+    body: "Tasks move through a strict state machine — pending, in progress, completed, or overdue → retry. An overdue task can't just be marked done: it forces a permanent “what went wrong” reflection first. Edit a task's assignee, weight, or time of day any time — but its date locks once set, and moving it means Extend deadline: three honest questions, logged permanently in the report, before the date changes. Every task also has a Notes panel for comments and photos, and any note not yet tied to a task can become one with one click. Tasks can be individual or team-owned, and any task can be marked to stand out on the calendar." },
   { icon: Building2, mesh: THEME_PRESETS[2].mesh, title: "Companies, Team & People",
-    body: "Companies and Team are your roster — names you can assign work to, no account needed. People & access is different: who can actually sign into this workspace, with roles from Viewer up to Owner. Invite someone by email and they get a real notification to accept, not a silent auto-join." },
+    body: "Companies and Team are your roster — names you can assign work to, no account needed. Both companies and projects can be edited, removed, or dragged into whatever order makes sense to you. People & access is different: who can actually sign into this workspace, with roles from Viewer up to Owner. Invite someone by email and they get a real notification to accept, not a silent auto-join." },
   { icon: MessageSquare, mesh: THEME_PRESETS[3].mesh, title: "The Board",
     body: "Share a photo or an update and pick what you want back: ask “what are your thoughts,” send a task request someone can accept or pass along (either way, permanently logged), run a poll, or post something as accomplished." },
   { icon: Bell, mesh: THEME_PRESETS[4].mesh, title: "Notifications",
@@ -266,7 +266,10 @@ export function engineReducer(s, a) {
       const interventions = a.tasks
         .filter((t) => t.state === "overdue" && !a.reflections.some((r) => r.taskId === t.id))
         .map((t) => ({ taskId: t.id }));
-      return { tasks: a.tasks, transitions: a.transitions, reflections: a.reflections, handoffs: a.handoffs, interventions };
+      return {
+        tasks: a.tasks, transitions: a.transitions, reflections: a.reflections, handoffs: a.handoffs,
+        deadlineExtensions: a.deadlineExtensions, interventions,
+      };
     }
     case "TRANSITION": {
       const t = s.tasks.find((x) => x.id === a.taskId);
@@ -355,6 +358,36 @@ export function engineReducer(s, a) {
           at: new Date().toISOString(),
         }],
         interventions: s.interventions.filter((i) => i.taskId !== a.taskId),
+      };
+    }
+
+    /* Editable task fields (item 10) — title/assignee/weight/duration/
+     * deadline-time, and the deadline DATE only while it was previously
+     * unset (TaskForm disables that input once a deadline exists — moving
+     * an already-committed one has to go through EXTEND_DEADLINE below). */
+    case "UPDATE_TASK_DETAILS":
+      return { ...s, tasks: s.tasks.map((x) => (x.id === a.taskId ? { ...x, ...a.patch } : x)) };
+
+    /* Voluntary, before-the-fact deadline move (item 10) — the answers are
+     * mandatory and, like SUBMIT_REFLECTION, permanently logged; unlike a
+     * reflection this never touches interventions/state, since the task
+     * hasn't missed anything yet. */
+    case "EXTEND_DEADLINE": {
+      const ok = ["whatChanged", "progressSoFar", "planToHold"]
+        .every((k) => a.answers?.[k] && a.answers[k].trim().length > 0);
+      const t = s.tasks.find((x) => x.id === a.taskId);
+      if (!ok || !a.newDeadline || !t || !t.deadline) return s;
+      return {
+        ...s,
+        tasks: s.tasks.map((x) => (x.id === a.taskId ? { ...x, deadline: a.newDeadline } : x)),
+        deadlineExtensions: [...s.deadlineExtensions, {
+          id: uid(), taskId: a.taskId, projectId: a.projectId,
+          oldDeadline: t.deadline, newDeadline: a.newDeadline,
+          whatChanged: a.answers.whatChanged.trim(),
+          progressSoFar: a.answers.progressSoFar.trim(),
+          planToHold: a.answers.planToHold.trim(),
+          at: new Date().toISOString(),
+        }],
       };
     }
 
@@ -705,6 +738,11 @@ export function findNextQueuedTask(tasks, completed) {
 export function tasksDueOn(tasks, ymd) {
   return tasks.filter((t) => t.deadline === ymd && t.state !== "completed");
 }
+/* Timed tasks first, in clock order — untimed ones fall to the end,
+ * mirroring buildAgenda's cross-day sort further down. */
+export function sortByDeadlineTime(tasks) {
+  return [...tasks].sort((a, b) => (a.deadlineTime ?? "99:99").localeCompare(b.deadlineTime ?? "99:99"));
+}
 /* Active projects whose deadline falls on this YYYY-MM-DD. */
 export function projectDeadlinesOn(projects, ymd) {
   return projects.filter((p) => p.deadline === ymd && p.status === "active");
@@ -717,15 +755,21 @@ export function buildAgenda({ events, tasks, projects }, days = 14) {
   const inWindow = (ymd) => ymd >= today && ymd <= horizon;
   const items = [];
   for (const e of events) {
-    if (inWindow(e.date)) items.push({ kind: "event", date: e.date, id: e.id, ref: e });
+    if (inWindow(e.date)) items.push({ kind: "event", date: e.date, time: e.startTime || null, id: e.id, ref: e });
   }
   for (const t of tasks) {
-    if (t.deadline && t.state !== "completed" && inWindow(t.deadline)) items.push({ kind: "task", date: t.deadline, id: t.id, ref: t });
+    if (t.deadline && t.state !== "completed" && inWindow(t.deadline)) items.push({ kind: "task", date: t.deadline, time: t.deadlineTime || null, id: t.id, ref: t });
   }
   for (const p of projects) {
-    if (p.deadline && p.status === "active" && inWindow(p.deadline)) items.push({ kind: "project", date: p.deadline, id: p.id, ref: p });
+    if (p.deadline && p.status === "active" && inWindow(p.deadline)) items.push({ kind: "project", date: p.deadline, time: null, id: p.id, ref: p });
   }
-  items.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  /* Same-day items sort timed-first, in clock order — untimed (project
+   * deadlines, all-day tasks) fall to the end of that day's group. */
+  items.sort((a, b) => {
+    if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+    const at = a.time ?? "99:99", bt = b.time ?? "99:99";
+    return at < bt ? -1 : at > bt ? 1 : 0;
+  });
   return items;
 }
 /* Human-readable "who is this task for". A team task names its group; an
@@ -755,7 +799,7 @@ export function relativeDayLabel(ymd) {
  *   · docHtml — Word-compatible HTML; saved as .doc it opens directly in
  *               MS Word with headings, tables, and the reflection log intact
  * ==========================================================================*/
-export function compileProjectReport({ project, company, tasks, transitions, reflections, members, board }) {
+export function compileProjectReport({ project, company, tasks, transitions, reflections, deadlineExtensions = [], members, board }) {
   const nameOf = (id) => members.find((m) => m.id === id)?.name ?? "Unassigned";
   const fmt = (iso) => (iso ? new Date(iso).toLocaleString("en-GB", { dateStyle: "medium", timeStyle: "short" }) : "—");
   const stack = computeSandStack(project, tasks);
@@ -783,6 +827,13 @@ export function compileProjectReport({ project, company, tasks, transitions, ref
     reflectionLog: reflections.filter((r) => r.projectId === project.id).map((r) => ({
       at: r.at, task: tasks.find((t) => t.id === r.taskId)?.title ?? "Task",
       whatWentWrong: r.whatWentWrong, rootBottleneck: r.rootBottleneck, correctiveAction: r.correctiveAction,
+    })),
+    /* Voluntary, before-the-fact deadline moves (item 10) — kept apart from
+     * reflectionLog above since these never followed an actual miss. */
+    extensionLog: deadlineExtensions.filter((e) => e.projectId === project.id).map((e) => ({
+      at: e.at, task: tasks.find((t) => t.id === e.taskId)?.title ?? "Task",
+      oldDeadline: e.oldDeadline, newDeadline: e.newDeadline,
+      whatChanged: e.whatChanged, progressSoFar: e.progressSoFar, planToHold: e.planToHold,
     })),
     /* Board task requests touching this project, with every decline and
      * transfer they went through. This is what makes "whenever a report is
@@ -820,6 +871,15 @@ export function compileProjectReport({ project, company, tasks, transitions, ref
         <b>Corrective action:</b> ${esc(r.correctiveAction)}
       </td></tr></table>`).join("")
     : "<p><i>No missed deadlines — no interventions were required.</i></p>";
+  const extensionBlocks = report.extensionLog.length
+    ? report.extensionLog.map((e) => `
+      <table class="ref"><tr><td>
+        <b>${esc(e.task)}</b> — ${esc(e.oldDeadline)} &rarr; ${esc(e.newDeadline)}<br/>
+        <b>What changed:</b> ${esc(e.whatChanged)}<br/>
+        <b>Progress so far:</b> ${esc(e.progressSoFar)}<br/>
+        <b>Plan to hold the new date:</b> ${esc(e.planToHold)}
+      </td></tr></table>`).join("")
+    : "<p><i>No deadlines were voluntarily extended.</i></p>";
   const trailBlocks = report.requestTrail.length
     ? report.requestTrail.map((r) => `
       <h3>${esc(r.title)} — ${esc(r.status)}${r.assignee ? ` (currently ${esc(r.assignee)})` : ""}</h3>
@@ -883,6 +943,9 @@ Sand stack: <b>${report.sandStack.fillPercent}%</b>${report.sandStack.degraded ?
 <table class="grid"><tr><th>Task</th><th>State</th><th>Assignee</th><th>Deadline</th><th>Completed</th><th>Retries</th><th>Weight</th></tr>${taskRows}</table>
 <h2>Task Timelines</h2>${timelineBlocks || "<p><i>No transitions recorded yet.</i></p>"}
 <h2>Supervisor Reflection Log (permanent)</h2>${reflectionBlocks}
+<h2>Deadline Extension Log (permanent)</h2>
+<p class="meta">Voluntary deadline moves, requested before the original date was missed, with the reasoning given at the time.</p>
+${extensionBlocks}
 <h2>Task Request Paper Trail</h2>
 <p class="meta">Every hand-off a board task request went through, with the reason given. This record is append-only and cannot be edited after the fact.</p>
 ${trailBlocks}
@@ -1346,6 +1409,53 @@ const RescheduleModal = ({ onConfirm, onClose }) => {
   );
 };
 
+/* ------------------------- EXTEND DEADLINE (item 10) ------------------------
+ * The voluntary counterpart to InterventionModal further down: that one
+ * fires AFTER a miss and is non-dismissible; this one is opt-in, used
+ * BEFORE a miss, on a task that hasn't gone overdue. Same spirit though —
+ * answering these honestly, before Puroductive lets the date move, is the
+ * whole point, so the questions are deliberately pointed rather than a
+ * blank "reason" box, and the answers are permanent (schema_v15.sql grants
+ * no UPDATE/DELETE on deadline_extensions at all). */
+const ExtendDeadlineModal = ({ task, onConfirm, onClose }) => {
+  const [newDeadline, setNewDeadline] = useState("");
+  const [a, setA] = useState({ whatChanged: "", progressSoFar: "", planToHold: "" });
+  const Q = [
+    { k: "whatChanged", q: "1 · What specifically changed since you set this deadline?", ph: "Not \"ran out of time\" — the actual event or blocker…" },
+    { k: "progressSoFar", q: "2 · What have you actually completed toward it so far?", ph: "Be concrete — if the honest answer is \"nothing,\" say that…" },
+    { k: "planToHold", q: "3 · What will be different this time so the new date holds?", ph: "A real change, not a hope…" },
+  ];
+  const ready = newDeadline && Q.every(({ k }) => a[k].trim().length > 0);
+  return (
+    <Modal wide onClose={onClose} title="Extend deadline"
+      subtitle={`"${task.title}" — currently due ${task.deadline}. Answer honestly before picking a new date.`}>
+      <div style={{ display: "grid", gap: 16 }}>
+        <div><Label>New deadline</Label>
+          <input type="date" min={task.deadline} style={inputStyle} value={newDeadline}
+            onChange={(e) => setNewDeadline(e.target.value)} /></div>
+        {Q.map(({ k, q, ph }) => (
+          <div key={k}>
+            <Label>{q}</Label>
+            <textarea rows={2} style={{ ...inputStyle, minHeight: 64, paddingTop: 11, resize: "vertical" }}
+              value={a[k]} onChange={(e) => setA({ ...a, [k]: e.target.value })} placeholder={ph} />
+          </div>
+        ))}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4, gap: 12, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 11.5, color: T.ink3, display: "flex", alignItems: "center", gap: 6 }}>
+            <ScrollText size={12} /> Permanent · appears in this project's report
+          </span>
+          <div style={{ display: "flex", gap: 10 }}>
+            <Btn ghost onClick={onClose}>Cancel</Btn>
+            <Btn disabled={!ready} onClick={() => ready && onConfirm(newDeadline, a)}>
+              <CalendarClock size={15} /> Extend deadline
+            </Btn>
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
 /* Shown when the user tries to delete a task that is not completed. */
 const NoDismissModal = ({ task, onRoute, onClose }) => (
   <Modal title="Tasks are never dismissed" tone="danger" onClose={onClose}
@@ -1435,10 +1545,11 @@ export default function PuroductiveApp({ session }) {
   const [groups, setGroups] = useState([]);
   const [events, setEvents] = useState([]);
   const [engine, dispatch] = useReducer(engineReducer, {
-    tasks: [], transitions: [], reflections: [], handoffs: [], interventions: [],
+    tasks: [], transitions: [], reflections: [], deadlineExtensions: [], handoffs: [], interventions: [],
   });
   const [view, setView] = useState("dashboard");
   const [openProjectId, setOpenProjectId] = useState(null);
+  const [projectNotes, setProjectNotes] = useState([]);
   const [activeCompanyId, setActiveCompanyId] = useState("all");
   const [modal, setModal] = useState(null);
   const [toasts, setToasts] = useState([]);
@@ -1547,6 +1658,7 @@ export default function PuroductiveApp({ session }) {
   const seenTaskIds = useRef(new Set());
   const seenTransitionIds = useRef(new Set());
   const seenReflectionIds = useRef(new Set());
+  const seenExtensionIds = useRef(new Set());
   const seenHandoffStatus = useRef(new Map());
   /* Step 1 — which workspaces does this account belong to? This also claims
    * any pending email invites, so a teammate who was invited while signed out
@@ -1658,8 +1770,12 @@ export default function PuroductiveApp({ session }) {
         seenTaskIds.current = new Set(data.tasks.map((t) => t.id));
         seenTransitionIds.current = new Set(data.transitions.map((t) => t.id));
         seenReflectionIds.current = new Set(data.reflections.map((r) => r.id));
+        seenExtensionIds.current = new Set(data.deadlineExtensions.map((e) => e.id));
         seenHandoffStatus.current = new Map(data.handoffs.map((h) => [h.id, h.status]));
-        dispatch({ type: "INIT", tasks: data.tasks, transitions: data.transitions, reflections: data.reflections, handoffs: data.handoffs });
+        dispatch({
+          type: "INIT", tasks: data.tasks, transitions: data.transitions, reflections: data.reflections,
+          deadlineExtensions: data.deadlineExtensions, handoffs: data.handoffs,
+        });
         /* Seed with whatever's already at 100% on load, so opening the app
          * doesn't itself read as "you just finished all of these" — only a
          * completion that happens *after* this point should celebrate. */
@@ -1711,6 +1827,18 @@ export default function PuroductiveApp({ session }) {
     fresh.forEach((r) => seenReflectionIds.current.add(r.id));
     fresh.forEach((r) => db.insertReflection(r).catch((e) => toast(`Sync failed: ${e.message}`, "error")));
   }, [engine.reflections]);
+  useEffect(() => {
+    const fresh = engine.deadlineExtensions.filter((e) => !seenExtensionIds.current.has(e.id));
+    if (!fresh.length) return;
+    fresh.forEach((e) => seenExtensionIds.current.add(e.id));
+    fresh.forEach((e) => db.insertDeadlineExtension(e).catch((err) => toast(`Sync failed: ${err.message}`, "error")));
+    /* The reducer already moved the task's deadline in local state; persist
+     * that alongside the extension record itself. */
+    fresh.forEach((e) => {
+      const task = engine.tasks.find((t) => t.id === e.taskId);
+      if (task) db.updateTaskState(task).catch((err) => toast(`Sync failed: ${err.message}`, "error"));
+    });
+  }, [engine.deadlineExtensions, engine.tasks]);
   useEffect(() => {
     for (const h of engine.handoffs) {
       const prev = seenHandoffStatus.current.get(h.id);
@@ -1908,10 +2036,38 @@ export default function PuroductiveApp({ session }) {
       tasks: engine.tasks.filter((t) => t.projectId === proj.id),
       transitions: engine.transitions,
       reflections: engine.reflections,
+      deadlineExtensions: engine.deadlineExtensions,
       members, board,
     });
     downloadProjectDoc(compiled, proj.name.replace(/[^\w]+/g, "-") + "-report.doc");
     toast("Report compiled — Word document downloading");
+  };
+
+  /* --------------------------- notes (items 7 & 8) -------------------------
+   * Loaded per-project, only while that project's screen is open — cleared
+   * on the way out so a note from the last project never flashes into the
+   * next one before the fetch for it resolves. */
+  useEffect(() => {
+    if (!openProjectId) { setProjectNotes([]); return; }
+    let cancelled = false;
+    db.fetchTaskNotes(openProjectId).then((ns) => { if (!cancelled) setProjectNotes(ns); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [openProjectId]);
+  const addProjectNote = async (projectId, { taskId, body, file }) => {
+    try {
+      const photoPath = file ? await db.uploadTaskNotePhoto(projectId, file) : null;
+      const note = await db.insertTaskNote({
+        id: uid(), projectId, taskId: taskId || null, body: body || "", photoPath, at: new Date().toISOString(),
+      });
+      setProjectNotes((ns) => [note, ...ns]);
+    } catch (e) {
+      toast(`Note failed: ${e.message}`, "error");
+    }
+  };
+  /* "Turn into task" (item 7) — no separate creation path, just pre-fills
+   * the same TaskForm used everywhere else. */
+  const turnNoteIntoTask = (note) => {
+    setModal({ kind: "task", projectId: note.projectId, prefillTitle: note.body });
   };
 
   /* -------- DEADLINE SWEEP: on mount and whenever tasks change ----------- */
@@ -2027,11 +2183,22 @@ export default function PuroductiveApp({ session }) {
       setProjects((ps) => ps.map((p) => (p.id === data.id ? { ...p, ...data } : p)));
       db.updateProject(data).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     } else {
-      const project = { ...data, id: uid(), status: "active" };
+      const sortOrder = nextQueueOrder(projects.map((p) => p.sortOrder).filter((v) => v != null));
+      const project = { ...data, id: uid(), status: "active", sortOrder };
       setProjects((ps) => [...ps, project]);
       db.insertProject(project).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     }
     setModal(null);
+  };
+  const deleteProject = (project) => {
+    setProjects((ps) => ps.filter((p) => p.id !== project.id));
+    db.softDeleteProject(project.id).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    if (openProjectId === project.id) setOpenProjectId(null);
+    toast(`${project.name} removed`);
+  };
+  const reorderProject = (projectId, sortOrder) => {
+    setProjects((ps) => ps.map((p) => (p.id === projectId ? { ...p, sortOrder } : p)));
+    db.updateProjectOrder(projectId, sortOrder).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
   };
   /* New tasks join the tail of both queues automatically (item 2) — a
    * project-pipeline position, and (only if assigned) a personal-queue
@@ -2054,13 +2221,32 @@ export default function PuroductiveApp({ session }) {
   /* Task inserts are picked up by the engine.tasks persistence watcher above. */
   const addTask = (task) => { dispatch({ type: "ADD_TASK", task: withQueuePositions(task) }); setModal(null); };
 
+  /* Editing a task's own details (item 10) — never the deadline date once
+   * it's set; TaskForm disables that field and routes to extendDeadline
+   * below instead. */
+  const editTask = (patch) => {
+    dispatch({ type: "UPDATE_TASK_DETAILS", taskId: patch.id, patch });
+    db.updateTaskDetails(patch).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    setModal(null);
+  };
+  /* Voluntary deadline extension (item 10) — the reflective questions are
+   * enforced by the reducer itself (EXTEND_DEADLINE is a no-op without all
+   * three answers), the persistence watcher above writes both the new
+   * extension record and the task's moved deadline. */
+  const extendDeadline = (task, newDeadline, answers) => {
+    dispatch({ type: "EXTEND_DEADLINE", taskId: task.id, projectId: task.projectId, newDeadline, answers });
+    setModal(null);
+    toast("Deadline extended — your reasoning is logged permanently in the report");
+  };
+
   /* ------------------------- companies CRUD ------------------------------- */
   const saveCompany = (data) => {
     if (data.id) {
       setCompanies((cs) => cs.map((c) => (c.id === data.id ? { ...c, ...data } : c)));
       db.updateCompany(data).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     } else {
-      const company = { ...data, id: "c-" + uid() };
+      const sortOrder = nextQueueOrder(companies.map((c) => c.sortOrder).filter((v) => v != null));
+      const company = { ...data, id: "c-" + uid(), sortOrder };
       setCompanies((cs) => [...cs, company]);
       db.insertCompany(company).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     }
@@ -2072,6 +2258,10 @@ export default function PuroductiveApp({ session }) {
     db.softDeleteCompany(company.id).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     if (activeCompanyId === company.id) setActiveCompanyId("all");
     toast(`${company.name} removed`);
+  };
+  const reorderCompany = (companyId, sortOrder) => {
+    setCompanies((cs) => cs.map((c) => (c.id === companyId ? { ...c, sortOrder } : c)));
+    db.updateCompanyOrder(companyId, sortOrder).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
   };
 
   /* --------------------------- team members CRUD --------------------------- */
@@ -2173,6 +2363,14 @@ export default function PuroductiveApp({ session }) {
     setNotifications((ns) => ns.filter((n) => n.id !== id));
     db.dismissNotification(id).catch(() => {});
   };
+  /* "No pending invite found" means the underlying workspace_members row is
+   * no longer status='invited' (removed, already actioned elsewhere, or
+   * superseded by a fresh invite) — the notification is stale, not a live
+   * invite that failed. schema_v12.sql dismisses these automatically going
+   * forward; this is the client-side fallback for anything already open in
+   * a tab from before that fix, so Accept/Decline never just silently fails
+   * and leaves a dead button behind. */
+  const isStaleInvite = (e) => /no pending invite found/i.test(e.message);
   const acceptInviteNotif = async (n) => {
     try {
       const newWsId = await db.acceptInvite(n.actionMembershipId);
@@ -2186,7 +2384,12 @@ export default function PuroductiveApp({ session }) {
       setWorkspaces(list);
       switchWorkspace(newWsId);
     } catch (e) {
-      toast(`Could not accept: ${e.message}`, "error");
+      if (isStaleInvite(e)) {
+        dismissNotif(n.id);
+        toast("This invite is no longer valid — it's been dismissed", "error");
+      } else {
+        toast(`Could not accept: ${e.message}`, "error");
+      }
     }
   };
   const declineInviteNotif = async (n) => {
@@ -2195,7 +2398,12 @@ export default function PuroductiveApp({ session }) {
       dismissNotif(n.id);
       toast("Invite declined");
     } catch (e) {
-      toast(`Could not decline: ${e.message}`, "error");
+      if (isStaleInvite(e)) {
+        dismissNotif(n.id);
+        toast("This invite is no longer valid — it's been dismissed", "error");
+      } else {
+        toast(`Could not decline: ${e.message}`, "error");
+      }
     }
   };
   /* Clicking the body of a notification (not its Accept/Decline buttons)
@@ -2584,12 +2792,14 @@ export default function PuroductiveApp({ session }) {
           <CompaniesView companies={companies} projects={projects} members={members}
             onAdd={() => setModal({ kind: "company", data: null })}
             onEdit={(c) => setModal({ kind: "company", data: c })}
-            onDelete={deleteCompany} />
+            onDelete={deleteCompany} onReorder={reorderCompany} />
         )}
         {view === "projects" && !openProject && (
           <ProjectsList projects={scopedProjects} companies={companies} engine={engine}
             onOpen={(p) => setOpenProjectId(p.id)}
-            onCreate={() => setModal({ kind: "project", data: null })} />
+            onCreate={() => setModal({ kind: "project", data: null })}
+            onEdit={(p) => setModal({ kind: "project", data: p })}
+            onDelete={deleteProject} onReorder={reorderProject} />
         )}
         {view === "projects" && openProject && (
           <ProjectDetail project={openProject} companies={companies} members={members} groups={groups} engine={engine}
@@ -2601,7 +2811,12 @@ export default function PuroductiveApp({ session }) {
             onComplete={(t) => setModal({ kind: "completeTask", task: t })}
             onReorder={reorderTask}
             onAddTask={() => setModal({ kind: "task", projectId: openProject.id })}
-            onExport={() => exportProject(openProject)} />
+            onEditTask={(t) => setModal({ kind: "task", data: t })}
+            onExtendDeadline={(t) => setModal({ kind: "extendDeadline", task: t })}
+            onExport={() => exportProject(openProject)}
+            notes={projectNotes}
+            onAddNote={(n) => addProjectNote(openProject.id, n)}
+            onTurnIntoTask={turnNoteIntoTask} />
         )}
         {view === "team" && (
           <TeamView members={members} companies={companies} groups={groups} engine={engine}
@@ -2689,7 +2904,15 @@ export default function PuroductiveApp({ session }) {
           onConfirm={(d) => { tryTransition(modal.taskId, "RESCHEDULE", { newDeadline: d }); setModal(null); }} />
       )}
       {!interventionTask && modal?.kind === "task" && (
-        <TaskForm projectId={modal.projectId} members={members} groups={groups} onSave={addTask} onClose={() => setModal(null)} />
+        <TaskForm data={modal.data} projectId={modal.projectId ?? modal.data?.projectId} prefillTitle={modal.prefillTitle}
+          members={members} groups={groups}
+          onSave={modal.data ? editTask : addTask}
+          onEditRequestExtend={() => setModal({ kind: "extendDeadline", task: modal.data })}
+          onClose={() => setModal(null)} />
+      )}
+      {!interventionTask && modal?.kind === "extendDeadline" && (
+        <ExtendDeadlineModal task={modal.task} onClose={() => setModal(null)}
+          onConfirm={(newDeadline, answers) => extendDeadline(modal.task, newDeadline, answers)} />
       )}
       {!interventionTask && modal?.kind === "project" && (
         <ProjectForm data={modal.data} companies={companies} defaultCompanyId={activeCompanyId}
@@ -3126,33 +3349,57 @@ const Dashboard = ({ companies, projects, members, engine, theme, openProject, m
 };
 
 /* ============================= PROJECTS LIST ============================== */
-const ProjectsList = ({ projects, companies, engine, onOpen, onCreate }) => (
+const ProjectsList = ({ projects, companies, engine, onOpen, onCreate, onEdit, onDelete, onReorder }) => (
   <div className="pd-fade-in">
     <PageHead kicker="Execution" title="Projects"
       sub="Deadlines lock permanently once committed — the supervisor never renegotiates."
       action={<Btn onClick={onCreate}><Plus size={15} /> New project</Btn>} />
-    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-      {projects.map((p) => {
+    {projects.length > 1 && (
+      <p style={{ margin: "0 0 10px", fontSize: 11, color: T.ink3 }}>
+        <GripVertical size={11} style={{ verticalAlign: -1 }} /> Drag a row to reorder.
+      </p>
+    )}
+    <DragQueueList items={projects} orderKey="sortOrder" onReorder={onReorder}
+      renderItem={(p) => {
         const c = companies.find((x) => x.id === p.companyId);
         const stack = computeSandStack(p, engine.tasks.filter((t) => t.projectId === p.id));
         return (
-          <Card key={p.id} className="pd-rise" style={{ padding: "16px 20px", display: "flex", alignItems: "center", gap: 18, cursor: "pointer" }}
-            onClick={() => onOpen(p)}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 14, fontWeight: 600, color: T.ink, display: "flex", alignItems: "center", gap: 8 }}>
-                {p.name} {p.locked && <Lock size={12} style={{ color: T.ink3 }} />}
-              </div>
-              <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 3 }}>{c?.name} · due {p.deadline}</div>
-            </div>
-            <SandBar stack={stack} theme={c?.theme ?? THEME_PRESETS[0]} />
-            <ChevronRight size={15} style={{ color: T.ink3 }} />
-          </Card>
+          <ProjectRow project={p} theme={c?.theme ?? THEME_PRESETS[0]} companyName={c?.name} stack={stack}
+            onOpen={() => onOpen(p)} onEdit={() => onEdit(p)} onDelete={() => onDelete(p)} />
         );
-      })}
-      {projects.length === 0 && <Empty text="No projects in this scope yet." />}
-    </div>
+      }} />
+    {projects.length === 0 && <Empty text="No projects in this scope yet." />}
   </div>
 );
+
+const ProjectRow = ({ project: p, theme, companyName, stack, onOpen, onEdit, onDelete }) => {
+  const [confirming, setConfirming] = useState(false);
+  return (
+    <Card className="pd-rise" style={{ padding: "16px 20px", display: "flex", alignItems: "center", gap: 18, cursor: "pointer" }}
+      onClick={onOpen}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: T.ink, display: "flex", alignItems: "center", gap: 8 }}>
+          {p.name} {p.locked && <Lock size={12} style={{ color: T.ink3 }} />}
+        </div>
+        <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 3 }}>{companyName} · due {p.deadline}</div>
+      </div>
+      <SandBar stack={stack} theme={theme} />
+      {confirming ? (
+        <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+          <span style={{ fontSize: 11, color: T.danger, whiteSpace: "nowrap" }}>Remove?</span>
+          <Btn small ghost onClick={() => setConfirming(false)}>Cancel</Btn>
+          <Btn small danger onClick={onDelete}>Confirm</Btn>
+        </div>
+      ) : (
+        <div onClick={(e) => e.stopPropagation()} style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          <IconBtn label="Edit project" onClick={onEdit}><Pencil size={13} /></IconBtn>
+          <IconBtn label="Delete project" danger onClick={() => setConfirming(true)}><Trash2 size={13.5} /></IconBtn>
+        </div>
+      )}
+      <ChevronRight size={15} style={{ color: T.ink3 }} />
+    </Card>
+  );
+};
 
 /* ---------------------------- DRAG-TO-REORDER QUEUE ------------------------
  * Generic — used for the project pipeline above (orderKey="queueOrder") and
@@ -3162,7 +3409,7 @@ const ProjectsList = ({ projects, companies, engine, onOpen, onCreate }) => (
  * Dropping a row moves the dragged item to just above the drop target; the
  * new order value is the midpoint between that target and its own previous
  * neighbor (see betweenQueueOrder), so nothing else in the list is touched. */
-const DragQueueList = ({ items, orderKey, onReorder, renderItem }) => {
+const DragQueueList = ({ items, orderKey, onReorder, renderItem, containerStyle }) => {
   const dragIdRef = useRef(null);
   const [overId, setOverId] = useState(null);
   const sorted = [...items].sort((a, b) => (a[orderKey] ?? Infinity) - (b[orderKey] ?? Infinity));
@@ -3181,7 +3428,7 @@ const DragQueueList = ({ items, orderKey, onReorder, renderItem }) => {
   };
 
   return (
-    <div style={{ display: "grid", gap: 10 }}>
+    <div style={containerStyle ?? { display: "grid", gap: 10 }}>
       {sorted.map((item) => (
         <div key={item.id}
           draggable
@@ -3202,7 +3449,7 @@ const DragQueueList = ({ items, orderKey, onReorder, renderItem }) => {
 };
 
 /* ============================ PROJECT DETAIL ============================== */
-const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onComplete, onReorder, onAddTask, onExport }) => {
+const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onComplete, onReorder, onAddTask, onEditTask, onExtendDeadline, onExport, notes, onAddNote, onTurnIntoTask }) => {
   const isMobile = useIsMobile();
   const c = companies.find((x) => x.id === project.companyId);
   const theme = c?.theme ?? THEME_PRESETS[0];
@@ -3303,18 +3550,132 @@ const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tr
               <TaskRow t={t} members={members} groups={groups}
                 tryTransition={tryTransition} attemptDelete={attemptDelete}
                 onReassign={onReassign} onReschedule={onReschedule} onMark={onMark} onComplete={onComplete}
+                onEdit={onEditTask} onExtendDeadline={onExtendDeadline}
                 hasReflection={engine.reflections.some((r) => r.taskId === t.id)} />
             )} />
           {tasks.length === 0 && <Empty text="No tasks yet — add the first one." />}
         </div>
+      </div>
+
+      {/* Notes (items 7 & 8) — photo notes not yet tied to a task, and
+        * per-task comments, in one panel: a note tagged with a task reads
+        * as a comment on it; an untagged one is a quick capture that can
+        * still become a task later. */}
+      <div style={{ marginTop: 24 }}>
+        <NotesPanel notes={notes} tasks={tasks} onAdd={onAddNote} onTurnIntoTask={onTurnIntoTask} />
       </div>
       </div>
     </div>
   );
 };
 
+/* -------------------------------- NOTES (items 7 & 8) ----------------------
+ * A note tagged with a task IS a comment on it; an untagged one is a quick
+ * "photo of something at this project" capture that "Turn into task" can
+ * spin into real work later. One list, one compose box, both asks. */
+const NotesPanel = ({ notes, tasks, onAdd, onTurnIntoTask }) => {
+  const [body, setBody] = useState("");
+  const [taskId, setTaskId] = useState("");
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [photoUrls, setPhotoUrls] = useState({});
+
+  const onPick = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    setFile(f);
+    setPreview(URL.createObjectURL(f));
+  };
+  const submit = async () => {
+    if (!body.trim() && !file) return;
+    setBusy(true);
+    try {
+      await onAdd({ taskId: taskId || null, body: body.trim(), file });
+      setBody(""); setTaskId(""); setFile(null); setPreview(null);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const viewPhoto = async (path) => {
+    if (photoUrls[path]) { window.open(photoUrls[path], "_blank", "noopener"); return; }
+    try {
+      const urls = await db.signMediaUrls([path], 3600, "task-notes");
+      if (urls[path]) { setPhotoUrls((p) => ({ ...p, [path]: urls[path] })); window.open(urls[path], "_blank", "noopener"); }
+    } catch { /* signing failed — nothing to open */ }
+  };
+
+  return (
+    <Card style={{ padding: 20 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+        <MessageSquare size={14} style={{ color: T.ink3 }} />
+        <span style={{ fontSize: 12, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3 }}>Notes & comments</span>
+      </div>
+
+      <div style={{ display: "grid", gap: 10, marginBottom: 18, padding: 14, borderRadius: 14, background: T.cardSoft, border: `1px solid ${T.line}` }}>
+        <textarea rows={2} style={{ ...inputStyle, minHeight: 56, paddingTop: 11, resize: "vertical" }}
+          value={body} onChange={(e) => setBody(e.target.value)}
+          placeholder="Add a note, or a comment on a task…" />
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+          <select style={{ ...inputStyle, width: "auto", minWidth: 160 }} value={taskId} onChange={(e) => setTaskId(e.target.value)}>
+            <option value="">General (not tied to a task)</option>
+            {tasks.map((t) => <option key={t.id} value={t.id}>{t.title}</option>)}
+          </select>
+          {preview ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <img src={preview} alt="" style={{ width: 36, height: 36, objectFit: "cover", borderRadius: 8, border: `1px solid ${T.line}` }} />
+              <IconBtn onClick={() => { setFile(null); setPreview(null); }} label="Remove photo" danger><X size={13} /></IconBtn>
+            </div>
+          ) : (
+            <label className="pd-press" style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 12px",
+              borderRadius: 10, border: `1px dashed ${T.line}`, cursor: "pointer", color: T.ink3, fontSize: 12 }}>
+              <Camera size={14} /> Photo
+              <input type="file" accept="image/*" style={{ display: "none" }} onChange={onPick} />
+            </label>
+          )}
+          <Btn small disabled={busy || (!body.trim() && !file)} onClick={submit} style={{ marginLeft: "auto" }}>
+            <Send size={13} /> {busy ? "Posting…" : "Post"}
+          </Btn>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gap: 10 }}>
+        {notes.map((n) => {
+          const task = n.taskId ? tasks.find((t) => t.id === n.taskId) : null;
+          return (
+            <div key={n.id} style={{ padding: "12px 14px", borderRadius: 12, border: `1px solid ${T.line}` }}>
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 6, flexWrap: "wrap" }}>
+                <Chip bg={task ? "#EAF6FE" : T.cardSoft} color={task ? "#0284C7" : T.ink2}>
+                  {task ? task.title : "General"}
+                </Chip>
+                <span style={{ fontSize: 10.5, color: T.ink3 }}>{relativeTime(n.at)}</span>
+              </div>
+              {n.body && <div style={{ fontSize: 12.5, color: T.ink2, lineHeight: 1.5 }}>{n.body}</div>}
+              <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+                {n.photoPath && (
+                  <button type="button" className="pd-press" onClick={() => viewPhoto(n.photoPath)}
+                    style={{ background: "none", border: "none", padding: 0, cursor: "pointer" }}>
+                    <Chip bg="#EAF6FE" color="#0284C7"><ImageIcon size={10} /> View photo</Chip>
+                  </button>
+                )}
+                {!task && (
+                  <button type="button" className="pd-press" onClick={() => onTurnIntoTask(n)}
+                    style={{ background: "none", border: "none", padding: 0, cursor: "pointer" }}>
+                    <Chip bg="#F4FBE3" color={T.limeDeep}><Plus size={10} /> Turn into task</Chip>
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+        {notes.length === 0 && <Empty text="No notes yet — jot one down, or attach a photo." />}
+      </div>
+    </Card>
+  );
+};
+
 /* ------------------------------- TASK ROW --------------------------------- */
-const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onComplete, hasReflection }) => {
+const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onComplete, onEdit, onExtendDeadline, hasReflection }) => {
   const meta = STATE_META[t.state];
   const acts = [];
   if (TRANSITIONS[t.state].START) acts.push({ k: "START", label: "Start", icon: Play, run: () => tryTransition(t.id, "START") });
@@ -3326,6 +3687,12 @@ const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign,
   if (TRANSITIONS[t.state].FAIL_ATTEMPT) acts.push({ k: "FAIL", label: "No answer / failed", icon: PhoneMissed, run: () => tryTransition(t.id, "FAIL_ATTEMPT", { note: "Attempt failed" }) });
   if (TRANSITIONS[t.state].REASSIGN) acts.push({ k: "REASSIGN", label: "Reassign", icon: UserCheck, run: () => onReassign(t) });
   if (TRANSITIONS[t.state].RESCHEDULE) acts.push({ k: "RESCHEDULE", label: "Reschedule", icon: CalendarClock, run: () => onReschedule(t) });
+  /* Voluntary extension (item 10) — only offered before any trouble: an
+   * already-overdue/retrying task goes through Reschedule/Reassign above
+   * instead, and a completed one has nothing left to extend. */
+  if ((t.state === "pending" || t.state === "in_progress") && t.deadline) {
+    acts.push({ k: "EXTEND", label: "Extend deadline", icon: CalendarPlus, run: () => onExtendDeadline(t) });
+  }
 
   return (
     <Card style={{
@@ -3358,11 +3725,12 @@ const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign,
             {t.state === "in_progress" && <TaskDurationBadge task={t} />}
           </div>
           <div className="pd-num" style={{ fontSize: 11.5, color: T.ink3, marginTop: 5 }}>
-            {taskAudience(t, members, groups)}{t.deadline ? ` · due ${t.deadline}` : ""} · weight {t.weight}
+            {taskAudience(t, members, groups)}{t.deadline ? ` · due ${t.deadline}${t.deadlineTime ? ` ${t.deadlineTime}` : ""}` : ""} · weight {t.weight}
             {t.estimatedMinutes ? ` · est. ${t.estimatedMinutes} min` : ""}
             {t.isMarked && t.markLabel ? ` · ${t.markLabel}` : ""}
           </div>
         </div>
+        <IconBtn onClick={() => onEdit(t)} label="Edit task"><Pencil size={13} /></IconBtn>
         <IconBtn onClick={() => onMark(t)} label={t.isMarked ? "Edit calendar mark" : "Mark on calendar"}>
           <Star size={13.5} style={t.isMarked ? { color: "#D97706", fill: "#D97706" } : undefined} />
         </IconBtn>
@@ -3384,14 +3752,24 @@ const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign,
 };
 
 /* ------------------------------ TASK FORM --------------------------------- */
-const TaskForm = ({ projectId, members, groups, onSave, onClose }) => {
-  const [f, setF] = useState({
-    title: "", scope: "individual", assigneeId: members[0]?.id ?? "",
-    assigneeGroupId: groups[0]?.id ?? "", deadline: "", weight: 1, estimatedMinutes: "",
+const TaskForm = ({ data, projectId, prefillTitle, members, groups, onSave, onEditRequestExtend, onClose }) => {
+  const [f, setF] = useState(data ? {
+    title: data.title, scope: data.scope, assigneeId: data.assigneeId ?? "",
+    assigneeGroupId: data.assigneeGroupId ?? "", deadline: data.deadline ?? "",
+    deadlineTime: data.deadlineTime ?? "", weight: data.weight, estimatedMinutes: data.estimatedMinutes ?? "",
+  } : {
+    title: prefillTitle ?? "", scope: "individual", assigneeId: members[0]?.id ?? "",
+    assigneeGroupId: groups[0]?.id ?? "", deadline: "", deadlineTime: "", weight: 1, estimatedMinutes: "",
   });
   const team = f.scope === "team";
+  /* Once a task has a committed deadline, its DATE can't be changed from
+   * this form — only extendDeadline's reflective flow can move it. A task
+   * created with no deadline can still have one set here for the first
+   * time, same as any other field. */
+  const deadlineLocked = !!(data && data.deadline);
   return (
-    <Modal title="Add task" subtitle="A new grain for the stack" onClose={onClose}>
+    <Modal title={data ? "Edit task" : "Add task"} onClose={onClose}
+      subtitle={data ? "Adjust who owns it, its weight, or its time of day." : "A new grain for the stack"}>
       <div style={{ display: "grid", gap: 18 }}>
         <div><Label>Title</Label>
           <input style={inputStyle} value={f.title} onChange={(e) => setF({ ...f, title: e.target.value })} placeholder="e.g. Call vendor for quotation" /></div>
@@ -3438,8 +3816,18 @@ const TaskForm = ({ projectId, members, groups, onSave, onClose }) => {
                 {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
               </select></div>
           )}
-          <div><Label>Deadline</Label>
-            <input type="date" style={inputStyle} value={f.deadline} onChange={(e) => setF({ ...f, deadline: e.target.value })} /></div>
+          <div><Label>Deadline {deadlineLocked && "· locked"}</Label>
+            <input type="date" style={{ ...inputStyle, opacity: deadlineLocked ? 0.5 : 1 }} disabled={deadlineLocked}
+              value={f.deadline} onChange={(e) => setF({ ...f, deadline: e.target.value })} />
+            {deadlineLocked && (
+              <button type="button" onClick={onEditRequestExtend} className="pd-press" style={{
+                marginTop: 6, background: "none", border: "none", padding: 0, cursor: "pointer",
+                fontSize: 11, fontWeight: 600, color: T.limeDeep, textDecoration: "underline",
+              }}>Extend this deadline instead →</button>
+            )}</div>
+          <div><Label>Time (optional)</Label>
+            <input type="time" style={inputStyle} value={f.deadlineTime} disabled={!f.deadline}
+              onChange={(e) => setF({ ...f, deadlineTime: e.target.value })} /></div>
           <div><Label>Weight</Label>
             <input type="number" min={1} max={10} style={inputStyle} value={f.weight}
               onChange={(e) => setF({ ...f, weight: Math.max(1, Math.min(10, +e.target.value || 1)) })} /></div>
@@ -3455,16 +3843,23 @@ const TaskForm = ({ projectId, members, groups, onSave, onClose }) => {
         )}
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
           <Btn ghost onClick={onClose}>Cancel</Btn>
-          <Btn disabled={!f.title.trim()} onClick={() => onSave({
+          <Btn disabled={!f.title.trim()} onClick={() => onSave(data ? {
+            id: data.id, title: f.title.trim(), scope: f.scope,
+            assigneeId: team ? null : (f.assigneeId || null),
+            assigneeGroupId: team ? (f.assigneeGroupId || null) : null,
+            deadline: deadlineLocked ? data.deadline : (f.deadline || null),
+            deadlineTime: f.deadline ? (f.deadlineTime || null) : null, weight: f.weight,
+            estimatedMinutes: f.estimatedMinutes ? Math.max(1, +f.estimatedMinutes) : null,
+          } : {
             id: "t-" + uid(), projectId, title: f.title.trim(), state: "pending",
             scope: f.scope,
             assigneeId: team ? null : (f.assigneeId || null),
             assigneeGroupId: team ? (f.assigneeGroupId || null) : null,
-            deadline: f.deadline || null, weight: f.weight,
+            deadline: f.deadline || null, deadlineTime: f.deadline ? (f.deadlineTime || null) : null, weight: f.weight,
             estimatedMinutes: f.estimatedMinutes ? Math.max(1, +f.estimatedMinutes) : null,
             retryCount: 0, completedAt: null, completedLate: false,
             isMarked: false, markLabel: "", markScope: null, markTargetId: null,
-          })}><Check size={15} /> Add task</Btn>
+          })}><Check size={15} /> {data ? "Save" : "Add task"}</Btn>
         </div>
       </div>
     </Modal>
@@ -3527,20 +3922,25 @@ const ProjectForm = ({ data, companies, defaultCompanyId, onSave, onClose }) => 
 };
 
 /* =============================== COMPANIES ================================= */
-const CompaniesView = ({ companies, projects, members, onAdd, onEdit, onDelete }) => (
+const CompaniesView = ({ companies, projects, members, onAdd, onEdit, onDelete, onReorder }) => (
   <div className="pd-fade-in">
     <PageHead kicker="Root entity" title="Companies"
       sub="Every project and team member is scoped to a company. Add the businesses you run work through."
       action={<Btn onClick={onAdd}><Plus size={15} /> Add company</Btn>} />
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 16 }}>
-      {companies.map((c) => (
-        <CompanyCard key={c.id} company={c}
+    {companies.length > 1 && (
+      <p style={{ margin: "0 0 12px", fontSize: 11, color: T.ink3 }}>
+        <GripVertical size={11} style={{ verticalAlign: -1 }} /> Drag a card to reorder.
+      </p>
+    )}
+    <DragQueueList items={companies} orderKey="sortOrder" onReorder={onReorder}
+      containerStyle={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 16 }}
+      renderItem={(c) => (
+        <CompanyCard company={c}
           projectCount={projects.filter((p) => p.companyId === c.id).length}
           memberCount={members.filter((m) => m.companyIds.includes(c.id)).length}
           onEdit={() => onEdit(c)} onDelete={() => onDelete(c)} />
-      ))}
-      {companies.length === 0 && <Empty text="No companies yet — add the first one." />}
-    </div>
+      )} />
+    {companies.length === 0 && <Empty text="No companies yet — add the first one." />}
   </div>
 );
 
@@ -4626,6 +5026,20 @@ const GoogleCalendarCard = ({ connection, syncing, onConnect, onDisconnect, onSy
         <Btn small onClick={onConnect}><CalendarPlus size={14} /> Connect Google Calendar</Btn>
       )}
     </div>
+    {/* item 3 — while the Google app is in "Testing" publish status, Google
+      * refuses anyone not explicitly added as a test user, with its own raw
+      * "Access blocked" / "unverified app" / 403 page — that happens on
+      * Google's own domain, before any redirect back here, so there's no
+      * ?google=error to catch and turn into a nicer toast. A standing hint
+      * is the only thing that can reach someone hitting it. */}
+    {!connection && (
+      <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${T.lineSoft}`,
+        fontSize: 11.5, color: T.ink3, lineHeight: 1.55 }}>
+        Seeing "Access blocked" or "unverified app" from Google instead of a sign-in prompt? That means
+        the workspace owner hasn't added your Google account as a test user yet — ask them to do that in
+        Google Cloud Console, then try connecting again.
+      </div>
+    )}
     {/* item 5 — background auto-sync is additive to the two mechanisms
       * that already exist: the manual "Sync now" above, and the while-the-
       * tab-is-open 3-minute poll. This toggle is the only one that keeps
@@ -4734,7 +5148,7 @@ const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, 
   const lead = start.getDay(); // blank cells before day 1 (week starts Sunday)
   const monthSessions = sessions.filter((s) => new Date(s.loginAt) >= start && new Date(s.loginAt) < end);
   const exFor = (ymd) => exceptions.find((x) => x.date === ymd);
-  const todaysTasks = tasksDueOn(tasks, today);
+  const todaysTasks = sortByDeadlineTime(tasksDueOn(tasks, today));
   const markedTasks = tasks.filter((t) => t.isMarked && t.state !== "completed");
   const agenda = buildAgenda({ events, tasks, projects }, 14);
 
@@ -4821,7 +5235,7 @@ const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, 
                     <div style={{ flex: 1, minWidth: 140 }}>
                       <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{t.title}</div>
                       <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
-                        {p?.name ?? "—"} · {who}{t.markLabel ? ` · ${t.markLabel}` : ""}
+                        {t.deadlineTime ? `${t.deadlineTime} · ` : ""}{p?.name ?? "—"} · {who}{t.markLabel ? ` · ${t.markLabel}` : ""}
                       </div>
                     </div>
                     <Chip bg={t.scope === "team" ? "#EAF6FE" : T.cardSoft} color={t.scope === "team" ? "#0284C7" : T.ink2}>
@@ -4932,7 +5346,9 @@ const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, 
                 <Chip bg="#FDF3E3" color="#B45309">Task due</Chip>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{item.ref.title}</div>
-                  <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>{item.date}{p ? ` · ${p.name}` : ""}</div>
+                  <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
+                    {item.date}{item.ref.deadlineTime ? ` · ${item.ref.deadlineTime}` : ""}{p ? ` · ${p.name}` : ""}
+                  </div>
                 </div>
                 <span style={{ fontSize: 11, color: T.ink3, flexShrink: 0 }}>{relativeDayLabel(item.date)}</span>
               </Card>
@@ -5228,7 +5644,7 @@ const DayDetailModal = ({ date, exceptions, events, tasks, projects, companies, 
   const exMeta = ex ? EXCEPTION_META[ex.type] ?? EXCEPTION_META.holiday : null;
   const ExIcon = ex ? (isLeaveType(ex.type) ? Palmtree : ex.type === "holiday" ? Sun : Plane) : null;
   const dayEvents = events.filter((e) => e.date === date);
-  const dayTasks = tasksDueOn(tasks, date);
+  const dayTasks = sortByDeadlineTime(tasksDueOn(tasks, date));
   const dayDeadlines = projectDeadlinesOn(projects, date);
   const isToday = date === ymdOf(new Date());
   const dow = new Date(date + "T00:00:00").toLocaleDateString("en", { weekday: "long" });
@@ -5296,7 +5712,7 @@ const DayDetailModal = ({ date, exceptions, events, tasks, projects, companies, 
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{t.title}</div>
                       <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>
-                        {p?.name ?? "—"} · {taskAudience(t, members)}{t.markLabel ? ` · ${t.markLabel}` : ""}
+                        {t.deadlineTime ? `${t.deadlineTime} · ` : ""}{p?.name ?? "—"} · {taskAudience(t, members)}{t.markLabel ? ` · ${t.markLabel}` : ""}
                       </div>
                     </div>
                     <IconBtn label={t.isMarked ? "Edit calendar mark" : "Mark on calendar"} onClick={() => onMarkTask(t)}>
