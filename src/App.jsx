@@ -1951,6 +1951,17 @@ export default function PuroductiveApp({ session }) {
       toast(`Could not start Google sign-in: ${e.message}`, "error");
     }
   };
+  /* "Ask an admin" (item 3 follow-up) — someone blocked by Google's
+   * unverified-app screen has no way to fix it themselves; this reaches
+   * whoever can, through the same notification center invites use. */
+  const requestGoogleAccess = async () => {
+    try {
+      await db.requestGoogleCalendarAccess(workspaceId);
+      toast("Request sent to your workspace admin");
+    } catch (e) {
+      toast(`Could not send request: ${e.message}`, "error");
+    }
+  };
   const disconnectGoogleHandler = async () => {
     if (!googleConnection) return;
     setGoogleConnection(null);
@@ -2860,6 +2871,9 @@ export default function PuroductiveApp({ session }) {
             googleConnection={googleConnection} googleSyncing={googleSyncing}
             onConnectGoogle={connectGoogle} onDisconnectGoogle={disconnectGoogleHandler} onSyncGoogleNow={syncGoogleNow}
             onToggleGoogleAutoSync={toggleGoogleAutoSync}
+            onRequestGoogleAccess={requestGoogleAccess}
+            adminEmails={memberships.filter((m) => (m.role === "owner" || m.role === "admin") && m.status === "active").map((m) => m.email)}
+            isWorkspaceAdmin={myRole === "owner" || myRole === "admin"}
             automationTokens={automationTokens} freshAutomationToken={freshAutomationToken}
             onGenerateAutomationToken={generateAutomationToken} onRevokeAutomationToken={revokeAutomationToken}
             onDismissFreshToken={() => setFreshAutomationToken(null)}
@@ -4998,7 +5012,15 @@ const EVENT_TYPE_META = {
  * Connect is a full-page redirect to Google (no way around that — a consent
  * screen can't render in an iframe or a fetch response), so this card is
  * mostly status + a couple of buttons, not a form. */
-const GoogleCalendarCard = ({ connection, syncing, onConnect, onDisconnect, onSyncNow, onToggleAutoSync }) => (
+const GoogleCalendarCard = ({ connection, syncing, onConnect, onDisconnect, onSyncNow, onToggleAutoSync,
+  onRequestAccess, adminEmails = [], isWorkspaceAdmin }) => {
+  const [requested, setRequested] = useState(false);
+  const mailBody = "Hi,\n\nI'm trying to connect Google Calendar in Puroductive but I'm getting Google's " +
+    "\"Access blocked\" / \"unverified app\" screen instead of a sign-in prompt. Could you add my Google " +
+    "account as a test user? It's in Google Cloud Console → OAuth consent screen → Audience → Test users.\n\nThanks!";
+  const mailtoHref = `mailto:${adminEmails.join(",")}?subject=${encodeURIComponent("Add me as a Google Calendar test user")}&body=${encodeURIComponent(mailBody)}`;
+
+  return (
   <Card style={{ padding: "16px 20px", marginBottom: 20 }}>
     <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
       <div style={{ width: 38, height: 38, borderRadius: 11, flexShrink: 0, display: "grid", placeItems: "center",
@@ -5030,14 +5052,29 @@ const GoogleCalendarCard = ({ connection, syncing, onConnect, onDisconnect, onSy
       * refuses anyone not explicitly added as a test user, with its own raw
       * "Access blocked" / "unverified app" / 403 page — that happens on
       * Google's own domain, before any redirect back here, so there's no
-      * ?google=error to catch and turn into a nicer toast. A standing hint
-      * is the only thing that can reach someone hitting it. */}
+      * ?google=error to catch and turn into a nicer toast. This explains
+      * what's actually going on and — for anyone who isn't the admin
+      * themselves — a one-click way to reach whoever can fix it, so it
+      * reads as a process step rather than a bug report. */}
     {!connection && (
-      <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${T.lineSoft}`,
-        fontSize: 11.5, color: T.ink3, lineHeight: 1.55 }}>
-        Seeing "Access blocked" or "unverified app" from Google instead of a sign-in prompt? That means
-        the workspace owner hasn't added your Google account as a test user yet — ask them to do that in
-        Google Cloud Console, then try connecting again.
+      <div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${T.lineSoft}` }}>
+        <div style={{ fontSize: 11.5, color: T.ink3, lineHeight: 1.55 }}>
+          Seeing "Access blocked" or "unverified app" from Google instead of a sign-in prompt? That means
+          the workspace owner hasn't added your Google account as a test user yet — that's a one-time setup
+          step, not a bug.
+        </div>
+        {!isWorkspaceAdmin && (
+          <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+            <Btn small ghost disabled={requested} onClick={() => { onRequestAccess(); setRequested(true); }}>
+              <Bell size={13} /> {requested ? "Request sent" : "Notify workspace admin"}
+            </Btn>
+            {adminEmails.length > 0 && (
+              <Btn small ghost onClick={() => window.open(mailtoHref, "_blank")}>
+                <Send size={13} /> Or email them
+              </Btn>
+            )}
+          </div>
+        )}
       </div>
     )}
     {/* item 5 — background auto-sync is additive to the two mechanisms
@@ -5058,7 +5095,8 @@ const GoogleCalendarCard = ({ connection, syncing, onConnect, onDisconnect, onSy
       </label>
     )}
   </Card>
-);
+  );
+};
 
 /* ------------------------- CLOCK AUTOMATION (item 1) ------------------------
  * Personal webhook tokens for phone-side clock-in/out — Apple Shortcuts can
@@ -5137,6 +5175,7 @@ const ClockAutomationCard = ({ tokens, freshToken, onGenerate, onRevoke, onDismi
 const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, tasks, alertsOn, enableAlerts,
   events, projects, companies, members, groups, googleConnection, googleSyncing,
   onConnectGoogle, onDisconnectGoogle, onSyncGoogleNow, onToggleGoogleAutoSync,
+  onRequestGoogleAccess, adminEmails, isWorkspaceAdmin,
   automationTokens, freshAutomationToken, onGenerateAutomationToken, onRevokeAutomationToken, onDismissFreshToken,
   onAddEvent, onEditEvent, onDeleteEvent, onMarkDay, onOpenDay, onOpenProject }) => {
   const isMobile = useIsMobile();
@@ -5164,7 +5203,8 @@ const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, 
 
       <GoogleCalendarCard connection={googleConnection} syncing={googleSyncing}
         onConnect={onConnectGoogle} onDisconnect={onDisconnectGoogle} onSyncNow={onSyncGoogleNow}
-        onToggleAutoSync={onToggleGoogleAutoSync} />
+        onToggleAutoSync={onToggleGoogleAutoSync}
+        onRequestAccess={onRequestGoogleAccess} adminEmails={adminEmails} isWorkspaceAdmin={isWorkspaceAdmin} />
 
       <ClockAutomationCard tokens={automationTokens} freshToken={freshAutomationToken}
         onGenerate={onGenerateAutomationToken} onRevoke={onRevokeAutomationToken} onDismissFresh={onDismissFreshToken} />

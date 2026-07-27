@@ -107,18 +107,22 @@ Run these SQL files **in order** in your Supabase project's SQL editor:
     photo notes and task comments in one table (a note tagged with a task
     is a comment on it; an untagged one is a quick capture that "Turn into
     task" can promote later). Adds the `task-notes` storage bucket.
-17. In Supabase → Authentication → URL Configuration, set **Site URL** to
+17. [`supabase/schema_v17.sql`](supabase/schema_v17.sql) — a "Notify
+    workspace admin" button for anyone blocked by Google's unverified-app
+    screen — one click notifies every active owner/admin in-app, through
+    `request_google_calendar_access()`.
+18. In Supabase → Authentication → URL Configuration, set **Site URL** to
    your deployed URL (e.g. `https://mi1918.github.io/puroductive/`) and add
    it to **Redirect URLs**. This is what was sending confirmation-email links
    to `localhost` instead of the live site — Supabase redirects there by
    default regardless of what the app requests unless this is set. If you
    also develop locally, add `http://localhost:5173/puroductive/` (or
    whatever port Vite prints) to Redirect URLs too.
-18. In Supabase → Authentication → Providers, make sure Email is enabled. By
+19. In Supabase → Authentication → Providers, make sure Email is enabled. By
     default Supabase requires email confirmation on sign-up; either confirm via
     the email you receive, or turn "Confirm email" off in Authentication →
     Settings for faster local testing.
-19. Grab your Project URL and anon/public key from Project Settings → API.
+20. Grab your Project URL and anon/public key from Project Settings → API.
 
 ## Workspaces, invites and roles
 
@@ -235,6 +239,7 @@ supabase/
   schema_v14.sql          — optional time-of-day on task deadlines
   schema_v15.sql          — task editing + voluntary deadline extension log
   schema_v16.sql          — task notes / photo notes / task comments
+  schema_v17.sql          — "notify workspace admin" for Google Calendar access
   functions/              — Edge Functions: invite-member, google-oauth-start,
                             google-oauth-callback, google-calendar-sync,
                             google-calendar-cron, clock-webhook

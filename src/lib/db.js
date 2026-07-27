@@ -277,6 +277,14 @@ export async function dismissNotification(id) {
   await supabase.from("notifications").update({ dismissed_at: nowIso() }).eq("id", id).then(throwIfError);
 }
 
+/* "Ask an admin" for Google Calendar access (schema_v17) — notifies every
+ * active owner/admin of the workspace, so someone blocked by Google's
+ * unverified-app screen has a way to reach whoever can actually fix it. */
+export async function requestGoogleCalendarAccess(workspaceId) {
+  const { error } = await supabase.rpc("request_google_calendar_access", { p_workspace_id: workspaceId });
+  if (error) throw new Error(error.message);
+}
+
 /* Both go through RPCs rather than a plain update, because the row being
  * changed (workspace_members) isn't gated by "is this yours" RLS the way
  * notifications are — see schema_v6.sql's accept/decline functions for why
