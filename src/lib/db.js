@@ -42,7 +42,7 @@ const throwIfError = ({ error, data }) => {
 /* ------------------------------- mappers ---------------------------------- */
 const rowToCompany = (r) => ({
   id: r.id, name: r.name, industry: r.industry, location: r.location,
-  theme: JSON.parse(r.theme_json),
+  theme: JSON.parse(r.theme_json), sortOrder: r.sort_order ?? 0,
 });
 const rowToMember = (r, companyIds) => {
   const extra = JSON.parse(r.roles_json);
@@ -53,7 +53,7 @@ const rowToMember = (r, companyIds) => {
     competesOnLeaderboard: r.competes_on_leaderboard === undefined ? true : !!r.competes_on_leaderboard,
   };
 };
-const rowToGroup = (r) => ({ id: r.id, name: r.name, sortOrder: r.sort_order });
+const rowToGroup = (r) => ({ id: r.id, name: r.name, sortOrder: r.sort_order, companyId: r.company_id ?? null });
 const rowToEvent = (r) => ({
   id: r.id, title: r.title, type: r.event_type, date: r.event_date,
   startTime: r.start_time ?? "", endTime: r.end_time ?? "",
@@ -63,6 +63,7 @@ const rowToEvent = (r) => ({
 const rowToProject = (r) => ({
   id: r.id, companyId: r.company_id, name: r.name, type: r.type,
   baseline: r.baseline_percent, deadline: r.deadline, locked: !!r.locked_at, status: r.status,
+  sortOrder: r.sort_order ?? 0,
 });
 const rowToTask = (r) => ({
   id: r.id, projectId: r.project_id, title: r.title, assigneeId: r.assignee_id,
@@ -157,11 +158,18 @@ export async function createWorkspace(id, name) {
   /* The creator's own membership. Without this the workspace exists but
    * is_workspace_member() is false for everyone, including its creator, and
    * the next read would come back empty. */
+  const membershipId = "wm-" + uid();
   await supabase.from("workspace_members").insert({
-    id: "wm-" + uid(), workspace_id: id, user_id: user.id, email: (user.email || "").toLowerCase(),
+    id: membershipId, workspace_id: id, user_id: user.id, email: (user.email || "").toLowerCase(),
     role: "owner", status: "active", invited_by: user.id,
     updated_at: now, created_at: now, device_id: getDeviceId(),
   }).then(throwIfError);
+  /* item 2/7 — the creator lands on the Team roster too, not just teammates
+   * they later invite. Best-effort: a workspace that exists but whose owner
+   * isn't rostered yet is a far smaller problem than failing creation over
+   * it, so a failure here is swallowed the same way claim_workspace_invites
+   * swallows its own best-effort failures elsewhere in this file. */
+  await supabase.rpc("ensure_team_member_for_membership", { p_membership_id: membershipId }).then(null, () => {});
   return { id, name, kind: "team", createdBy: user.id, myRole: "owner" };
 }
 
@@ -224,6 +232,16 @@ export async function sendWorkspaceInviteEmail(workspaceId, email, role) {
   return { alreadyHadAccount: !!data?.alreadyHadAccount };
 }
 
+/* Ensures the caller has a Team roster entry for a membership that just
+ * became active (accepted invite, or a freshly created workspace's own
+ * owner membership — see createWorkspace above). No-op if one already
+ * exists. Returns the team_members id either way. */
+export async function ensureTeamMemberForMembership(membershipId) {
+  const { data, error } = await supabase.rpc("ensure_team_member_for_membership", { p_membership_id: membershipId });
+  if (error) throw new Error(error.message);
+  return data;
+}
+
 export async function updateMembershipRole(id, role) {
   await supabase.from("workspace_members")
     .update({ role, updated_at: nowIso(), device_id: getDeviceId() })
@@ -270,6 +288,29 @@ export async function dismissNotification(id) {
   await supabase.from("notifications").update({ dismissed_at: nowIso() }).eq("id", id).then(throwIfError);
 }
 
+/* ------------------------------- profile (v12) -----------------------------
+ * Purely self-scoped identity (full name + role/title) — not workspace data,
+ * so it's fetched once per session, not per active-workspace switch. Used to
+ * greet the signed-in user and to prefill their own Team roster entry the
+ * moment they join a workspace (see ensureTeamMemberForMembership above). */
+const rowToProfile = (r) => ({ fullName: r.full_name, jobRole: r.job_role });
+
+export async function fetchMyProfile() {
+  const row = await supabase.from("profiles").select("*").maybeSingle().then(throwIfError);
+  return row ? rowToProfile(row) : null;
+}
+
+export async function upsertProfile({ fullName, jobRole }) {
+  const { data: userData } = await supabase.auth.getUser();
+  const user = userData?.user;
+  if (!user) throw new Error("Not signed in");
+  const now = nowIso();
+  await supabase.from("profiles").upsert({
+    user_id: user.id, full_name: fullName.trim(), job_role: jobRole.trim(),
+    updated_at: now, created_at: now,
+  }).then(throwIfError);
+}
+
 /* Both go through RPCs rather than a plain update, because the row being
  * changed (workspace_members) isn't gated by "is this yours" RLS the way
  * notifications are — see schema_v6.sql's accept/decline functions for why
@@ -290,9 +331,9 @@ export async function declineInvite(membershipId) {
  * channels table — groups already are the team-subdivision concept this
  * would otherwise duplicate. */
 const rowToMessage = (r) => ({
-  id: r.id, workspaceId: r.workspace_id, groupId: r.group_id ?? null,
+  id: r.id, workspaceId: r.workspace_id, groupId: r.group_id ?? null, channelId: r.channel_id ?? null,
   authorId: r.author_id, authorMemberId: r.author_member_id ?? null,
-  body: r.body, at: r.created_at,
+  body: r.body, pinned: !!r.pinned, pinNote: r.pin_note ?? null, at: r.created_at,
 });
 
 export async function fetchChatMessages(groupId, limit = 100) {
@@ -318,6 +359,81 @@ export async function deleteChatMessage(id) {
   await supabase.from("chat_messages")
     .update({ deleted_at: nowIso(), updated_at: nowIso(), device_id: getDeviceId() })
     .eq("id", id).then(throwIfError);
+}
+
+/* item 16 — pinning goes through the RPC (schema_v14), never a plain update,
+ * so "who can pin" can stay broader than "who can delete" without a second
+ * UPDATE policy accidentally widening who can edit/soft-delete a message. */
+export async function togglePinChatMessage(messageId, pinned, note = null) {
+  const { error } = await supabase.rpc("toggle_chat_message_pin", {
+    p_message_id: messageId, p_pinned: pinned, p_note: note || null,
+  });
+  if (error) throw new Error(error.message);
+}
+
+/* ----------------------- ad-hoc / DM chat channels (v14) --------------------
+ * A second, independent scoping axis from group_id above — General and
+ * department channels are visible to everyone in scope by design; a
+ * chat_channel is visible only to the people explicitly added to it (see
+ * chat_channel_members + is_chat_channel_member() RLS). This is what makes a
+ * "new chat with these specific people" or a 1:1 "whisper" actually private,
+ * not just unlisted. */
+const rowToChatChannel = (r) => ({
+  id: r.id, workspaceId: r.workspace_id, companyId: r.company_id ?? null,
+  name: r.name ?? null, isDm: !!r.is_dm, createdBy: r.created_by, at: r.created_at,
+});
+const rowToChannelMember = (r) => ({ id: r.id, channelId: r.channel_id, memberId: r.member_id, userId: r.user_id });
+
+/* RLS already restricts chat_channels to ones I participate in, so this is
+ * "all my ad-hoc/DM channels", not a workspace-wide list. */
+export async function fetchChatChannels() {
+  const channels = await notDeleted(supabase.from("chat_channels").select("*"))
+    .order("created_at", { ascending: false }).then(throwIfError);
+  const ids = channels.map((c) => c.id);
+  const memberRows = ids.length
+    ? await supabase.from("chat_channel_members").select("*").in("channel_id", ids).then(throwIfError)
+    : [];
+  return { channels: channels.map(rowToChatChannel), members: memberRows.map(rowToChannelMember) };
+}
+
+/* `participants` is [{ memberId, userId }] — resolved by the caller from
+ * workspace_members (already loaded there), since a participant only ever
+ * makes sense as someone with an actual account: there'd be no way for
+ * anyone else to ever read a private channel they were "added" to. */
+export async function createChatChannel({ name, isDm, companyId, participants }) {
+  const now = nowIso();
+  const { data: userData } = await supabase.auth.getUser();
+  const channelId = "cc-" + uid();
+  const channelRow = {
+    id: channelId, workspace_id: ws(), company_id: companyId || null,
+    name: name || null, is_dm: !!isDm, created_by: userData?.user?.id,
+    updated_at: now, created_at: now,
+  };
+  await supabase.from("chat_channels").insert(channelRow).then(throwIfError);
+  const memberRows = participants.map((p) => ({
+    id: "ccm-" + uid(), channel_id: channelId, workspace_id: ws(),
+    member_id: p.memberId, user_id: p.userId, created_at: now,
+  }));
+  await supabase.from("chat_channel_members").insert(memberRows).then(throwIfError);
+  return { channel: rowToChatChannel(channelRow), members: memberRows.map(rowToChannelMember) };
+}
+
+export async function fetchChannelMessages(channelId, limit = 100) {
+  const rows = await scoped(supabase.from("chat_messages").select("*").eq("channel_id", channelId))
+    .order("created_at", { ascending: false }).limit(limit).then(throwIfError);
+  return rows.reverse().map(rowToMessage);
+}
+
+export async function sendChannelMessage(channelId, body, authorMemberId = null) {
+  const now = nowIso();
+  const { data: userData } = await supabase.auth.getUser();
+  const row = {
+    id: "cm-" + uid(), workspace_id: ws(), channel_id: channelId, group_id: null,
+    author_id: userData?.user?.id, author_member_id: authorMemberId,
+    body, updated_at: now, created_at: now, device_id: getDeviceId(),
+  };
+  await supabase.from("chat_messages").insert(row).then(throwIfError);
+  return rowToMessage(row);
 }
 
 /* --------------------------- Google Calendar sync --------------------------
@@ -475,7 +591,7 @@ export async function insertCompany(c) {
   const now = nowIso();
   await supabase.from("companies").insert({
     id: c.id, name: c.name, industry: c.industry || null, location: c.location || null,
-    theme_json: JSON.stringify(c.theme), workspace_id: ws(),
+    theme_json: JSON.stringify(c.theme), sort_order: c.sortOrder ?? 0, workspace_id: ws(),
     updated_at: now, created_at: now, device_id: getDeviceId(),
   }).then(throwIfError);
 }
@@ -487,6 +603,12 @@ export async function updateCompany(c) {
 }
 export async function softDeleteCompany(id) {
   await supabase.from("companies").update({ deleted_at: nowIso(), updated_at: nowIso(), device_id: getDeviceId() })
+    .eq("id", id).then(throwIfError);
+}
+/* Drag-reorder write — its own call, mirroring updateTaskQueueOrder's
+ * reasoning: never round-trips the rest of the row just to move it. */
+export async function updateCompanySortOrder(id, sortOrder) {
+  await supabase.from("companies").update({ sort_order: sortOrder, updated_at: nowIso(), device_id: getDeviceId() })
     .eq("id", id).then(throwIfError);
 }
 
@@ -534,13 +656,14 @@ export async function setMemberCompanies(memberId, companyIds) {
 export async function insertGroup(g) {
   const now = nowIso();
   await supabase.from("member_groups").insert({
-    id: g.id, name: g.name, sort_order: g.sortOrder ?? 0, workspace_id: ws(),
+    id: g.id, name: g.name, sort_order: g.sortOrder ?? 0, company_id: g.companyId || null, workspace_id: ws(),
     updated_at: now, created_at: now, device_id: getDeviceId(),
   }).then(throwIfError);
 }
 export async function updateGroup(g) {
-  await supabase.from("member_groups").update({ name: g.name, updated_at: nowIso(), device_id: getDeviceId() })
-    .eq("id", g.id).then(throwIfError);
+  await supabase.from("member_groups").update({
+    name: g.name, company_id: g.companyId || null, updated_at: nowIso(), device_id: getDeviceId(),
+  }).eq("id", g.id).then(throwIfError);
 }
 export async function softDeleteGroup(id) {
   await supabase.from("member_groups").update({ deleted_at: nowIso(), updated_at: nowIso(), device_id: getDeviceId() })
@@ -641,6 +764,46 @@ export async function attachTaskCompletionPhoto(taskId, path) {
     .eq("id", taskId).then(throwIfError);
 }
 
+/* -------------------------------- task notes (v13, item 10) -----------------
+ * A running log per task, separate from the one-line title — optionally with
+ * a photo. Append-only (no update/delete policy, same shape as
+ * task_request_events): a note is a small permanent record, not a draft you
+ * edit in place. */
+const rowToTaskNote = (r) => ({
+  id: r.id, taskId: r.task_id, projectId: r.project_id, authorId: r.author_id,
+  body: r.body, photoPath: r.photo_path ?? null, at: r.created_at,
+});
+
+export async function fetchTaskNotes(taskId) {
+  const rows = await scoped(supabase.from("task_notes").select("*").eq("task_id", taskId))
+    .order("created_at").then(throwIfError);
+  return rows.map(rowToTaskNote);
+}
+
+export async function insertTaskNote({ taskId, projectId, body, photoPath }) {
+  const now = nowIso();
+  const { data: userData } = await supabase.auth.getUser();
+  const row = {
+    id: "tn-" + uid(), workspace_id: ws(), project_id: projectId, task_id: taskId,
+    author_id: userData?.user?.id, body: body || "", photo_path: photoPath || null, created_at: now,
+  };
+  await supabase.from("task_notes").insert(row).then(throwIfError);
+  return rowToTaskNote(row);
+}
+
+/* Same bucket/path convention as uploadTaskCompletionPhoto — its own bucket
+ * ('task-notes') since a note's photo is a different thing than the one
+ * "proof of completion" photo a task can carry. */
+export async function uploadTaskNotePhoto(taskId, file) {
+  const workspaceId = ws();
+  const ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+  const path = `${workspaceId}/${taskId}/${uid()}.${ext}`;
+  const { error } = await supabase.storage.from("task-notes")
+    .upload(path, file, { cacheControl: "3600", upsert: false });
+  if (error) throw new Error(`Photo upload failed: ${error.message}`);
+  return path;
+}
+
 /* ----------------------------- transitions ---------------------------------- */
 export async function recordTransition(tr) {
   await supabase.from("task_transitions").insert({
@@ -662,6 +825,23 @@ export async function updateHandoffStatus(id, status) {
     .eq("id", id).then(throwIfError);
 }
 
+/* --------------------------- deadline extensions (item 9) -------------------
+ * The reflective counterpart to RESCHEDULE — same idea as the mandatory
+ * "what went wrong" reflection an overdue task demands, but for "why is a
+ * still-open task's deadline moving": what changed, how far it actually got,
+ * and what happens between now and the new date. Append-only, no update
+ * policy — a permanent record of every deadline pushed, not just the latest. */
+export async function insertDeadlineExtension({ taskId, projectId, oldDeadline, newDeadline, whatChanged, progressSoFar, planToHold }) {
+  const row = {
+    id: "de-" + uid(), task_id: taskId, project_id: projectId, workspace_id: ws(),
+    old_deadline: oldDeadline, new_deadline: newDeadline,
+    what_changed: whatChanged, progress_so_far: progressSoFar, plan_to_hold: planToHold,
+    created_at: nowIso(),
+  };
+  await supabase.from("deadline_extensions").insert(row).then(throwIfError);
+  return row;
+}
+
 /* ------------------------------ reflections --------------------------------- */
 export async function insertReflection(r) {
   await supabase.from("reflections").insert({
@@ -677,8 +857,8 @@ export async function insertProject(p) {
   await supabase.from("projects").insert({
     id: p.id, company_id: p.companyId, name: p.name, type: p.type,
     baseline_percent: p.baseline, deadline: p.deadline || null,
-    locked_at: p.locked ? now : null, status: p.status ?? "active", workspace_id: ws(),
-    updated_at: now, created_at: now, device_id: getDeviceId(),
+    locked_at: p.locked ? now : null, status: p.status ?? "active", sort_order: p.sortOrder ?? 0,
+    workspace_id: ws(), updated_at: now, created_at: now, device_id: getDeviceId(),
   }).then(throwIfError);
 }
 export async function updateProject(p) {
@@ -687,6 +867,15 @@ export async function updateProject(p) {
     locked_at: p.locked ? nowIso() : null, status: p.status ?? "active",
     updated_at: nowIso(), device_id: getDeviceId(),
   }).eq("id", p.id).then(throwIfError);
+}
+export async function softDeleteProject(id) {
+  await supabase.from("projects").update({ deleted_at: nowIso(), updated_at: nowIso(), device_id: getDeviceId() })
+    .eq("id", id).then(throwIfError);
+}
+/* Drag-reorder write — same reasoning as updateCompanySortOrder above. */
+export async function updateProjectSortOrder(id, sortOrder) {
+  await supabase.from("projects").update({ sort_order: sortOrder, updated_at: nowIso(), device_id: getDeviceId() })
+    .eq("id", id).then(throwIfError);
 }
 
 /* --------------------------- calendar exceptions ------------------------------
@@ -739,7 +928,7 @@ export async function updateSessionLogout(id, logoutAt) {
 const rowToPost = (r) => ({
   id: r.id, authorId: r.author_id, authorMemberId: r.author_member_id ?? null,
   kind: r.kind, caption: r.caption ?? "", projectId: r.project_id ?? null,
-  taskId: r.task_id ?? null, pinned: !!r.pinned, at: r.created_at,
+  taskId: r.task_id ?? null, pinned: !!r.pinned, companyId: r.company_id ?? null, at: r.created_at,
 });
 const rowToMedia = (r) => ({
   id: r.id, postId: r.post_id, path: r.storage_path, mediaType: r.media_type, sortOrder: r.sort_order,
@@ -851,7 +1040,8 @@ export async function insertPost(p) {
     author_member_id: p.authorMemberId || null,
     kind: p.kind, caption: p.caption || "",
     project_id: p.projectId || null, task_id: p.taskId || null,
-    pinned: p.pinned ? 1 : 0, updated_at: now, created_at: now, device_id: getDeviceId(),
+    pinned: p.pinned ? 1 : 0, company_id: p.companyId || null,
+    updated_at: now, created_at: now, device_id: getDeviceId(),
   };
   await supabase.from("posts").insert(row).then(throwIfError);
   return rowToPost(row);
@@ -859,6 +1049,13 @@ export async function insertPost(p) {
 export async function softDeletePost(id) {
   await supabase.from("posts")
     .update({ deleted_at: nowIso(), updated_at: nowIso(), device_id: getDeviceId() })
+    .eq("id", id).then(throwIfError);
+}
+/* item 16 — pinned existed as a column since schema_v5 but nothing ever set
+ * it; this is the one write path for it. */
+export async function updatePostPinned(id, pinned) {
+  await supabase.from("posts")
+    .update({ pinned: pinned ? 1 : 0, updated_at: nowIso(), device_id: getDeviceId() })
     .eq("id", id).then(throwIfError);
 }
 

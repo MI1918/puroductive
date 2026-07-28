@@ -10,10 +10,11 @@ import {
   BarChart2, HelpCircle, PartyPopper, ArrowRightLeft, Paperclip,
   Crown, Medal, Zap, MessageCircle, Hash,
   GripVertical, Pause, Camera, Copy, KeyRound, Smartphone, Award,
+  Pin, PinOff, ChevronDown, StickyNote, Search, Palette,
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient.js";
 import * as db from "./lib/db.js";
-import { getInitialTheme, applyTheme } from "./lib/theme.js";
+import { getInitialTheme, applyTheme, applyAccent, getStoredAccent, storeAccent } from "./lib/theme.js";
 
 /* ============================================================================
  * PURODUCTIVE — Phase 3: Logic Engines wired into the light fintech UI.
@@ -60,13 +61,63 @@ const GRAIN =
 const MOLD_MESH = ["#D8D9D2", "#AFB2A6", "#82857A"];
 const MOLD_INK = "#3F423A";
 
+/* item 5 — 12 presets now instead of 5, same {key,label,primary,ink,mesh:[3]}
+ * shape used for a company's own theme and (v14) the per-workspace personal
+ * accent — one color model, two use sites (CompanyForm and the accent
+ * picker), via the shared ColorPicker component below. */
 const THEME_PRESETS = [
   { key: "lime",    label: "Fresh Lime", primary: "#7CB518", ink: "#243305", mesh: ["#E9FBB7", "#C6F04D", "#8FD14F"] },
   { key: "mint",    label: "Sea Mint",   primary: "#0E9F6E", ink: "#093826", mesh: ["#D9FBEA", "#8FE3BE", "#4CC694"] },
   { key: "apricot", label: "Apricot",    primary: "#D97706", ink: "#4A2A03", mesh: ["#FDEED3", "#FBD38D", "#F6AD55"] },
   { key: "sky",     label: "Glass Sky",  primary: "#0284C7", ink: "#062F44", mesh: ["#DDF3FE", "#A5DFF9", "#67C3F0"] },
   { key: "lilac",   label: "Soft Lilac", primary: "#7C5CDB", ink: "#291D52", mesh: ["#EEE9FD", "#D3C6F8", "#B3A0F2"] },
+  { key: "coral",   label: "Coral",      primary: "#E85D4E", ink: "#4A1710", mesh: ["#FDE2DC", "#F5A99A", "#EE7D68"] },
+  { key: "rose",    label: "Rose",       primary: "#DB4C77", ink: "#4A0F26", mesh: ["#FCE4EE", "#F5A8C4", "#E8749D"] },
+  { key: "amber",   label: "Amber",      primary: "#C9962C", ink: "#3D2B04", mesh: ["#FBF0D6", "#F0D48A", "#E0B354"] },
+  { key: "teal",    label: "Deep Teal",  primary: "#0D9488", ink: "#062F2C", mesh: ["#D7F5F0", "#8FE0D3", "#4CBFAE"] },
+  { key: "indigo",  label: "Indigo",     primary: "#4F46E5", ink: "#1E1B4B", mesh: ["#E4E3FD", "#B8B4F8", "#8A83F0"] },
+  { key: "slate",   label: "Slate",      primary: "#475569", ink: "#1E2531", mesh: ["#E7EBEF", "#C2CCD6", "#94A3B4"] },
+  { key: "plum",    label: "Plum",       primary: "#9333A6", ink: "#34093E", mesh: ["#F3E1F7", "#DDA8E8", "#C773D6"] },
 ];
+
+/* -------------------------- custom color derivation -------------------------
+ * Turns one picked hex into the full {primary, ink, mesh:[3]} shape above —
+ * fixed lightness steps at the picked hue/saturation, so the result always
+ * reads as a coherent theme regardless of exactly how light or dark the
+ * picked color was (a near-black or near-white pick still derives a usable
+ * mid-tone primary and a legible dark ink). */
+function hexToHsl(hex) {
+  const r = parseInt(hex.slice(1, 3), 16) / 255, g = parseInt(hex.slice(3, 5), 16) / 255, b = parseInt(hex.slice(5, 7), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h = 0, s = 0; const l = (max + min) / 2;
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+  }
+  return [h, s * 100, l * 100];
+}
+function hslToHex(h, s, l) {
+  s /= 100; l /= 100;
+  const k = (n) => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const toHex = (x) => Math.round(255 * x).toString(16).padStart(2, "0");
+  return `#${toHex(f(0))}${toHex(f(8))}${toHex(f(4))}`;
+}
+function deriveThemeFromHex(hex) {
+  const [h, rawSat] = hexToHsl(hex);
+  const sat = Math.min(Math.max(rawSat, 40), 75);
+  return {
+    key: "custom", label: "Custom", custom: true,
+    primary: hslToHex(h, sat, 42),
+    ink: hslToHex(h, Math.min(sat, 70), 14),
+    mesh: [hslToHex(h, Math.max(sat - 15, 25), 90), hslToHex(h, sat, 78), hslToHex(h, sat, 62)],
+  };
+}
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 const todayIso = () => new Date().toISOString().slice(0, 10);
@@ -1145,9 +1196,14 @@ const Btn = ({ children, onClick, ghost, danger, small, ink = false, type = "but
          * which would turn this into a light button with invisible white
          * text on it. */
         ? { background: "#16181D", color: "#FFFFFF", border: "none", boxShadow: T.shadowMd }
-        : { color: "#243305", border: "1px solid rgba(36,51,5,0.12)",
-            boxShadow: "0 2px 6px rgba(124,181,24,0.25), 0 10px 24px -10px rgba(124,181,24,0.5)",
-            ...meshBackground(["#E9FBB7", "#C6F04D", "#A4E24B"]) }),
+        /* item 4 — these six read from the per-workspace accent CSS vars
+         * (applyAccent in lib/theme.js), not literals, so every primary
+         * button in the app reflects whichever color a user picked for the
+         * workspace they're currently in. Defaults to today's lime until
+         * someone personalizes it. */
+        : { color: "var(--lime-ink)", border: "1px solid color-mix(in srgb, var(--lime-deep) 12%, transparent)",
+            boxShadow: "0 2px 6px color-mix(in srgb, var(--lime-deep) 25%, transparent), 0 10px 24px -10px color-mix(in srgb, var(--lime-deep) 50%, transparent)",
+            ...meshBackground(["var(--lime-mesh-1)", "var(--lime-mesh-2)", "var(--lime-mesh-3)"]) }),
     }}>
     {!ghost && !danger && !ink && <GrainOverlay opacity={0.22} radius={12} />}
     <span style={{ position: "relative", display: "inline-flex", alignItems: "center", gap: 8 }}>{children}</span>
@@ -1268,9 +1324,81 @@ const InterventionModal = ({ task, project, onSubmit }) => {
 /* ============================================================================
  * ENGINE 4 — HANDOFF / RETRY LOOP UI
  * ==========================================================================*/
-const ReassignModal = ({ task, members, companies, onConfirm, onClose }) => {
+/* ----------------------- MEMBER PICKER (item 12) ---------------------------
+ * A searchable, department-grouped alternative to a bare <select> or a long
+ * unfiltered list of cards — used anywhere a task needs an assignee, so
+ * finding the right person out of a big roster stops being a scroll hunt.
+ * "Assign to me" is one click rather than searching for your own name. */
+const MemberPickerList = ({ members, groups, companies, value, onChange, myMemberId,
+  allowSelf = true, allowUnassigned = true, unassignedLabel = "Unassigned" }) => {
+  const [query, setQuery] = useState("");
+  const q = query.trim().toLowerCase();
+  const filtered = members.filter((m) => !q || m.name.toLowerCase().includes(q) || m.roles.some((r) => r.toLowerCase().includes(q)));
+  const groupName = (m) => groups.find((g) => g.id === m.groupId)?.name ?? "Ungrouped";
+  const sorted = [...filtered].sort((a, b) => groupName(a).localeCompare(groupName(b)) || a.name.localeCompare(b.name));
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+        <div style={{ position: "relative", flex: 1, minWidth: 160 }}>
+          <Search size={13} style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: T.ink3, pointerEvents: "none" }} />
+          <input style={{ ...inputStyle, paddingLeft: 32, minHeight: 38 }} value={query}
+            onChange={(e) => setQuery(e.target.value)} placeholder="Search by name or role…" />
+        </div>
+        {allowSelf && myMemberId && (
+          <Btn small ghost onClick={() => onChange(myMemberId)}><UserCheck size={13} /> Assign to me</Btn>
+        )}
+      </div>
+      <div className="pd-scroll" style={{ display: "grid", gap: 7, maxHeight: 280, overflowY: "auto", paddingRight: 2 }}>
+        {allowUnassigned && (
+          <button type="button" onClick={() => onChange("")} className="pd-press" style={{
+            display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderRadius: 11,
+            cursor: "pointer", textAlign: "left",
+            background: !value ? "#F4FBE3" : T.card, border: `1px solid ${!value ? "#C9E88A" : T.line}`,
+          }}>
+            <span style={{ flex: 1, fontSize: 12.5, color: T.ink2 }}>{unassignedLabel}</span>
+            {!value && <Check size={14} style={{ color: T.limeDeep }} />}
+          </button>
+        )}
+        {sorted.map((m) => {
+          const on = value === m.id;
+          const co = companies.find((c) => c.id === m.companyIds[0]);
+          return (
+            <button type="button" key={m.id} onClick={() => onChange(m.id)} className="pd-press" style={{
+              display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderRadius: 11,
+              cursor: "pointer", textAlign: "left",
+              background: on ? "#F4FBE3" : T.card, border: `1px solid ${on ? "#C9E88A" : T.line}`,
+            }}>
+              <Mesh mesh={co?.theme.mesh ?? THEME_PRESETS[0].mesh} style={{
+                width: 28, height: 28, borderRadius: 8, flexShrink: 0, display: "grid", placeItems: "center",
+                border: "1px solid rgba(22,24,29,0.07)",
+              }}>
+                <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 11, color: co?.theme.ink ?? "#243305" }}>{m.name[0]}</span>
+              </Mesh>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 600, color: T.ink, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  {m.name}
+                  {m.id === myMemberId && <Chip>You</Chip>}
+                  {m.defaultDelegate && <Chip accent={T.limeDeep}><ShieldCheck size={9} /></Chip>}
+                  {m.external && <Chip><Globe size={9} /></Chip>}
+                </div>
+                <div style={{ fontSize: 10.5, color: T.ink3, marginTop: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {groupName(m)}{m.roles.length ? ` · ${m.roles.join(", ")}` : ""}
+                </div>
+              </div>
+              {on && <Check size={14} style={{ color: T.limeDeep, flexShrink: 0 }} />}
+            </button>
+          );
+        })}
+        {sorted.length === 0 && <span style={{ fontSize: 11.5, color: T.ink3, padding: "6px 4px" }}>No matches.</span>}
+      </div>
+    </div>
+  );
+};
+
+const ReassignModal = ({ task, members, groups, companies, myMemberId, onConfirm, onClose }) => {
   const raj = members.find((m) => m.defaultDelegate);
-  const [toId, setToId] = useState(raj?.id ?? members[0]?.id);
+  const [toId, setToId] = useState(raj?.id ?? members[0]?.id ?? "");
   const [reason, setReason] = useState("");
   const [newDeadline, setNewDeadline] = useState("");
   return (
@@ -1279,37 +1407,8 @@ const ReassignModal = ({ task, members, companies, onConfirm, onClose }) => {
       <div style={{ display: "grid", gap: 18 }}>
         <div>
           <Label>Hand off to</Label>
-          <div style={{ display: "grid", gap: 8 }}>
-            {members.map((m) => {
-              const on = toId === m.id;
-              const co = companies.find((c) => c.id === m.companyIds[0]);
-              return (
-                <button key={m.id} onClick={() => setToId(m.id)} className="pd-press" style={{
-                  display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", borderRadius: 13,
-                  cursor: "pointer", textAlign: "left",
-                  background: on ? "#F4FBE3" : T.card,
-                  border: `1px solid ${on ? "#C9E88A" : T.line}`,
-                  transition: "background 140ms ease-out",
-                }}>
-                  <Mesh mesh={co?.theme.mesh ?? THEME_PRESETS[0].mesh} style={{
-                    width: 34, height: 34, borderRadius: 10, display: "grid", placeItems: "center",
-                    border: "1px solid rgba(22,24,29,0.07)",
-                  }}>
-                    <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 13, color: co?.theme.ink ?? "#243305" }}>{m.name[0]}</span>
-                  </Mesh>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13.5, fontWeight: 600, color: T.ink, display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
-                      {m.name}
-                      {m.defaultDelegate && <Chip accent={T.limeDeep}><ShieldCheck size={10} /> Default delegate</Chip>}
-                      {m.external && <Chip><Globe size={10} /> External</Chip>}
-                    </div>
-                    <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 2 }}>{m.roles.join(" · ")}</div>
-                  </div>
-                  {on && <Check size={16} style={{ color: T.limeDeep }} />}
-                </button>
-              );
-            })}
-          </div>
+          <MemberPickerList members={members} groups={groups} companies={companies}
+            value={toId} onChange={setToId} myMemberId={myMemberId} allowUnassigned={false} />
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14 }}>
           <div><Label>Reason</Label>
@@ -1321,7 +1420,7 @@ const ReassignModal = ({ task, members, companies, onConfirm, onClose }) => {
         </div>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
           <Btn ghost onClick={onClose}>Back</Btn>
-          <Btn onClick={() => onConfirm({ toAssigneeId: toId, reason, newDeadline: newDeadline || undefined })}>
+          <Btn disabled={!toId} onClick={() => onConfirm({ toAssigneeId: toId, reason, newDeadline: newDeadline || undefined })}>
             <UserCheck size={15} /> Confirm handoff
           </Btn>
         </div>
@@ -1330,16 +1429,41 @@ const ReassignModal = ({ task, members, companies, onConfirm, onClose }) => {
   );
 };
 
-const RescheduleModal = ({ onConfirm, onClose }) => {
+/* item 9/17 — the same reflective rigor an overdue task's completion already
+ * demands (InterventionModal), applied to moving a still-open deadline:
+ * what changed, how far it actually got, and what's different this time so
+ * it holds. Logged permanently to deadline_extensions (schema already
+ * provisioned this table and its RLS — this is the first thing to write to
+ * it), independent of the RESCHEDULE state transition itself. */
+const RescheduleModal = ({ task, onConfirm, onClose }) => {
   const [d, setD] = useState("");
+  const [whatChanged, setWhatChanged] = useState("");
+  const [progressSoFar, setProgressSoFar] = useState("");
+  const [planToHold, setPlanToHold] = useState("");
+  const ready = !!d && whatChanged.trim() && progressSoFar.trim() && planToHold.trim();
   return (
-    <Modal title="Reschedule attempt" onClose={onClose} subtitle="Same assignee, fresh attempt window.">
-      <div style={{ display: "grid", gap: 18 }}>
+    <Modal title="Reschedule attempt" onClose={onClose}
+      subtitle={`Currently due ${task.deadline || "—"} · same assignee, a fresh attempt window.`}>
+      <div style={{ display: "grid", gap: 16 }}>
         <div><Label>New attempt deadline</Label>
           <input type="date" min={todayIso()} style={inputStyle} value={d} onChange={(e) => setD(e.target.value)} /></div>
+        <div><Label>What changed since the original deadline?</Label>
+          <textarea rows={2} style={{ ...inputStyle, minHeight: 60, paddingTop: 11, resize: "vertical" }}
+            value={whatChanged} onChange={(e) => setWhatChanged(e.target.value)}
+            placeholder="e.g. Vendor delayed the raw material delivery by a week" /></div>
+        <div><Label>Progress so far</Label>
+          <textarea rows={2} style={{ ...inputStyle, minHeight: 60, paddingTop: 11, resize: "vertical" }}
+            value={progressSoFar} onChange={(e) => setProgressSoFar(e.target.value)}
+            placeholder="What's actually done already" /></div>
+        <div><Label>Plan to hold the new date</Label>
+          <textarea rows={2} style={{ ...inputStyle, minHeight: 60, paddingTop: 11, resize: "vertical" }}
+            value={planToHold} onChange={(e) => setPlanToHold(e.target.value)}
+            placeholder="What's different this time so it doesn't slip again" /></div>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
           <Btn ghost onClick={onClose}>Back</Btn>
-          <Btn disabled={!d} onClick={() => onConfirm(d)}><CalendarClock size={15} /> Reschedule</Btn>
+          <Btn disabled={!ready} onClick={() => onConfirm({
+            newDeadline: d, whatChanged: whatChanged.trim(), progressSoFar: progressSoFar.trim(), planToHold: planToHold.trim(),
+          })}><CalendarClock size={15} /> Reschedule</Btn>
         </div>
       </div>
     </Modal>
@@ -1427,6 +1551,52 @@ const Confetti = ({ trigger, big }) => {
   );
 };
 
+/* ============================================================================
+ * PROFILE GATE (v12, items 7/22) — a one-time, blocking "who are you" step
+ * right after sign-up. Separate from AuthGate's email/password (an *account*
+ * credential): this is the *identity* every workspace needs in order to add
+ * you to its Team roster automatically the moment you join it (see
+ * ensureTeamMemberForMembership in lib/db.js) and to greet you by name.
+ * Shown once — there's no skip and no dismiss, only forward.
+ * ==========================================================================*/
+const ProfileGateScreen = ({ onSave }) => {
+  const [fullName, setFullName] = useState("");
+  const [jobRole, setJobRole] = useState("");
+  const [busy, setBusy] = useState(false);
+  const valid = fullName.trim().length > 1 && jobRole.trim().length > 1;
+  const submit = async () => {
+    if (!valid || busy) return;
+    setBusy(true);
+    await onSave({ fullName: fullName.trim(), jobRole: jobRole.trim() });
+  };
+  return (
+    <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: T.bg, padding: 20 }}>
+      <Card style={{ width: "100%", maxWidth: 400, padding: 32 }}>
+        <h1 style={{ margin: "0 0 6px", fontFamily: T.fontDisplay, fontSize: 21, fontWeight: 700, color: T.ink }}>
+          Welcome to Puroductive
+        </h1>
+        <p style={{ margin: "0 0 22px", fontSize: 13, color: T.ink2, lineHeight: 1.55 }}>
+          Tell us who you are — this is what teammates see the moment you join a workspace
+          (added straight to its Team roster), and what lets the app greet you by name.
+        </p>
+        <div style={{ display: "grid", gap: 16 }}>
+          <div><Label>Full name</Label>
+            <input autoFocus style={inputStyle} value={fullName} placeholder="e.g. Aiko Tanaka"
+              onChange={(e) => setFullName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()} /></div>
+          <div><Label>Role / title</Label>
+            <input style={inputStyle} value={jobRole} placeholder="e.g. Operations Manager"
+              onChange={(e) => setJobRole(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()} /></div>
+        </div>
+        <div style={{ display: "flex", justifyContent: "center", marginTop: 22 }}>
+          <Btn disabled={!valid || busy} onClick={submit}><Check size={15} /> {busy ? "Saving…" : "Continue"}</Btn>
+        </div>
+      </Card>
+    </div>
+  );
+};
+
 /* =============================== MAIN APP ================================= */
 export default function PuroductiveApp({ session }) {
   const [companies, setCompanies] = useState([]);
@@ -1471,6 +1641,25 @@ export default function PuroductiveApp({ session }) {
     if (tourStorageKey) localStorage.setItem(tourStorageKey, "1");
   };
 
+  /* --------------------------- profile gate (v12) --------------------------
+   * `undefined` = still checking, `null` = no profile row yet (blocks the
+   * whole app behind ProfileGateScreen), an object = loaded. Independent of
+   * which workspace is active — this is account-level identity, checked
+   * exactly once per sign-in. */
+  const [profile, setProfile] = useState(undefined);
+  useEffect(() => {
+    db.fetchMyProfile().then(setProfile).catch(() => setProfile(null));
+  }, []);
+  const saveProfile = async ({ fullName, jobRole }) => {
+    try {
+      await db.upsertProfile({ fullName, jobRole });
+      setProfile({ fullName, jobRole });
+      toast(`Welcome, ${fullName.split(" ")[0]} — your daily task manager assistant is ready.`);
+    } catch (e) {
+      toast(`Could not save your profile: ${e.message}`, "error");
+    }
+  };
+
   /* --------------------------- workspaces (v4) ----------------------------
    * The workspace is chosen before any data loads, because every query is
    * filtered by it. `null` means "still discovering which workspaces this
@@ -1487,6 +1676,25 @@ export default function PuroductiveApp({ session }) {
   const myMembership = memberships.find((m) => (m.email || "").toLowerCase() === (session?.user?.email || "").toLowerCase());
   const myMemberId = myMembership?.memberId ?? null;
 
+  /* item 4 — a personal, per-workspace accent color, independent of the
+   * dark/light toggle. Re-read and (re)applied whenever the active
+   * workspace changes, so two workspaces can look distinct from each other
+   * at a glance without touching anything server-side — this is purely a
+   * device-local preference, same storage shape as dark/light mode. */
+  const [accentTheme, setAccentTheme] = useState(THEME_PRESETS[0]);
+  useEffect(() => {
+    if (!workspaceId) return;
+    const stored = getStoredAccent(workspaceId, THEME_PRESETS[0]);
+    setAccentTheme(stored);
+    applyAccent(stored);
+  }, [workspaceId]);
+  const chooseAccent = (theme) => {
+    setAccentTheme(theme);
+    applyAccent(theme);
+    storeAccent(workspaceId, theme);
+    setModal(null);
+  };
+
   /* --------------------------- notifications -------------------------------
    * User-scoped, not workspace-scoped, so this lives at the top level rather
    * than inside the per-workspace load effect below — a pending invite to a
@@ -1496,6 +1704,15 @@ export default function PuroductiveApp({ session }) {
   const [notifCenterOpen, setNotifCenterOpen] = useState(false);
   const loadNotifications = () => {
     db.fetchNotifications().then(setNotifications).catch(() => {});
+  };
+
+  /* item 8 — "Message privately" (whisper) from a Team card jumps to Chat
+   * with this member id queued; ChatView resolves it into an existing or
+   * brand-new DM channel and clears it via onConsumePendingDm. */
+  const [pendingDmMemberId, setPendingDmMemberId] = useState(null);
+  const startWhisper = (member) => {
+    setPendingDmMemberId(member.id);
+    goTo("chat");
   };
 
   /* ------------------------------ the board ------------------------------- */
@@ -1645,6 +1862,13 @@ export default function PuroductiveApp({ session }) {
       Promise.all([db.fetchBootstrap(), db.fetchMemberships(workspaceId), loadBoard()]).then(([data, mems]) => {
         if (cancelled) return;
         setCompanies(data.companies);
+        {
+          const remembered = localStorage.getItem(`pd.activeCompany.${workspaceId}`);
+          setActiveCompanyId(
+            remembered && (remembered === "all" || data.companies.some((c) => c.id === remembered))
+              ? remembered : "all"
+          );
+        }
         setMembers(data.members);
         setGroups(data.groups);
         setProjects(data.projects);
@@ -1988,6 +2212,19 @@ export default function PuroductiveApp({ session }) {
     db.updateTaskQueueOrder(taskId, patch).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
   };
 
+  /* item 9/17 — the RESCHEDULE transition itself is unchanged; this just
+   * additionally logs the "why" permanently, the same two-write shape
+   * insertReflection/tryTransition already use for overdue completions. */
+  const rescheduleTaskReflective = (task, { newDeadline, whatChanged, progressSoFar, planToHold }) => {
+    tryTransition(task.id, "RESCHEDULE", { newDeadline });
+    db.insertDeadlineExtension({
+      taskId: task.id, projectId: task.projectId, oldDeadline: task.deadline || "", newDeadline,
+      whatChanged, progressSoFar, planToHold,
+    }).catch((e) => toast(`Sync failed (extension log): ${e.message}`, "error"));
+    setModal(null);
+    toast("Rescheduled — reflection logged");
+  };
+
   /* Completing with an optional photo (item 3) — the transition itself
    * fires immediately either way (so completing never waits on an upload);
    * the photo, if any, attaches as a side-channel patch once it's up. */
@@ -2027,11 +2264,22 @@ export default function PuroductiveApp({ session }) {
       setProjects((ps) => ps.map((p) => (p.id === data.id ? { ...p, ...data } : p)));
       db.updateProject(data).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     } else {
-      const project = { ...data, id: uid(), status: "active" };
+      const project = { ...data, id: uid(), status: "active", sortOrder: nextQueueOrder(projects.map((p) => p.sortOrder ?? 0)) };
       setProjects((ps) => [...ps, project]);
       db.insertProject(project).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     }
     setModal(null);
+  };
+  /* item 1 — edit/delete/reorder parity with tasks. */
+  const deleteProject = (project) => {
+    setProjects((ps) => ps.filter((p) => p.id !== project.id));
+    db.softDeleteProject(project.id).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    if (openProjectId === project.id) setOpenProjectId(null);
+    toast(`"${project.name}" removed`);
+  };
+  const reorderProject = (id, sortOrder) => {
+    setProjects((ps) => ps.map((p) => (p.id === id ? { ...p, sortOrder } : p)));
+    db.updateProjectSortOrder(id, sortOrder).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
   };
   /* New tasks join the tail of both queues automatically (item 2) — a
    * project-pipeline position, and (only if assigned) a personal-queue
@@ -2060,7 +2308,7 @@ export default function PuroductiveApp({ session }) {
       setCompanies((cs) => cs.map((c) => (c.id === data.id ? { ...c, ...data } : c)));
       db.updateCompany(data).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     } else {
-      const company = { ...data, id: "c-" + uid() };
+      const company = { ...data, id: "c-" + uid(), sortOrder: nextQueueOrder(companies.map((c) => c.sortOrder ?? 0)) };
       setCompanies((cs) => [...cs, company]);
       db.insertCompany(company).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     }
@@ -2070,8 +2318,18 @@ export default function PuroductiveApp({ session }) {
   const deleteCompany = (company) => {
     setCompanies((cs) => cs.filter((c) => c.id !== company.id));
     db.softDeleteCompany(company.id).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
-    if (activeCompanyId === company.id) setActiveCompanyId("all");
+    if (activeCompanyId === company.id) chooseCompany("all");
     toast(`${company.name} removed`);
+  };
+  /* item 1 — drag-reorder, same fractional-order pattern tasks already use. */
+  const reorderCompany = (id, sortOrder) => {
+    setCompanies((cs) => cs.map((c) => (c.id === id ? { ...c, sortOrder } : c)));
+    db.updateCompanySortOrder(id, sortOrder).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+  };
+  /* item 6/19 — click a company card to work inside it. */
+  const enterCompany = (company) => {
+    chooseCompany(company.id);
+    goTo("dashboard");
   };
 
   /* --------------------------- team members CRUD --------------------------- */
@@ -2103,6 +2361,16 @@ export default function PuroductiveApp({ session }) {
       db.insertGroup(group).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
     }
   };
+  /* item 11 — creating a department inline (e.g. from TaskForm) without
+   * leaving to visit Manage Groups first. The id is generated synchronously
+   * (same as saveGroup above), so the caller can select it immediately
+   * without waiting on the write. */
+  const createGroupInline = (name) => {
+    const group = { id: "g-" + uid(), name, sortOrder: groups.length, companyId: activeCompanyId !== "all" ? activeCompanyId : null };
+    setGroups((gs) => [...gs, group]);
+    db.insertGroup(group).catch((e) => toast(`Sync failed: ${e.message}`, "error"));
+    return group;
+  };
   const deleteGroup = (group) => {
     const affected = members.filter((m) => m.groupId === group.id);
     setGroups((gs) => gs.filter((g) => g.id !== group.id));
@@ -2112,11 +2380,24 @@ export default function PuroductiveApp({ session }) {
   };
 
   /* ------------------------ workspaces & membership ------------------------ */
+  /* item 6/19 — the company you're currently "inside", persisted per
+   * workspace so re-opening the app returns you to the same company instead
+   * of always dumping you back at Overall. The remembered id is validated
+   * against the loaded company list once the per-workspace bootstrap
+   * finishes (see the load() effect below) — this setter alone can't know
+   * yet whether it's still valid. */
+  const chooseCompany = (id) => {
+    setActiveCompanyId(id);
+    if (workspaceId) localStorage.setItem(`pd.activeCompany.${workspaceId}`, id);
+    if (isMobile) setSidebarOpen(false);
+  };
+
   const switchWorkspace = (id) => {
     if (id === workspaceId) return;
     /* Reset view state along with the data — an open project id from the old
      * workspace resolves to nothing in the new one and would render a blank
-     * detail page. */
+     * detail page. The remembered company for the new workspace, if any, is
+     * restored once its bootstrap load finishes below. */
     setOpenProjectId(null);
     setActiveCompanyId("all");
     setView("dashboard");
@@ -2170,12 +2451,36 @@ export default function PuroductiveApp({ session }) {
 
   /* --------------------------- notification center -------------------------- */
   const dismissNotif = (id) => {
+    const prev = notifications;
     setNotifications((ns) => ns.filter((n) => n.id !== id));
-    db.dismissNotification(id).catch(() => {});
+    /* item 21 — this used to swallow a failure silently, which is exactly
+     * what "I can view it but can't clear it" looks like from the outside:
+     * the row vanishes from state, then reappears on the next 60s poll with
+     * no explanation. Now a real failure restores the row and says why. */
+    db.dismissNotification(id).catch((e) => {
+      setNotifications(prev);
+      toast(`Could not clear that notification: ${e.message}`, "error");
+    });
+  };
+  /* item 21 — bulk clear, since a notification center that only lets you
+   * dismiss one at a time doesn't scale past a handful of items. */
+  const clearAllNotifications = () => {
+    const ids = notifications.map((n) => n.id);
+    if (!ids.length) return;
+    setNotifications([]);
+    Promise.all(ids.map((id) => db.dismissNotification(id))).catch((e) => {
+      toast(`Some notifications couldn't be cleared: ${e.message}`, "error");
+      loadNotifications();
+    });
   };
   const acceptInviteNotif = async (n) => {
     try {
       const newWsId = await db.acceptInvite(n.actionMembershipId);
+      /* item 2/7 — join the Team roster of the workspace you just joined.
+       * Best-effort: the invite has already been accepted regardless of
+       * whether this succeeds, so a failure here only means falling back to
+       * the old "an admin adds you to Team manually" path, not losing access. */
+      db.ensureTeamMemberForMembership(n.actionMembershipId).catch(() => {});
       dismissNotif(n.id);
       toast("Invite accepted — switching you over");
       /* The freshly-active membership means fetchWorkspaces() will now
@@ -2214,6 +2519,25 @@ export default function PuroductiveApp({ session }) {
     }
   };
 
+  /* item 10 — "share to board" from a task's notes panel. Scoped to that
+   * task's own project's company (not whatever company happens to be active
+   * in the sidebar right now), so it always lands in the right team's feed
+   * regardless of where you were looking when you shared it. */
+  const shareTaskToBoard = async (task, noteBody) => {
+    const project = projects.find((p) => p.id === task.projectId);
+    try {
+      const post = await db.insertPost({
+        id: "po-" + uid(), kind: "update", caption: (noteBody || "").trim() || task.title,
+        projectId: task.projectId, taskId: task.id, companyId: project?.companyId || null,
+        authorMemberId: myMemberId,
+      });
+      setBoard((b) => ({ ...b, posts: [post, ...b.posts] }));
+      toast("Shared to the board");
+    } catch (e) {
+      toast(`Could not share: ${e.message}`, "error");
+    }
+  };
+
   /* ------------------------------- the board -------------------------------
    * Posting is a multi-step write (post row, then media, then poll options or
    * a task request) and there is no transaction across them from the browser.
@@ -2226,6 +2550,7 @@ export default function PuroductiveApp({ session }) {
       const post = await db.insertPost({
         id: postId, kind: draft.kind, caption: draft.caption,
         projectId: draft.projectId || null, taskId: draft.taskId || null,
+        companyId: draft.companyId || null,
         authorMemberId: myMemberId,
       });
 
@@ -2290,6 +2615,16 @@ export default function PuroductiveApp({ session }) {
   const deletePost = async (post) => {
     setBoard((b) => ({ ...b, posts: b.posts.filter((p) => p.id !== post.id) }));
     try { await db.softDeletePost(post.id); toast("Post removed"); }
+    catch (e) { toast(`Sync failed: ${e.message}`, "error"); loadBoard(); }
+  };
+  /* item 16 — pinned existed as a column since schema_v5 with no way to set
+   * it; this is that missing write path, wired to whoever can write here
+   * (not just the post's own author) since "the team needs to see this" is
+   * often someone else's call to make about someone else's post. */
+  const togglePostPinned = async (post) => {
+    const pinned = !post.pinned;
+    setBoard((b) => ({ ...b, posts: b.posts.map((p) => (p.id === post.id ? { ...p, pinned } : p)) }));
+    try { await db.updatePostPinned(post.id, pinned); }
     catch (e) { toast(`Sync failed: ${e.message}`, "error"); loadBoard(); }
   };
 
@@ -2393,21 +2728,59 @@ export default function PuroductiveApp({ session }) {
   const activeCompany = companies.find((c) => c.id === activeCompanyId);
   const theme = activeCompany ? activeCompany.theme : THEME_PRESETS[0];
   const reassignTask = modal?.kind === "reassign" ? engine.tasks.find((t) => t.id === modal.taskId) : null;
+  const rescheduleTask = modal?.kind === "reschedule" ? engine.tasks.find((t) => t.id === modal.taskId) : null;
 
-  const NAV = [
+  /* item 6/13/19 — once a specific company is active, Dashboard/Team/Board/
+   * Chat all scope down to it instead of showing the whole workspace. */
+  const scopedProjectIds = new Set(scopedProjects.map((p) => p.id));
+  const scopedEngine = activeCompanyId === "all"
+    ? engine
+    : { ...engine, tasks: engine.tasks.filter((t) => scopedProjectIds.has(t.projectId)) };
+  const scopedMembers = activeCompanyId === "all"
+    ? members
+    : members.filter((m) => m.companyIds.includes(activeCompanyId));
+  /* A group with no company (companyId null) is workspace-wide — e.g. an
+   * all-hands crew that spans every division — so it stays visible in every
+   * scope, not just "all". */
+  const scopedGroups = activeCompanyId === "all"
+    ? groups
+    : groups.filter((g) => !g.companyId || g.companyId === activeCompanyId);
+  const scopedBoard = activeCompanyId === "all"
+    ? board
+    : { ...board, posts: board.posts.filter((p) => !p.companyId || p.companyId === activeCompanyId) };
+
+  /* item 14 — a personal workspace can never have teammates, so the
+   * collaborative-only screens (Board/Team/Chat/Leaderboard/People & access)
+   * are dropped from the nav entirely rather than rendered empty/misleading.
+   * PeopleView's own "this is personal" message (for anyone who lands there
+   * some other way) stays as a defensive fallback. */
+  const personalWorkspace = activeWorkspace?.kind === "personal";
+  const NAV_ALL = [
     { key: "dashboard", label: "Dashboard", icon: LayoutGrid },
-    { key: "board", label: "Board", icon: MessageSquare },
+    { key: "board", label: "Board", icon: MessageSquare, collaborative: true },
     { key: "companies", label: "Companies", icon: Building2 },
     { key: "projects", label: "Projects", icon: FolderKanban },
-    { key: "team", label: "Team", icon: Users },
-    { key: "people", label: "People & access", icon: UserPlus },
-    { key: "leaderboard", label: "Leaderboard", icon: Trophy },
-    { key: "chat", label: "Chat", icon: MessageCircle },
+    { key: "team", label: "Team", icon: Users, collaborative: true },
+    { key: "people", label: "People & access", icon: UserPlus, collaborative: true },
+    { key: "leaderboard", label: "Leaderboard", icon: Trophy, collaborative: true },
+    { key: "chat", label: "Chat", icon: MessageCircle, collaborative: true },
     { key: "calendar", label: "Calendar", icon: CalendarDays },
     { key: "gantt", label: "Gantt", icon: GanttChart },
     { key: "reports", label: "Reports", icon: BarChart3 },
   ];
+  const NAV = personalWorkspace ? NAV_ALL.filter((n) => !n.collaborative) : NAV_ALL;
 
+  if (profile === undefined) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center",
+        background: T.bg, color: T.ink3, fontFamily: T.fontBody, fontSize: 13 }}>
+        Loading…
+      </div>
+    );
+  }
+  if (profile === null) {
+    return <ProfileGateScreen onSave={saveProfile} />;
+  }
   if (loading) {
     return (
       <div style={{ minHeight: "100vh", display: "grid", placeItems: "center",
@@ -2443,8 +2816,8 @@ export default function PuroductiveApp({ session }) {
           padding: "12px 16px", background: T.card, borderBottom: `1px solid ${T.line}`,
         }}>
           <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
-            <Mesh mesh={THEME_PRESETS[0].mesh} style={{ width: 28, height: 28, borderRadius: 8, display: "grid", placeItems: "center", border: "1px solid rgba(36,51,5,0.1)" }}>
-              <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 13, color: "#243305", display: "grid", placeItems: "center", height: "100%" }}>P</span>
+            <Mesh mesh={["var(--lime-mesh-1)", "var(--lime-mesh-2)", "var(--lime-mesh-3)"]} style={{ width: 28, height: 28, borderRadius: 8, display: "grid", placeItems: "center", border: "1px solid rgba(36,51,5,0.1)" }}>
+              <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 13, color: "var(--lime-ink)", display: "grid", placeItems: "center", height: "100%" }}>P</span>
             </Mesh>
             <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 14.5, letterSpacing: "-0.02em" }}>Puroductive</span>
           </div>
@@ -2465,11 +2838,11 @@ export default function PuroductiveApp({ session }) {
         }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "0 8px", marginBottom: 30 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 11, minWidth: 0 }}>
-              <Mesh mesh={THEME_PRESETS[0].mesh} style={{
+              <Mesh mesh={["var(--lime-mesh-1)", "var(--lime-mesh-2)", "var(--lime-mesh-3)"]} style={{
                 width: 36, height: 36, borderRadius: 11, display: "grid", placeItems: "center", flexShrink: 0,
-                boxShadow: "0 4px 14px -4px rgba(124,181,24,0.55)", border: "1px solid rgba(36,51,5,0.1)",
+                boxShadow: "0 4px 14px -4px color-mix(in srgb, var(--lime-deep) 55%, transparent)", border: "1px solid rgba(36,51,5,0.1)",
               }}>
-                <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 17, color: "#243305", display: "grid", placeItems: "center", height: "100%" }}>P</span>
+                <span style={{ fontFamily: T.fontDisplay, fontWeight: 700, fontSize: 17, color: "var(--lime-ink)", display: "grid", placeItems: "center", height: "100%" }}>P</span>
               </Mesh>
               {/* minWidth:0 + truncation here (not flexShrink:0) is what stops
                 * this text from refusing to shrink and pushing the bell/help
@@ -2485,6 +2858,7 @@ export default function PuroductiveApp({ session }) {
             <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
               <NotificationBell count={notifications.filter((n) => !n.readAt).length}
                 onClick={() => setNotifCenterOpen((o) => !o)} />
+              <IconBtn label="Personalize this workspace's color" onClick={() => setModal({ kind: "accentPicker" })}><Palette size={15} /></IconBtn>
               <IconBtn label="Show the app tour" onClick={() => setShowTour(true)}><HelpCircle size={15} /></IconBtn>
               {isMobile && <IconBtn label="Close menu" onClick={() => setSidebarOpen(false)}><X size={15} /></IconBtn>}
             </div>
@@ -2493,12 +2867,15 @@ export default function PuroductiveApp({ session }) {
           {notifCenterOpen && (
             <NotificationCenter notifications={notifications}
               onClose={() => setNotifCenterOpen(false)}
-              onOpen={openNotification} onDismiss={dismissNotif}
+              onOpen={openNotification} onDismiss={dismissNotif} onClearAll={clearAllNotifications}
               onAccept={acceptInviteNotif} onDecline={declineInviteNotif} />
           )}
 
           <WorkspaceSwitcher workspaces={workspaces} activeId={workspaceId} myRole={myRole}
             onSwitch={switchWorkspace} onCreate={() => setModal({ kind: "workspace" })} />
+
+          <CompanySwitcher companies={companies} activeId={activeCompanyId}
+            onSwitch={chooseCompany} onManage={() => goTo("companies")} />
 
           <nav style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             {NAV.map(({ key, label, icon: Icon }) => {
@@ -2509,47 +2886,39 @@ export default function PuroductiveApp({ session }) {
                   display: "flex", alignItems: "center", gap: 11, minHeight: 42, padding: "0 12px",
                   borderRadius: 11, cursor: "pointer", textAlign: "left",
                   fontSize: 13.5, fontWeight: active ? 600 : 450,
-                  color: active ? "#243305" : T.ink2,
+                  /* item 4 — the active nav highlight is the one thing on
+                   * screen every single view, so it's the clearest place a
+                   * per-workspace accent actually helps tell workspaces
+                   * apart at a glance; see the Btn primary variant above for
+                   * the same var(--lime-*) treatment. */
+                  color: active ? "var(--lime-ink)" : T.ink2,
                   border: active ? "1px solid rgba(36,51,5,0.1)" : "1px solid transparent",
-                  boxShadow: active ? "0 2px 8px -2px rgba(124,181,24,0.4)" : "none",
-                  ...(active ? meshBackground(["#EFFCC9", "#D6F47A", "#BCE95C"]) : { background: "transparent" }),
+                  boxShadow: active ? "0 2px 8px -2px color-mix(in srgb, var(--lime-deep) 40%, transparent)" : "none",
+                  ...(active ? meshBackground(["var(--lime-mesh-1)", "var(--lime-mesh-2)", "var(--lime-mesh-3)"]) : { background: "transparent" }),
                 }}>
                   {active && <GrainOverlay opacity={0.2} radius={11} />}
-                  <Icon size={16.5} style={{ position: "relative", color: active ? "#3F6212" : T.ink3 }} />
+                  <Icon size={16.5} style={{ position: "relative", color: active ? "var(--lime-deep)" : T.ink3 }} />
                   <span style={{ position: "relative" }}>{label}</span>
                 </button>
               );
             })}
           </nav>
 
-          <div style={{ marginTop: 28 }}>
-            <Label>Scope</Label>
-            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-              {[{ id: "all", name: "All companies", theme: THEME_PRESETS[0] }, ...companies].map((c) => {
-                const on = activeCompanyId === c.id;
-                return (
-                  <button key={c.id} onClick={() => { setActiveCompanyId(c.id); if (isMobile) setSidebarOpen(false); }} className="pd-press" style={{
-                    display: "flex", alignItems: "center", gap: 9, minHeight: 36, padding: "0 11px",
-                    borderRadius: 10, cursor: "pointer", textAlign: "left", fontSize: 12.5,
-                    fontWeight: on ? 600 : 450, color: on ? T.ink : T.ink3,
-                    background: on ? T.bg : "transparent",
-                    border: `1px solid ${on ? T.line : "transparent"}`,
-                  }}>
-                    <CircleDot size={11} style={{ color: c.theme.primary, flexShrink: 0 }} />
-                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
           <OpenHandoffsPanel handoffs={engine.handoffs} tasks={engine.tasks} members={members} />
 
           <div style={{ marginTop: 10, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
             padding: "10px 12px", borderRadius: 12, border: `1px solid ${T.lineSoft}`, background: T.cardSoft }}>
-            <span style={{ fontSize: 11, color: T.ink3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {session?.user?.email}
-            </span>
+            <div style={{ minWidth: 0, overflow: "hidden" }}>
+              {profile?.fullName && (
+                <div style={{ fontSize: 12, fontWeight: 600, color: T.ink,
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  Hi, {profile.fullName.split(" ")[0]}
+                </div>
+              )}
+              <span style={{ fontSize: 11, color: T.ink3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {session?.user?.email}
+              </span>
+            </div>
             <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
               <IconBtn label={colorMode === "dark" ? "Switch to light mode" : "Switch to dark mode"} onClick={toggleColorMode}>
                 <span style={{ fontSize: 13, lineHeight: 1 }}>{colorMode === "dark" ? "☀️" : "🌙"}</span>
@@ -2574,8 +2943,26 @@ export default function PuroductiveApp({ session }) {
             </span>
           </Card>
         )}
+        {/* item 6/19 — always-visible reminder of which company you're
+          * scoped into, with a one-click way back out to the cross-company
+          * view. Every view below this point already reads activeCompanyId
+          * (via scopedProjects / companyMembers / etc.), so this is purely
+          * the "where am I" signal, not a second filter. */}
+        {activeCompany && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
+            <CircleDot size={11} style={{ color: activeCompany.theme.primary, flexShrink: 0 }} />
+            <span style={{ fontSize: 12, color: T.ink3 }}>
+              Viewing <strong style={{ color: T.ink, fontWeight: 600 }}>{activeCompany.name}</strong>
+            </span>
+            <button onClick={() => chooseCompany("all")} className="pd-press" style={{
+              marginLeft: "auto", background: "none", border: "none", cursor: "pointer",
+              fontSize: 11.5, color: T.limeDeep, fontWeight: 600, padding: 0,
+            }}>Overall ↗</button>
+          </div>
+        )}
         {view === "dashboard" && (
-          <Dashboard {...{ companies, projects, members, engine, theme, myMemberId, tryTransition }}
+          <Dashboard companies={companies} projects={scopedProjects} members={members} engine={scopedEngine}
+            theme={theme} activeCompany={activeCompany} myMemberId={myMemberId} tryTransition={tryTransition}
             openProject={(id) => { setOpenProjectId(id); setView("projects"); }}
             onComplete={(t) => setModal({ kind: "completeTask", task: t })}
             onReorder={reorderTask} />
@@ -2584,11 +2971,13 @@ export default function PuroductiveApp({ session }) {
           <CompaniesView companies={companies} projects={projects} members={members}
             onAdd={() => setModal({ kind: "company", data: null })}
             onEdit={(c) => setModal({ kind: "company", data: c })}
-            onDelete={deleteCompany} />
+            onDelete={deleteCompany} onEnter={enterCompany} onReorder={reorderCompany} />
         )}
         {view === "projects" && !openProject && (
           <ProjectsList projects={scopedProjects} companies={companies} engine={engine}
             onOpen={(p) => setOpenProjectId(p.id)}
+            onEdit={(p) => setModal({ kind: "project", data: p })}
+            onDelete={deleteProject} onReorder={reorderProject}
             onCreate={() => setModal({ kind: "project", data: null })} />
         )}
         {view === "projects" && openProject && (
@@ -2601,23 +2990,26 @@ export default function PuroductiveApp({ session }) {
             onComplete={(t) => setModal({ kind: "completeTask", task: t })}
             onReorder={reorderTask}
             onAddTask={() => setModal({ kind: "task", projectId: openProject.id })}
-            onExport={() => exportProject(openProject)} />
+            onExport={() => exportProject(openProject)} onShareToBoard={shareTaskToBoard} />
         )}
         {view === "team" && (
-          <TeamView members={members} companies={companies} groups={groups} engine={engine}
+          <TeamView members={scopedMembers} companies={companies} groups={scopedGroups} engine={scopedEngine}
+            memberships={memberships} myMemberId={myMemberId}
             onAddMember={() => setModal({ kind: "member", data: null })}
             onEditMember={(m) => setModal({ kind: "member", data: m })}
             onDeleteMember={deleteMember}
-            onManageGroups={() => setModal({ kind: "groupsManage" })} />
+            onManageGroups={() => setModal({ kind: "groupsManage" })}
+            onWhisper={startWhisper} />
         )}
         {view === "board" && (
-          <BoardView board={board} mediaUrls={mediaUrls} available={boardAvailable}
+          <BoardView board={scopedBoard} mediaUrls={mediaUrls} available={boardAvailable}
             members={members} projects={projects} companies={companies}
             myUserId={session?.user?.id} myMemberId={myMemberId} readOnly={readOnly}
             onCompose={() => setModal({ kind: "post" })}
             onComment={addComment} onVote={vote} onDelete={deletePost}
             onAccept={acceptRequest}
             onDecline={(req) => setModal({ kind: "declineRequest", req })}
+            onTogglePin={togglePostPinned}
             onOpenProject={(id) => { setOpenProjectId(id); setView("projects"); }} />
         )}
         {view === "people" && (
@@ -2634,8 +3026,9 @@ export default function PuroductiveApp({ session }) {
           <LeaderboardView tasks={engine.tasks} members={members} />
         )}
         {view === "chat" && (
-          <ChatView workspaceId={workspaceId} groups={groups} members={members}
-            myUserId={session?.user?.id} myMemberId={myMemberId} readOnly={readOnly} />
+          <ChatView workspaceId={workspaceId} groups={scopedGroups} members={members} memberships={memberships}
+            myUserId={session?.user?.id} myMemberId={myMemberId} readOnly={readOnly}
+            pendingDmMemberId={pendingDmMemberId} onConsumePendingDm={() => setPendingDmMemberId(null)} />
         )}
         {view === "calendar" && (
           <CalendarView exceptions={exceptions}
@@ -2680,16 +3073,17 @@ export default function PuroductiveApp({ session }) {
           onRoute={() => routeToRetry(modal.task)} />
       )}
       {!interventionTask && reassignTask && (
-        <ReassignModal task={reassignTask} members={members} companies={companies}
+        <ReassignModal task={reassignTask} members={members} groups={groups} companies={companies} myMemberId={myMemberId}
           onClose={() => setModal(null)}
           onConfirm={(x) => { tryTransition(reassignTask.id, "REASSIGN", x); setModal(null); }} />
       )}
-      {!interventionTask && modal?.kind === "reschedule" && (
-        <RescheduleModal onClose={() => setModal(null)}
-          onConfirm={(d) => { tryTransition(modal.taskId, "RESCHEDULE", { newDeadline: d }); setModal(null); }} />
+      {!interventionTask && rescheduleTask && (
+        <RescheduleModal task={rescheduleTask} onClose={() => setModal(null)}
+          onConfirm={(extras) => rescheduleTaskReflective(rescheduleTask, extras)} />
       )}
       {!interventionTask && modal?.kind === "task" && (
-        <TaskForm projectId={modal.projectId} members={members} groups={groups} onSave={addTask} onClose={() => setModal(null)} />
+        <TaskForm projectId={modal.projectId} members={members} groups={groups} companies={companies} myMemberId={myMemberId}
+          onCreateGroup={createGroupInline} onSave={addTask} onClose={() => setModal(null)} />
       )}
       {!interventionTask && modal?.kind === "project" && (
         <ProjectForm data={modal.data} companies={companies} defaultCompanyId={activeCompanyId}
@@ -2703,7 +3097,8 @@ export default function PuroductiveApp({ session }) {
           onSave={saveMember} onClose={() => setModal(null)} />
       )}
       {!interventionTask && modal?.kind === "groupsManage" && (
-        <GroupsManageModal groups={groups} onSave={saveGroup} onDelete={deleteGroup} onClose={() => setModal(null)} />
+        <GroupsManageModal groups={groups} companies={companies} defaultCompanyId={activeCompanyId}
+          onSave={saveGroup} onDelete={deleteGroup} onClose={() => setModal(null)} />
       )}
       {!interventionTask && modal?.kind === "event" && (
         <CalendarEventForm data={modal.data} defaultDate={modal.date} companies={companies} projects={projects} members={members}
@@ -2736,8 +3131,12 @@ export default function PuroductiveApp({ session }) {
       {!interventionTask && modal?.kind === "workspace" && (
         <WorkspaceForm onSave={addWorkspace} onClose={() => setModal(null)} />
       )}
+      {!interventionTask && modal?.kind === "accentPicker" && (
+        <AccentPickerModal value={accentTheme} onSave={chooseAccent} onClose={() => setModal(null)} />
+      )}
       {!interventionTask && modal?.kind === "post" && (
         <PostComposer members={members} projects={projects} tasks={engine.tasks}
+          companies={companies} defaultCompanyId={activeCompanyId}
           onSave={createPost} onClose={() => setModal(null)} />
       )}
       {!interventionTask && modal?.kind === "declineRequest" && (
@@ -2847,14 +3246,20 @@ const NotificationRow = ({ n, onOpen, onDismiss, onAccept, onDecline }) => {
   );
 };
 
-const NotificationCenter = ({ notifications, onClose, onOpen, onDismiss, onAccept, onDecline }) => (
+const NotificationCenter = ({ notifications, onClose, onOpen, onDismiss, onAccept, onDecline, onClearAll }) => (
   <div style={{ marginBottom: 18 }}>
     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 2px", marginBottom: 8 }}>
       <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3 }}>
         Notifications
       </span>
-      <button onClick={onClose} className="pd-press" style={{ background: "none", border: "none", cursor: "pointer",
-        fontSize: 11, color: T.ink3, padding: 0 }}>Close</button>
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        {notifications.length > 0 && (
+          <button onClick={onClearAll} className="pd-press" style={{ background: "none", border: "none", cursor: "pointer",
+            fontSize: 11, color: T.limeDeep, fontWeight: 600, padding: 0 }}>Clear all</button>
+        )}
+        <button onClick={onClose} className="pd-press" style={{ background: "none", border: "none", cursor: "pointer",
+          fontSize: 11, color: T.ink3, padding: 0 }}>Close</button>
+      </div>
     </div>
     <div className="pd-scroll" style={{ maxHeight: 320, overflowY: "auto" }}>
       {notifications.length === 0
@@ -2912,6 +3317,77 @@ const WorkspaceSwitcher = ({ workspaces, activeId, myRole, onSwitch, onCreate })
             color: T.limeDeep, fontWeight: 600, background: "transparent", border: "1px solid transparent",
           }}>
             <Plus size={11} style={{ flexShrink: 0 }} /> New workspace
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* ------------------------ COMPANY SWITCHER (sidebar, v12) ------------------
+ * The primary day-to-day context switch, directly under the Workspace one —
+ * a workspace is the account you're signed into; a company is the division
+ * you're currently working inside of it. "Overall" (id "all") is the
+ * cross-company summary every other view already understood as the default;
+ * picking an actual company scopes Dashboard/Team/Board/Chat down to it. */
+const CompanySwitcher = ({ companies, activeId, onSwitch, onManage }) => {
+  const [open, setOpen] = useState(false);
+  const active = companies.find((c) => c.id === activeId) ?? null;
+  return (
+    <div style={{ marginBottom: 22 }}>
+      <Label>Company</Label>
+      <button onClick={() => setOpen((o) => !o)} className="pd-press" style={{
+        display: "flex", alignItems: "center", gap: 9, width: "100%", minHeight: 40, padding: "0 11px",
+        borderRadius: 11, cursor: "pointer", textAlign: "left",
+        border: `1px solid ${T.line}`, background: T.cardSoft,
+      }}>
+        {active
+          ? <CircleDot size={14} style={{ color: active.theme.primary, flexShrink: 0 }} />
+          : <Layers size={14} style={{ color: T.limeDeep, flexShrink: 0 }} />}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: T.ink,
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {active ? active.name : "Overall"}
+          </div>
+          <div style={{ fontSize: 10, color: T.ink3, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+            {active ? "Company" : "All companies combined"}
+          </div>
+        </div>
+        <ChevronsUpDown size={13} style={{ color: T.ink3, flexShrink: 0 }} />
+      </button>
+      {open && (
+        <div style={{ marginTop: 5, display: "flex", flexDirection: "column", gap: 3 }}>
+          <button onClick={() => { onSwitch("all"); setOpen(false); }} className="pd-press" style={{
+            display: "flex", alignItems: "center", gap: 8, minHeight: 34, padding: "0 11px",
+            borderRadius: 9, cursor: "pointer", textAlign: "left", fontSize: 12,
+            fontWeight: activeId === "all" ? 600 : 450, color: activeId === "all" ? T.ink : T.ink2,
+            background: activeId === "all" ? T.bg : "transparent",
+            border: `1px solid ${activeId === "all" ? T.line : "transparent"}`,
+          }}>
+            <Layers size={10} style={{ color: T.ink3, flexShrink: 0 }} />
+            <span>Overall (all companies)</span>
+          </button>
+          {companies.map((c) => (
+            <button key={c.id} onClick={() => { onSwitch(c.id); setOpen(false); }} className="pd-press" style={{
+              display: "flex", alignItems: "center", gap: 8, minHeight: 34, padding: "0 11px",
+              borderRadius: 9, cursor: "pointer", textAlign: "left", fontSize: 12,
+              fontWeight: c.id === activeId ? 600 : 450, color: c.id === activeId ? T.ink : T.ink2,
+              background: c.id === activeId ? T.bg : "transparent",
+              border: `1px solid ${c.id === activeId ? T.line : "transparent"}`,
+            }}>
+              <CircleDot size={10} style={{ color: c.theme.primary, flexShrink: 0 }} />
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
+            </button>
+          ))}
+          {companies.length === 0 && (
+            <div style={{ padding: "8px 11px", fontSize: 11.5, color: T.ink3 }}>No companies yet.</div>
+          )}
+          <button onClick={() => { onManage(); setOpen(false); }} className="pd-press" style={{
+            display: "flex", alignItems: "center", gap: 8, minHeight: 34, padding: "0 11px",
+            borderRadius: 9, cursor: "pointer", textAlign: "left", fontSize: 12,
+            color: T.limeDeep, fontWeight: 600, background: "transparent", border: "1px solid transparent",
+          }}>
+            <Building2 size={11} style={{ flexShrink: 0 }} /> Manage companies
           </button>
         </div>
       )}
@@ -2987,7 +3463,7 @@ const MyQueueItem = ({ task, projects, active, onStart, onPause, onComplete }) =
 };
 
 /* =============================== DASHBOARD ================================ */
-const Dashboard = ({ companies, projects, members, engine, theme, openProject, myMemberId, tryTransition, onComplete, onReorder }) => {
+const Dashboard = ({ companies, projects, members, engine, theme, activeCompany, openProject, myMemberId, tryTransition, onComplete, onReorder }) => {
   const active = projects.filter((p) => p.status === "active");
   const overdue = engine.tasks.filter((t) => t.state === "overdue");
   const retrying = engine.tasks.filter((t) => t.state === "retry_pending");
@@ -3013,7 +3489,7 @@ const Dashboard = ({ companies, projects, members, engine, theme, openProject, m
           <div>
             <div style={{ fontSize: 11, fontWeight: 600, letterSpacing: "0.15em", textTransform: "uppercase",
               color: attention > 0 ? MOLD_INK : theme.ink, opacity: 0.65, marginBottom: 12 }}>
-              Cross-company overview
+              {activeCompany ? `${activeCompany.name} overview` : "Cross-company overview"}
             </div>
             <h1 style={{ margin: 0, fontFamily: T.fontDisplay, fontSize: 38, fontWeight: 700, letterSpacing: "-0.035em",
               lineHeight: 1.05, color: attention > 0 ? MOLD_INK : theme.ink }}>
@@ -3126,33 +3602,56 @@ const Dashboard = ({ companies, projects, members, engine, theme, openProject, m
 };
 
 /* ============================= PROJECTS LIST ============================== */
-const ProjectsList = ({ projects, companies, engine, onOpen, onCreate }) => (
+const ProjectsList = ({ projects, companies, engine, onOpen, onEdit, onDelete, onReorder, onCreate }) => (
   <div className="pd-fade-in">
     <PageHead kicker="Execution" title="Projects"
-      sub="Deadlines lock permanently once committed — the supervisor never renegotiates."
-      action={<Btn onClick={onCreate}><Plus size={15} /> New project</Btn>} />
-    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-      {projects.map((p) => {
-        const c = companies.find((x) => x.id === p.companyId);
-        const stack = computeSandStack(p, engine.tasks.filter((t) => t.projectId === p.id));
-        return (
-          <Card key={p.id} className="pd-rise" style={{ padding: "16px 20px", display: "flex", alignItems: "center", gap: 18, cursor: "pointer" }}
-            onClick={() => onOpen(p)}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 14, fontWeight: 600, color: T.ink, display: "flex", alignItems: "center", gap: 8 }}>
-                {p.name} {p.locked && <Lock size={12} style={{ color: T.ink3 }} />}
-              </div>
-              <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 3 }}>{c?.name} · due {p.deadline}</div>
-            </div>
-            <SandBar stack={stack} theme={c?.theme ?? THEME_PRESETS[0]} />
-            <ChevronRight size={15} style={{ color: T.ink3 }} />
-          </Card>
-        );
-      })}
-      {projects.length === 0 && <Empty text="No projects in this scope yet." />}
-    </div>
+      sub={companies.length === 0
+        ? "Add a company first — every project has to live under one."
+        : "Deadlines lock permanently once committed — the supervisor never renegotiates."}
+      action={<Btn onClick={onCreate} disabled={companies.length === 0}><Plus size={15} /> New project</Btn>} />
+    {projects.length === 0 ? (
+      <Empty text="No projects in this scope yet." />
+    ) : (
+      <DragQueueList items={projects} orderKey="sortOrder" onReorder={onReorder}
+        renderItem={(p) => (
+          <ProjectRow project={p} company={companies.find((x) => x.id === p.companyId)} engine={engine}
+            onOpen={() => onOpen(p)} onEdit={() => onEdit(p)} onDelete={() => onDelete(p)} />
+        )} />
+    )}
   </div>
 );
+
+const ProjectRow = ({ project: p, company: c, engine, onOpen, onEdit, onDelete }) => {
+  const [confirming, setConfirming] = useState(false);
+  const stack = computeSandStack(p, engine.tasks.filter((t) => t.projectId === p.id));
+  return (
+    <Card className="pd-rise" style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, cursor: "pointer" }} onClick={onOpen}>
+        <GripVertical size={14} style={{ color: T.ink3, flexShrink: 0, cursor: "grab" }} onClick={(e) => e.stopPropagation()} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: T.ink, display: "flex", alignItems: "center", gap: 8 }}>
+            {p.name} {p.locked && <Lock size={12} style={{ color: T.ink3 }} />}
+          </div>
+          <div style={{ fontSize: 11.5, color: T.ink3, marginTop: 3 }}>{c?.name} · due {p.deadline}</div>
+        </div>
+        <SandBar stack={stack} theme={c?.theme ?? THEME_PRESETS[0]} />
+        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          <IconBtn label="Edit project" onClick={onEdit}><Pencil size={13} /></IconBtn>
+          <IconBtn label="Delete project" danger onClick={() => setConfirming(true)}><Trash2 size={13.5} /></IconBtn>
+        </div>
+        <ChevronRight size={15} style={{ color: T.ink3 }} />
+      </div>
+      {confirming && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 12,
+          background: T.dangerBg, border: `1px solid ${T.dangerLine}` }} onClick={(e) => e.stopPropagation()}>
+          <span style={{ flex: 1, fontSize: 11.5, color: T.danger }}>Remove "{p.name}"? Tasks keep their history.</span>
+          <Btn small ghost onClick={() => setConfirming(false)}>Cancel</Btn>
+          <Btn small danger onClick={onDelete}>Confirm</Btn>
+        </div>
+      )}
+    </Card>
+  );
+};
 
 /* ---------------------------- DRAG-TO-REORDER QUEUE ------------------------
  * Generic — used for the project pipeline above (orderKey="queueOrder") and
@@ -3202,11 +3701,14 @@ const DragQueueList = ({ items, orderKey, onReorder, renderItem }) => {
 };
 
 /* ============================ PROJECT DETAIL ============================== */
-const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onComplete, onReorder, onAddTask, onExport }) => {
+const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onComplete, onReorder, onAddTask, onExport, onShareToBoard }) => {
   const isMobile = useIsMobile();
   const c = companies.find((x) => x.id === project.companyId);
   const theme = c?.theme ?? THEME_PRESETS[0];
   const tasks = engine.tasks.filter((t) => t.projectId === project.id);
+  const openTasks = tasks.filter((t) => t.state !== "completed");
+  const completedTasks = tasks.filter((t) => t.state === "completed")
+    .sort((a, b) => new Date(b.completedAt || 0) - new Date(a.completedAt || 0));
   const stack = computeSandStack(project, tasks);
   const reflections = engine.reflections.filter((r) => r.projectId === project.id);
   const history = engine.transitions.filter((tr) => tasks.some((t) => t.id === tr.taskId)).slice(-6).reverse();
@@ -3290,22 +3792,32 @@ const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tr
           * queue_order (item 2) — this project's own pipeline order, e.g.
           * R.M. cutting → CNC machining, independent of who's assigned each
           * step. Dropping a row moves it to just above the one it's dropped
-          * on. */}
+          * on. Completed tasks (item 15) drop out of the pipeline entirely
+          * and collapse under their own section below, dulled and sorted
+          * most-recent-first — done work stops competing for attention with
+          * what's still open. */}
         <div>
-          {tasks.length > 1 && (
+          {openTasks.length > 1 && (
             <p style={{ margin: "0 0 8px", fontSize: 11, color: T.ink3 }}>
               <GripVertical size={11} style={{ verticalAlign: -1 }} /> Drag to reorder this project's pipeline — completing one auto-starts the next.
             </p>
           )}
-          <DragQueueList items={tasks} orderKey="queueOrder"
+          <DragQueueList items={openTasks} orderKey="queueOrder"
             onReorder={(taskId, queueOrder) => onReorder(taskId, { queueOrder })}
             renderItem={(t) => (
               <TaskRow t={t} members={members} groups={groups}
                 tryTransition={tryTransition} attemptDelete={attemptDelete}
                 onReassign={onReassign} onReschedule={onReschedule} onMark={onMark} onComplete={onComplete}
+                onShareToBoard={onShareToBoard}
                 hasReflection={engine.reflections.some((r) => r.taskId === t.id)} />
             )} />
-          {tasks.length === 0 && <Empty text="No tasks yet — add the first one." />}
+          {openTasks.length === 0 && completedTasks.length === 0 && <Empty text="No tasks yet — add the first one." />}
+          {completedTasks.length > 0 && (
+            <CompletedTasksSection tasks={completedTasks} members={members} groups={groups}
+              tryTransition={tryTransition} attemptDelete={attemptDelete}
+              onReassign={onReassign} onReschedule={onReschedule} onMark={onMark} onComplete={onComplete}
+              onShareToBoard={onShareToBoard} reflections={engine.reflections} />
+          )}
         </div>
       </div>
       </div>
@@ -3314,7 +3826,8 @@ const ProjectDetail = ({ project, companies, members, groups, engine, onBack, tr
 };
 
 /* ------------------------------- TASK ROW --------------------------------- */
-const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onComplete, hasReflection }) => {
+const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onComplete, onShareToBoard, hasReflection }) => {
+  const [notesOpen, setNotesOpen] = useState(false);
   const meta = STATE_META[t.state];
   const acts = [];
   if (TRANSITIONS[t.state].START) acts.push({ k: "START", label: "Start", icon: Play, run: () => tryTransition(t.id, "START") });
@@ -3363,6 +3876,9 @@ const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign,
             {t.isMarked && t.markLabel ? ` · ${t.markLabel}` : ""}
           </div>
         </div>
+        <IconBtn onClick={() => setNotesOpen((o) => !o)} label={notesOpen ? "Hide notes" : "Task notes"}>
+          <StickyNote size={13.5} style={notesOpen ? { color: T.limeDeep } : undefined} />
+        </IconBtn>
         <IconBtn onClick={() => onMark(t)} label={t.isMarked ? "Edit calendar mark" : "Mark on calendar"}>
           <Star size={13.5} style={t.isMarked ? { color: "#D97706", fill: "#D97706" } : undefined} />
         </IconBtn>
@@ -3379,17 +3895,143 @@ const TaskRow = ({ t, members, groups, tryTransition, attemptDelete, onReassign,
           ))}
         </div>
       )}
+      {notesOpen && <TaskNotesPanel task={t} onShareToBoard={onShareToBoard} />}
     </Card>
   );
 };
 
+/* ----------------------------- TASK NOTES (item 10) -------------------------
+ * A running log per task — optionally with a photo — separate from the
+ * one-line title. Lazy-loaded the moment the panel opens, not fetched for
+ * every task up front (a project can have dozens of tasks, most with no
+ * notes at all). "Share to board" posts the latest note (or the task title,
+ * if there isn't one yet) to that project's board — the "tell the team"
+ * half of this feature. */
+const TaskNotesPanel = ({ task, onShareToBoard }) => {
+  const [notes, setNotes] = useState(null); // null = still loading
+  const [draft, setDraft] = useState("");
+  const [file, setFile] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    db.fetchTaskNotes(task.id).then((ns) => { if (!cancelled) setNotes(ns); }).catch(() => { if (!cancelled) setNotes([]); });
+    return () => { cancelled = true; };
+  }, [task.id]);
+
+  const submit = async () => {
+    if (busy || (!draft.trim() && !file)) return;
+    setBusy(true);
+    try {
+      const photoPath = file ? await db.uploadTaskNotePhoto(task.id, file) : null;
+      const note = await db.insertTaskNote({ taskId: task.id, projectId: task.projectId, body: draft.trim(), photoPath });
+      setNotes((ns) => [...(ns ?? []), note]);
+      setDraft(""); setFile(null);
+    } catch { /* left in the draft so nothing typed is lost; no toast plumbing this deep */ }
+    setBusy(false);
+  };
+
+  return (
+    <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.lineSoft}` }} onClick={(e) => e.stopPropagation()}>
+      {notes === null ? (
+        <div style={{ fontSize: 11.5, color: T.ink3 }}>Loading notes…</div>
+      ) : (
+        <>
+          {notes.length === 0 ? (
+            <div style={{ fontSize: 11.5, color: T.ink3, marginBottom: 8 }}>No notes yet.</div>
+          ) : (
+            <div style={{ display: "grid", gap: 8, marginBottom: 10 }}>
+              {notes.map((n) => (
+                <div key={n.id} style={{ fontSize: 12, color: T.ink2, lineHeight: 1.55 }}>
+                  <span className="pd-num" style={{ color: T.ink3, fontWeight: 600 }}>{relativeTime(n.at)}</span>
+                  {n.body && <span> — {n.body}</span>}
+                  {n.photoPath && (
+                    <button type="button" className="pd-press" onClick={async () => {
+                      try {
+                        const urls = await db.signMediaUrls([n.photoPath], 3600, "task-notes");
+                        const url = urls[n.photoPath];
+                        if (url) window.open(url, "_blank", "noopener");
+                      } catch { /* signing failed — nothing to open */ }
+                    }} style={{ background: "none", border: "none", padding: 0, marginLeft: 7, cursor: "pointer", color: T.limeDeep, fontSize: 11 }}>
+                      <Camera size={10} style={{ verticalAlign: -1 }} /> photo
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input style={{ ...inputStyle, minHeight: 34, flex: 1, minWidth: 140, fontSize: 12 }} value={draft}
+              placeholder="Add a note…" onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()} />
+            <label className="pd-press" title={file ? file.name : "Attach a photo"} style={{
+              display: "grid", placeItems: "center", width: 34, height: 34, borderRadius: 10, cursor: "pointer",
+              border: `1px solid ${T.line}`, background: file ? "#F4FBE3" : T.card, flexShrink: 0,
+            }}>
+              <Paperclip size={13} style={{ color: file ? T.limeDeep : T.ink3 }} />
+              <input type="file" accept="image/*" style={{ display: "none" }}
+                onChange={(e) => setFile(e.target.files[0] ?? null)} />
+            </label>
+            <Btn small disabled={busy || (!draft.trim() && !file)} onClick={submit}>Add</Btn>
+          </div>
+          <div style={{ marginTop: 8 }}>
+            <Btn small ghost onClick={() => onShareToBoard(task, notes[notes.length - 1]?.body)}>
+              <Send size={12} /> Share to board
+            </Btn>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+/* ------------------------- COMPLETED TASKS (item 15) -----------------------
+ * Collapsed by default — done work shouldn't compete with what's still open
+ * for the same visual attention, but the full history stays one click away
+ * rather than disappearing. */
+const CompletedTasksSection = ({ tasks, members, groups, tryTransition, attemptDelete, onReassign, onReschedule, onMark, onComplete, onShareToBoard, reflections }) => {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ marginTop: 18 }}>
+      <button type="button" onClick={() => setOpen((o) => !o)} className="pd-press" style={{
+        display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "11px 14px", borderRadius: 12,
+        background: T.cardSoft, border: `1px solid ${T.lineSoft}`, cursor: "pointer",
+        fontSize: 12.5, fontWeight: 600, color: T.ink2,
+      }}>
+        <ChevronDown size={14} style={{ transition: "transform 150ms", transform: open ? "rotate(0deg)" : "rotate(-90deg)" }} />
+        Completed ({tasks.length})
+      </button>
+      {open && (
+        <div style={{ display: "grid", gap: 10, marginTop: 10, opacity: 0.72 }}>
+          {tasks.map((t) => (
+            <TaskRow key={t.id} t={t} members={members} groups={groups}
+              tryTransition={tryTransition} attemptDelete={attemptDelete}
+              onReassign={onReassign} onReschedule={onReschedule} onMark={onMark} onComplete={onComplete}
+              onShareToBoard={onShareToBoard}
+              hasReflection={reflections.some((r) => r.taskId === t.id)} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 /* ------------------------------ TASK FORM --------------------------------- */
-const TaskForm = ({ projectId, members, groups, onSave, onClose }) => {
+const TaskForm = ({ projectId, members, groups, companies, myMemberId, onCreateGroup, onSave, onClose }) => {
   const [f, setF] = useState({
     title: "", scope: "individual", assigneeId: members[0]?.id ?? "",
     assigneeGroupId: groups[0]?.id ?? "", deadline: "", weight: 1, estimatedMinutes: "",
   });
+  const [newGroupName, setNewGroupName] = useState("");
+  const [addingGroup, setAddingGroup] = useState(false);
   const team = f.scope === "team";
+  const createGroup = () => {
+    if (!newGroupName.trim()) return;
+    const g = onCreateGroup(newGroupName.trim());
+    setF({ ...f, assigneeGroupId: g.id });
+    setNewGroupName("");
+    setAddingGroup(false);
+  };
   return (
     <Modal title="Add task" subtitle="A new grain for the stack" onClose={onClose}>
       <div style={{ display: "grid", gap: 18 }}>
@@ -3424,29 +4066,58 @@ const TaskForm = ({ projectId, members, groups, onSave, onClose }) => {
           </div>
         </div>
 
+        {/* item 12 — a searchable, department-sorted picker instead of a bare
+          * <select> a big roster turns into a scroll hunt, plus a one-click
+          * self-assign. Team tasks keep the lighter group dropdown (a
+          * handful of departments never needed search), with an inline
+          * "+ New group" so assigning to a department that doesn't exist yet
+          * doesn't mean leaving this form first. */}
+        {team ? (
+          <div>
+            <Label>Group</Label>
+            <select style={inputStyle} value={f.assigneeGroupId} onChange={(e) => setF({ ...f, assigneeGroupId: e.target.value })}>
+              <option value="">Whole team</option>
+              {groups.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+            </select>
+            {addingGroup ? (
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <input autoFocus style={{ ...inputStyle, minHeight: 36, flex: 1 }} value={newGroupName}
+                  placeholder="New group name" onChange={(e) => setNewGroupName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && createGroup()} />
+                <Btn small disabled={!newGroupName.trim()} onClick={createGroup}>Create</Btn>
+                <Btn small ghost onClick={() => { setAddingGroup(false); setNewGroupName(""); }}>Cancel</Btn>
+              </div>
+            ) : (
+              <button type="button" onClick={() => setAddingGroup(true)} className="pd-press" style={{
+                marginTop: 7, background: "none", border: "none", cursor: "pointer", padding: 0,
+                fontSize: 11.5, fontWeight: 600, color: T.limeDeep, display: "inline-flex", alignItems: "center", gap: 5,
+              }}><Plus size={11} /> New group</button>
+            )}
+          </div>
+        ) : (
+          <div><Label>Assignee</Label>
+            <MemberPickerList members={members} groups={groups} companies={companies}
+              value={f.assigneeId} onChange={(id) => setF({ ...f, assigneeId: id })} myMemberId={myMemberId} />
+          </div>
+        )}
+
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 12 }}>
-          {team ? (
-            <div><Label>Group</Label>
-              <select style={inputStyle} value={f.assigneeGroupId} onChange={(e) => setF({ ...f, assigneeGroupId: e.target.value })}>
-                <option value="">Whole team</option>
-                {groups.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
-              </select></div>
-          ) : (
-            <div><Label>Assignee</Label>
-              <select style={inputStyle} value={f.assigneeId} onChange={(e) => setF({ ...f, assigneeId: e.target.value })}>
-                <option value="">Unassigned</option>
-                {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
-              </select></div>
-          )}
           <div><Label>Deadline</Label>
             <input type="date" style={inputStyle} value={f.deadline} onChange={(e) => setF({ ...f, deadline: e.target.value })} /></div>
-          <div><Label>Weight</Label>
+          <div><Label>Weight (1–10)</Label>
             <input type="number" min={1} max={10} style={inputStyle} value={f.weight}
               onChange={(e) => setF({ ...f, weight: Math.max(1, Math.min(10, +e.target.value || 1)) })} /></div>
           <div><Label>Est. duration (min, optional)</Label>
             <input type="number" min={1} style={inputStyle} value={f.estimatedMinutes} placeholder="e.g. 18"
               onChange={(e) => setF({ ...f, estimatedMinutes: e.target.value })} /></div>
         </div>
+        {/* item 20 — weight otherwise looks like a mystery number; this is
+          * the one line that explains what it actually drives. */}
+        <p style={{ margin: 0, fontSize: 11.5, color: T.ink3, lineHeight: 1.55 }}>
+          <strong style={{ color: T.ink2 }}>Weight</strong> sets how much this task fills the project's
+          progress bar once completed, relative to its other tasks — 1 is a light task, 10 is a major
+          milestone. It doesn't affect anything else (assignment, ordering, or the calendar).
+        </p>
         {team && (
           <p style={{ margin: 0, fontSize: 11.5, color: T.ink3, lineHeight: 1.55 }}>
             A team task can still be handed to one person to execute — reassigning it does not
@@ -3473,8 +4144,12 @@ const TaskForm = ({ projectId, members, groups, onSave, onClose }) => {
 
 /* ------------------------------ PROJECT FORM ------------------------------ */
 const ProjectForm = ({ data, companies, defaultCompanyId, onSave, onClose }) => {
+  /* item 3/19 — when you're already scoped into one company, a new project
+   * can only ever be its project; editing an existing one still lets you
+   * move it between companies deliberately. */
+  const lockedToCompany = !data && defaultCompanyId !== "all";
   const [f, setF] = useState(data ?? {
-    name: "", companyId: defaultCompanyId !== "all" ? defaultCompanyId : companies[0]?.id,
+    name: "", companyId: defaultCompanyId !== "all" ? defaultCompanyId : (companies[0]?.id ?? ""),
     type: "zero_to_one", baseline: 0, deadline: "", locked: false,
   });
   const locked = data?.locked;
@@ -3485,8 +4160,10 @@ const ProjectForm = ({ data, companies, defaultCompanyId, onSave, onClose }) => 
         <div><Label>Project name</Label>
           <input style={inputStyle} value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14 }}>
-          <div><Label>Company</Label>
-            <select style={inputStyle} value={f.companyId} onChange={(e) => setF({ ...f, companyId: e.target.value })}>
+          <div><Label>Company{lockedToCompany && " · scoped to the company you're viewing"}</Label>
+            <select style={{ ...inputStyle, opacity: lockedToCompany ? 0.6 : 1 }} disabled={lockedToCompany}
+              value={f.companyId} onChange={(e) => setF({ ...f, companyId: e.target.value })}>
+              {companies.length === 0 && <option value="">Add a company first</option>}
               {companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select></div>
           <div><Label>Type</Label>
@@ -3519,7 +4196,9 @@ const ProjectForm = ({ data, companies, defaultCompanyId, onSave, onClose }) => 
         )}
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
           <Btn ghost onClick={onClose}>Cancel</Btn>
-          <Btn disabled={!f.name.trim()} onClick={() => onSave(f)}><Check size={15} /> {data ? "Save" : "Create project"}</Btn>
+          <Btn disabled={!f.name.trim() || !f.companyId} onClick={() => onSave(f)}>
+            <Check size={15} /> {data ? "Save" : "Create project"}
+          </Btn>
         </div>
       </div>
     </Modal>
@@ -3527,28 +4206,32 @@ const ProjectForm = ({ data, companies, defaultCompanyId, onSave, onClose }) => 
 };
 
 /* =============================== COMPANIES ================================= */
-const CompaniesView = ({ companies, projects, members, onAdd, onEdit, onDelete }) => (
+const CompaniesView = ({ companies, projects, members, onAdd, onEdit, onDelete, onEnter, onReorder }) => (
   <div className="pd-fade-in">
     <PageHead kicker="Root entity" title="Companies"
-      sub="Every project and team member is scoped to a company. Add the businesses you run work through."
+      sub="Every project and team member is scoped to a company. Click a card to work inside it — drag to reorder."
       action={<Btn onClick={onAdd}><Plus size={15} /> Add company</Btn>} />
-    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 16 }}>
-      {companies.map((c) => (
-        <CompanyCard key={c.id} company={c}
-          projectCount={projects.filter((p) => p.companyId === c.id).length}
-          memberCount={members.filter((m) => m.companyIds.includes(c.id)).length}
-          onEdit={() => onEdit(c)} onDelete={() => onDelete(c)} />
-      ))}
-      {companies.length === 0 && <Empty text="No companies yet — add the first one." />}
-    </div>
+    {companies.length === 0 ? (
+      <Empty text="No companies yet — add the first one." />
+    ) : (
+      <DragQueueList items={companies} orderKey="sortOrder" onReorder={onReorder}
+        renderItem={(c) => (
+          <CompanyCard company={c}
+            projectCount={projects.filter((p) => p.companyId === c.id).length}
+            memberCount={members.filter((m) => m.companyIds.includes(c.id)).length}
+            onEdit={() => onEdit(c)} onDelete={() => onDelete(c)} onEnter={() => onEnter(c)} />
+        )} />
+    )}
   </div>
 );
 
-const CompanyCard = ({ company: c, projectCount, memberCount, onEdit, onDelete }) => {
+const CompanyCard = ({ company: c, projectCount, memberCount, onEdit, onDelete, onEnter }) => {
   const [confirming, setConfirming] = useState(false);
   return (
-    <Card className="pd-rise" style={{ padding: 22, display: "flex", flexDirection: "column", gap: 15 }}>
+    <Card className="pd-rise" onClick={confirming ? undefined : onEnter}
+      style={{ padding: 22, display: "flex", flexDirection: "column", gap: 15, cursor: confirming ? "default" : "pointer" }}>
       <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+        <GripVertical size={14} style={{ color: T.ink3, flexShrink: 0, marginTop: 17, cursor: "grab" }} />
         <Mesh mesh={c.theme.mesh} style={{ width: 48, height: 48, borderRadius: 14, flexShrink: 0,
           border: "1px solid rgba(22,24,29,0.07)", boxShadow: T.shadowSm }}>
           <div style={{ display: "grid", placeItems: "center", height: "100%" }}>
@@ -3567,7 +4250,7 @@ const CompanyCard = ({ company: c, projectCount, memberCount, onEdit, onDelete }
       </div>
       {confirming ? (
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 12,
-          background: T.dangerBg, border: `1px solid ${T.dangerLine}` }}>
+          background: T.dangerBg, border: `1px solid ${T.dangerLine}` }} onClick={(e) => e.stopPropagation()}>
           <span style={{ flex: 1, fontSize: 11.5, color: T.danger }}>Remove {c.name}? Projects/members keep their history.</span>
           <Btn small ghost onClick={() => setConfirming(false)}>Cancel</Btn>
           <Btn small danger onClick={onDelete}>Confirm</Btn>
@@ -3579,6 +4262,45 @@ const CompanyCard = ({ company: c, projectCount, memberCount, onEdit, onDelete }
         </div>
       )}
     </Card>
+  );
+};
+
+/* ------------------------------ COLOR PICKER -------------------------------
+ * item 5 — the 12-preset grid plus a native color-input swatch that derives
+ * a full theme from whatever hex you pick (deriveThemeFromHex above). Shared
+ * between a company's own theme (here) and the per-workspace personal
+ * accent picker below — one color model, two use sites. */
+const ColorPicker = ({ value, onChange }) => {
+  const isCustom = value?.key === "custom";
+  return (
+    <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+      {THEME_PRESETS.map((t) => {
+        const on = !isCustom && value?.key === t.key;
+        return (
+          <button key={t.key} type="button" onClick={() => onChange(t)} className="pd-press" title={t.label} style={{
+            cursor: "pointer", padding: 3, borderRadius: 14,
+            border: `2px solid ${on ? t.primary : "transparent"}`, background: "none",
+          }}>
+            <Mesh mesh={t.mesh} style={{ width: 40, height: 40, borderRadius: 11, border: "1px solid rgba(22,24,29,0.07)" }} />
+          </button>
+        );
+      })}
+      <label className="pd-press" title="Custom color" style={{
+        cursor: "pointer", padding: 3, borderRadius: 14, display: "inline-flex",
+        border: `2px solid ${isCustom ? value.primary : "transparent"}`,
+      }}>
+        <div style={{
+          position: "relative", width: 40, height: 40, borderRadius: 11, overflow: "hidden",
+          border: "1px solid rgba(22,24,29,0.07)", display: "grid", placeItems: "center",
+          background: isCustom ? value.primary : "conic-gradient(red, yellow, lime, cyan, blue, magenta, red)",
+        }}>
+          {!isCustom && <Palette size={16} style={{ color: "#fff", filter: "drop-shadow(0 1px 2px rgba(0,0,0,.45))" }} />}
+          <input type="color" value={isCustom ? value.primary : "#7CB518"}
+            onChange={(e) => onChange(deriveThemeFromHex(e.target.value))}
+            style={{ position: "absolute", inset: 0, opacity: 0, cursor: "pointer", width: "100%", height: "100%", border: "none", padding: 0 }} />
+        </div>
+      </label>
+    </div>
   );
 };
 
@@ -3600,19 +4322,7 @@ const CompanyForm = ({ data, onSave, onClose }) => {
         </div>
         <div>
           <Label>Theme</Label>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            {THEME_PRESETS.map((t) => {
-              const on = f.theme.key === t.key;
-              return (
-                <button key={t.key} onClick={() => setF({ ...f, theme: t })} className="pd-press" title={t.label} style={{
-                  cursor: "pointer", padding: 3, borderRadius: 14,
-                  border: `2px solid ${on ? t.primary : "transparent"}`, background: "none",
-                }}>
-                  <Mesh mesh={t.mesh} style={{ width: 40, height: 40, borderRadius: 11, border: "1px solid rgba(22,24,29,0.07)" }} />
-                </button>
-              );
-            })}
-          </div>
+          <ColorPicker value={f.theme} onChange={(theme) => setF({ ...f, theme })} />
         </div>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
           <Btn ghost onClick={onClose}>Cancel</Btn>
@@ -3624,12 +4334,15 @@ const CompanyForm = ({ data, onSave, onClose }) => {
 };
 
 /* ================================= TEAM =================================== */
-const TeamView = ({ members, companies, groups, engine, onAddMember, onEditMember, onDeleteMember, onManageGroups }) => {
+const TeamView = ({ members, companies, groups, engine, memberships, myMemberId, onAddMember, onEditMember, onDeleteMember, onManageGroups, onWhisper }) => {
   const sortedGroups = [...groups].sort((a, b) => a.sortOrder - b.sortOrder);
   const buckets = [
     ...sortedGroups.map((g) => ({ id: g.id, label: g.name, members: members.filter((m) => m.groupId === g.id) })),
     { id: null, label: "Ungrouped", members: members.filter((m) => !m.groupId || !groups.some((g) => g.id === m.groupId)) },
   ].filter((b) => b.members.length > 0);
+  /* item 8 — whisper only makes sense for someone who can actually sign in
+   * and read a reply; a roster entry with no linked account never can. */
+  const linkedMemberIds = new Set(memberships.filter((m) => m.userId).map((m) => m.memberId));
   return (
     <div className="pd-fade-in">
       <PageHead kicker="Resource pool" title="Team"
@@ -3645,6 +4358,8 @@ const TeamView = ({ members, companies, groups, engine, onAddMember, onEditMembe
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(330px, 1fr))", gap: 16 }}>
             {b.members.map((m) => (
               <MemberCard key={m.id} m={m} companies={companies} engine={engine}
+                canWhisper={m.id !== myMemberId && linkedMemberIds.has(m.id)}
+                onWhisper={() => onWhisper(m)}
                 onEdit={() => onEditMember(m)} onDelete={() => onDeleteMember(m)} />
             ))}
           </div>
@@ -3654,7 +4369,7 @@ const TeamView = ({ members, companies, groups, engine, onAddMember, onEditMembe
   );
 };
 
-const MemberCard = ({ m, companies, engine, onEdit, onDelete }) => {
+const MemberCard = ({ m, companies, engine, canWhisper, onWhisper, onEdit, onDelete }) => {
   const [confirming, setConfirming] = useState(false);
   const firstCo = companies.find((c) => c.id === m.companyIds[0]);
   const theme = firstCo?.theme ?? THEME_PRESETS[0];
@@ -3687,6 +4402,7 @@ const MemberCard = ({ m, companies, engine, onEdit, onDelete }) => {
           </div>
         </div>
         <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          {canWhisper && <IconBtn label="Message privately" onClick={onWhisper}><MessageCircle size={13} /></IconBtn>}
           <IconBtn label="Edit member" onClick={onEdit}><Pencil size={13} /></IconBtn>
           <IconBtn label="Delete member" danger onClick={() => setConfirming(true)}><Trash2 size={13.5} /></IconBtn>
         </div>
@@ -3805,25 +4521,39 @@ const MemberForm = ({ data, companies, groups, onSave, onClose }) => {
 };
 
 /* ---------------------------- GROUPS MANAGEMENT ----------------------------- */
-const GroupsManageModal = ({ groups, onSave, onDelete, onClose }) => {
+const GroupsManageModal = ({ groups, companies, defaultCompanyId, onSave, onDelete, onClose }) => {
   const [editingId, setEditingId] = useState(null);
   const [editText, setEditText] = useState("");
   const [newName, setNewName] = useState("");
+  const [newCompanyId, setNewCompanyId] = useState(defaultCompanyId && defaultCompanyId !== "all" ? defaultCompanyId : "");
   const [confirmId, setConfirmId] = useState(null);
   const startEdit = (g) => { setEditingId(g.id); setEditText(g.name); };
-  const commitEdit = (g) => { if (editText.trim()) onSave({ id: g.id, name: editText.trim() }); setEditingId(null); };
+  const commitEdit = (g) => { if (editText.trim()) onSave({ id: g.id, name: editText.trim(), companyId: g.companyId }); setEditingId(null); };
+  const companyName = (id) => companies.find((c) => c.id === id)?.name;
   return (
-    <Modal title="Manage team groups" onClose={onClose} subtitle="Group your team into departments, crews, or vendors.">
+    <Modal title="Manage team groups" onClose={onClose}
+      subtitle="Group your team into departments, crews, or vendors — optionally scoped to one company.">
       <div style={{ display: "grid", gap: 10, marginBottom: 18 }}>
         {[...groups].sort((a, b) => a.sortOrder - b.sortOrder).map((g) => (
-          <div key={g.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px",
+          <div key={g.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "9px 12px", flexWrap: "wrap",
             borderRadius: 11, border: `1px solid ${T.line}`, background: T.card }}>
             {editingId === g.id ? (
               <input autoFocus style={{ ...inputStyle, minHeight: 34, flex: 1 }} value={editText}
                 onChange={(e) => setEditText(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && commitEdit(g)} />
             ) : (
-              <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: T.ink }}>{g.name}</span>
+              <div style={{ flex: 1, minWidth: 110 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: T.ink }}>{g.name}</div>
+                <div style={{ fontSize: 10.5, color: T.ink3, marginTop: 1 }}>{companyName(g.companyId) ?? "Workspace-wide"}</div>
+              </div>
+            )}
+            {editingId !== g.id && confirmId !== g.id && (
+              <select value={g.companyId ?? ""} title="Scope this group (and its chat channel) to one company"
+                style={{ ...inputStyle, width: "auto", minHeight: 32, fontSize: 11.5, padding: "0 8px" }}
+                onChange={(e) => onSave({ id: g.id, name: g.name, companyId: e.target.value || null })}>
+                <option value="">Workspace-wide</option>
+                {companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
             )}
             {confirmId === g.id ? (
               <>
@@ -3842,10 +4572,15 @@ const GroupsManageModal = ({ groups, onSave, onDelete, onClose }) => {
         ))}
         {groups.length === 0 && <span style={{ fontSize: 11.5, color: T.ink3 }}>No groups yet.</span>}
       </div>
-      <div style={{ display: "flex", gap: 10 }}>
-        <input style={inputStyle} value={newName} onChange={(e) => setNewName(e.target.value)}
-          placeholder="New group name" onKeyDown={(e) => { if (e.key === "Enter" && newName.trim()) { onSave({ name: newName.trim() }); setNewName(""); } }} />
-        <Btn disabled={!newName.trim()} onClick={() => { onSave({ name: newName.trim() }); setNewName(""); }}>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <input style={{ ...inputStyle, flex: 1, minWidth: 140 }} value={newName} onChange={(e) => setNewName(e.target.value)}
+          placeholder="New group name"
+          onKeyDown={(e) => { if (e.key === "Enter" && newName.trim()) { onSave({ name: newName.trim(), companyId: newCompanyId || null }); setNewName(""); } }} />
+        <select value={newCompanyId} style={{ ...inputStyle, width: "auto" }} onChange={(e) => setNewCompanyId(e.target.value)}>
+          <option value="">Workspace-wide</option>
+          {companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
+        <Btn disabled={!newName.trim()} onClick={() => { onSave({ name: newName.trim(), companyId: newCompanyId || null }); setNewName(""); }}>
           <Plus size={15} /> Add
         </Btn>
       </div>
@@ -3860,7 +4595,7 @@ const GroupsManageModal = ({ groups, onSave, onDelete, onClose }) => {
  * THE BOARD — a workspace feed where posts carry an intent
  * ==========================================================================*/
 const BoardView = ({ board, mediaUrls, available, members, projects, companies, myUserId, myMemberId,
-  readOnly, onCompose, onComment, onVote, onDelete, onAccept, onDecline, onOpenProject }) => {
+  readOnly, onCompose, onComment, onVote, onDelete, onAccept, onDecline, onTogglePin, onOpenProject }) => {
   const [filter, setFilter] = useState("all");
 
   if (!available) {
@@ -3885,7 +4620,12 @@ const BoardView = ({ board, mediaUrls, available, members, projects, companies, 
     );
   }
 
-  const posts = filter === "all" ? board.posts : board.posts.filter((p) => p.kind === filter);
+  const filtered = filter === "all" ? board.posts : board.posts.filter((p) => p.kind === filter);
+  /* item 16 — pinned posts float above everything else, under their own
+   * divider, so "the team needs to see this" doesn't get buried by whatever
+   * was posted most recently. */
+  const pinnedPosts = filtered.filter((p) => p.pinned);
+  const posts = filtered.filter((p) => !p.pinned);
   /* Requests needing a decision from me float to the top — a board is only
    * useful if the thing waiting on you is the thing you see first. */
   const mine = board.requests.filter((r) => r.status === "pending" && r.assigneeMemberId === myMemberId);
@@ -3921,15 +4661,33 @@ const BoardView = ({ board, mediaUrls, available, members, projects, companies, 
         })}
       </div>
 
+      {pinnedPosts.length > 0 && (
+        <div style={{ marginBottom: 18 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 10, fontSize: 11, fontWeight: 600,
+            letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3 }}>
+            <Pin size={11} /> Pinned
+          </div>
+          <div style={{ display: "grid", gap: 14 }}>
+            {pinnedPosts.map((p) => (
+              <PostCard key={p.id} post={p} board={board} mediaUrls={mediaUrls}
+                members={members} projects={projects} myUserId={myUserId} myMemberId={myMemberId}
+                readOnly={readOnly}
+                onComment={onComment} onVote={onVote} onDelete={onDelete}
+                onAccept={onAccept} onDecline={onDecline} onTogglePin={onTogglePin} onOpenProject={onOpenProject} />
+            ))}
+          </div>
+        </div>
+      )}
+
       <div style={{ display: "grid", gap: 14 }}>
         {posts.map((p) => (
           <PostCard key={p.id} post={p} board={board} mediaUrls={mediaUrls}
             members={members} projects={projects} myUserId={myUserId} myMemberId={myMemberId}
             readOnly={readOnly}
             onComment={onComment} onVote={onVote} onDelete={onDelete}
-            onAccept={onAccept} onDecline={onDecline} onOpenProject={onOpenProject} />
+            onAccept={onAccept} onDecline={onDecline} onTogglePin={onTogglePin} onOpenProject={onOpenProject} />
         ))}
-        {posts.length === 0 && (
+        {posts.length === 0 && pinnedPosts.length === 0 && (
           <Empty text={filter === "all"
             ? "Nothing on the board yet — post a photo, ask a question, or hand someone a task."
             : `No ${POST_KIND_META[filter].label.toLowerCase()} posts yet.`} />
@@ -3941,7 +4699,7 @@ const BoardView = ({ board, mediaUrls, available, members, projects, companies, 
 
 /* ------------------------------- POST CARD -------------------------------- */
 const PostCard = ({ post, board, mediaUrls, members, projects, myUserId, myMemberId, readOnly,
-  onComment, onVote, onDelete, onAccept, onDecline, onOpenProject }) => {
+  onComment, onVote, onDelete, onAccept, onDecline, onTogglePin, onOpenProject }) => {
   const [draft, setDraft] = useState("");
   const [showTrail, setShowTrail] = useState(false);
   const meta = POST_KIND_META[post.kind] ?? POST_KIND_META.update;
@@ -3971,6 +4729,11 @@ const PostCard = ({ post, board, mediaUrls, members, projects, myUserId, myMembe
           </div>
         </div>
         <Chip bg={meta.bg} color={meta.color}><Icon size={10} /> {meta.label}</Chip>
+        {!readOnly && (
+          <IconBtn label={post.pinned ? "Unpin" : "Pin for the team"} onClick={() => onTogglePin(post)}>
+            {post.pinned ? <PinOff size={13} style={{ color: T.limeDeep }} /> : <Pin size={13} />}
+          </IconBtn>
+        )}
         {isAuthor && !readOnly && (
           <IconBtn label="Delete post" danger onClick={() => onDelete(post)}><Trash2 size={13} /></IconBtn>
         )}
@@ -4183,10 +4946,11 @@ const TaskRequestPanel = ({ request, board, members, myMemberId, readOnly, showT
  * The kind is picked first and everything below adapts to it, because the
  * fields a poll needs and the fields a task request needs have nothing in
  * common — showing all of them at once and greying most out would be worse. */
-const PostComposer = ({ members, projects, tasks, onSave, onClose }) => {
+const PostComposer = ({ members, projects, tasks, companies, defaultCompanyId, onSave, onClose }) => {
   const [kind, setKind] = useState("update");
   const [caption, setCaption] = useState("");
   const [projectId, setProjectId] = useState("");
+  const [companyId, setCompanyId] = useState(defaultCompanyId && defaultCompanyId !== "all" ? defaultCompanyId : "");
   const [files, setFiles] = useState([]);
   const [busy, setBusy] = useState(false);
   const [pollOptions, setPollOptions] = useState(["", ""]);
@@ -4214,7 +4978,7 @@ const PostComposer = ({ members, projects, tasks, onSave, onClose }) => {
   const submit = async () => {
     setBusy(true);
     await onSave({
-      kind, caption: caption.trim(), projectId, taskId: kind === "accomplished" ? taskId : "",
+      kind, caption: caption.trim(), projectId, companyId, taskId: kind === "accomplished" ? taskId : "",
       pollOptions, requestTitle: req.title.trim(), assigneeMemberId: req.assigneeMemberId,
       requestDeadline: req.deadline, requestWeight: req.weight,
     }, files);
@@ -4304,7 +5068,9 @@ const PostComposer = ({ members, projects, tasks, onSave, onClose }) => {
                   onChange={(e) => setReq({ ...req, weight: Math.max(1, Math.min(10, +e.target.value || 1)) })} /></div>
             </div>
             <p style={{ margin: 0, fontSize: 11.5, color: T.ink3, lineHeight: 1.55 }}>
-              They can accept it — which turns it into a real task — or pass it to someone else with a
+              Weight sets how much this task will fill the project's progress bar once done (1 = light,
+              10 = major milestone) — see the note on Weight when adding a task directly for how that math works.
+              Once sent, they can accept it — which turns it into a real task — or pass it to someone else with a
               reason. Either way it's written to a permanent trail that shows up in reports.
             </p>
           </>
@@ -4320,11 +5086,18 @@ const PostComposer = ({ members, projects, tasks, onSave, onClose }) => {
             </select></div>
         )}
 
-        <div><Label>Project (optional)</Label>
-          <select style={inputStyle} value={projectId} onChange={(e) => setProjectId(e.target.value)}>
-            <option value="">—</option>
-            {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-          </select></div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14 }}>
+          <div><Label>Post to</Label>
+            <select style={inputStyle} value={companyId} onChange={(e) => setCompanyId(e.target.value)}>
+              <option value="">Whole workspace</option>
+              {companies.map((c) => <option key={c.id} value={c.id}>{c.name} only</option>)}
+            </select></div>
+          <div><Label>Project (optional)</Label>
+            <select style={inputStyle} value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+              <option value="">—</option>
+              {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select></div>
+        </div>
 
         <div>
           <Label>Photos & video</Label>
@@ -4546,6 +5319,26 @@ const WorkspaceForm = ({ onSave, onClose }) => {
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
           <Btn ghost onClick={onClose}>Cancel</Btn>
           <Btn disabled={!name.trim()} onClick={() => onSave(name.trim())}><Check size={15} /> Create</Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+/* --------------------------- ACCENT PICKER (item 4) ------------------------
+ * A personal, device-local preference — nobody else's view changes when you
+ * pick one, only yours, and only for whichever workspace you picked it for
+ * (see chooseAccent/applyAccent). Same ColorPicker CompanyForm uses above. */
+const AccentPickerModal = ({ value, onSave, onClose }) => {
+  const [theme, setTheme] = useState(value);
+  return (
+    <Modal title="Workspace color" onClose={onClose}
+      subtitle="Pick a color just for this workspace — helps tell them apart at a glance when you're juggling more than one. Only you see this.">
+      <div style={{ display: "grid", gap: 18 }}>
+        <ColorPicker value={theme} onChange={setTheme} />
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          <Btn ghost onClick={onClose}>Cancel</Btn>
+          <Btn onClick={() => onSave(theme)}><Check size={15} /> Apply</Btn>
         </div>
       </div>
     </Modal>
@@ -5669,20 +6462,66 @@ const LeaderboardView = ({ tasks, members }) => {
  * CHAT — General plus one channel per existing group. Not a separate
  * "channels" concept: group_id null is General, group_id set is that group.
  * ==========================================================================*/
-const ChatView = ({ workspaceId, groups, members, myUserId, myMemberId, readOnly }) => {
-  const [channelId, setChannelId] = useState(null); // null = General
+/* ================================= CHAT ====================================
+ * Two independent scoping axes now (item 6/8, schema_v14):
+ * - "general" / "group:<id>" — the existing open, scope-wide channels
+ *   (General = everyone in scope, a group = that department). Unchanged
+ *   behavior, still backed by chat_messages.group_id.
+ * - "channel:<id>" — a new ad-hoc or DM conversation, visible only to the
+ *   people explicitly added to it (chat_channel_members + RLS), created via
+ *   "+ New chat" or a "Message privately" whisper from Team. Backed by the
+ *   new chat_messages.channel_id.
+ * activeKey is a plain string so the tab list can mix both kinds without a
+ * discriminated-union prop threading exercise. */
+const ChatView = ({ workspaceId, groups, members, memberships, myUserId, myMemberId, readOnly,
+  pendingDmMemberId, onConsumePendingDm }) => {
+  const [activeKey, setActiveKey] = useState("general");
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(true);
+  const [channels, setChannels] = useState([]);
+  const [channelMembers, setChannelMembers] = useState([]);
+  const [channelsLoaded, setChannelsLoaded] = useState(false);
+  const [newChatOpen, setNewChatOpen] = useState(false);
   const listRef = useRef(null);
-  const channels = [{ id: null, name: "General" }, ...groups];
+  /* Guards the whisper effect below against firing twice for the same
+   * request — both React StrictMode's dev-mode double-invoke and the
+   * channels-not-loaded-yet retry (see channelsLoaded) would otherwise each
+   * independently decide "no existing DM found" and create a duplicate
+   * channel. Keyed by member id so a second, different whisper afterward
+   * still runs. */
+  const consumedDmRef = useRef(null);
+
+  const groupChannels = [{ id: null, key: "general", name: "General" }, ...groups.map((g) => ({ id: g.id, key: `group:${g.id}`, name: g.name }))];
+  const adHocChannels = channels.map((c) => {
+    if (c.isDm) {
+      const otherMemberId = channelMembers.find((m) => m.channelId === c.id && m.memberId !== myMemberId)?.memberId;
+      const other = members.find((m) => m.id === otherMemberId);
+      return { key: `channel:${c.id}`, id: c.id, name: other?.name ?? "Direct message", isDm: true };
+    }
+    return { key: `channel:${c.id}`, id: c.id, name: c.name || "Group chat", isDm: false };
+  });
+
+  const loadChannels = () => {
+    db.fetchChatChannels().then(({ channels: cs, members: ms }) => {
+      setChannels(cs);
+      setChannelMembers(ms);
+      setChannelsLoaded(true);
+    }).catch(() => setChannelsLoaded(true));
+  };
 
   const load = () => {
-    db.fetchChatMessages(channelId).then((msgs) => {
-      setMessages(msgs);
-      setLoading(false);
-    }).catch(() => setLoading(false));
+    const p = activeKey.startsWith("channel:")
+      ? db.fetchChannelMessages(activeKey.slice("channel:".length))
+      : db.fetchChatMessages(activeKey === "general" ? null : activeKey.slice("group:".length));
+    p.then((msgs) => { setMessages(msgs); setLoading(false); }).catch(() => setLoading(false));
   };
+
+  useEffect(() => { loadChannels(); }, [workspaceId]);
+  useEffect(() => {
+    const iv = setInterval(loadChannels, 15000);
+    return () => clearInterval(iv);
+  }, []);
 
   useEffect(() => {
     setLoading(true);
@@ -5693,18 +6532,44 @@ const ChatView = ({ workspaceId, groups, members, myUserId, myMemberId, readOnly
     const iv = setInterval(load, 4000);
     return () => clearInterval(iv);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [channelId, workspaceId]);
+  }, [activeKey, workspaceId]);
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
   }, [messages]);
+
+  /* item 8 — "Message privately" from a Team card lands here with a target
+   * member id; reuse an existing DM with them if one's already loaded,
+   * otherwise create one. Waits for channelsLoaded so this doesn't race the
+   * initial fetch and wrongly conclude "no existing DM" while channels is
+   * still its empty initial value. consumedDmRef makes the whole thing
+   * idempotent per member id, so React StrictMode's dev-mode double-invoke
+   * (and the channelsLoaded-triggered re-run) can't each independently
+   * create their own duplicate channel for the same request. */
+  useEffect(() => {
+    if (!pendingDmMemberId || !channelsLoaded) return;
+    if (consumedDmRef.current === pendingDmMemberId) return;
+    consumedDmRef.current = pendingDmMemberId;
+    onConsumePendingDm();
+    const existing = channels.find((c) => c.isDm && channelMembers.some((m) => m.channelId === c.id && m.memberId === pendingDmMemberId));
+    if (existing) { setActiveKey(`channel:${existing.id}`); return; }
+    const target = memberships.find((m) => m.memberId === pendingDmMemberId && m.userId);
+    const mine = memberships.find((m) => m.memberId === myMemberId && m.userId);
+    if (!target || !mine) return; // no account on one side — can't create a channel they could ever read
+    db.createChatChannel({ isDm: true, name: null, companyId: null,
+      participants: [{ memberId: target.memberId, userId: target.userId }, { memberId: mine.memberId, userId: mine.userId }],
+    }).then(({ channel }) => { loadChannels(); setActiveKey(`channel:${channel.id}`); }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingDmMemberId, channelsLoaded]);
 
   const send = async () => {
     const body = draft.trim();
     if (!body) return;
     setDraft("");
     try {
-      const msg = await db.sendChatMessage(channelId, body, myMemberId);
+      const msg = activeKey.startsWith("channel:")
+        ? await db.sendChannelMessage(activeKey.slice("channel:".length), body, myMemberId)
+        : await db.sendChatMessage(activeKey === "general" ? null : activeKey.slice("group:".length), body, myMemberId);
       setMessages((ms) => [...ms, msg]);
     } catch (e) {
       setDraft(body); // give the text back so nothing typed is lost
@@ -5714,17 +6579,37 @@ const ChatView = ({ workspaceId, groups, members, myUserId, myMemberId, readOnly
     setMessages((ms) => ms.filter((m) => m.id !== id));
     db.deleteChatMessage(id).catch(load);
   };
+  const togglePin = async (m) => {
+    const pinned = !m.pinned;
+    setMessages((ms) => ms.map((x) => (x.id === m.id ? { ...x, pinned } : x)));
+    try { await db.togglePinChatMessage(m.id, pinned); }
+    catch { load(); }
+  };
+
+  const createChat = async ({ participants, name, isDm }) => {
+    const mine = memberships.find((m) => m.memberId === myMemberId && m.userId);
+    const all = mine && !participants.some((p) => p.memberId === mine.memberId)
+      ? [...participants, { memberId: mine.memberId, userId: mine.userId }] : participants;
+    const { channel } = await db.createChatChannel({ participants: all, name, isDm, companyId: null });
+    loadChannels();
+    setActiveKey(`channel:${channel.id}`);
+    setNewChatOpen(false);
+  };
+
+  const activeName = [...groupChannels, ...adHocChannels].find((c) => c.key === activeKey)?.name ?? "General";
+  const pinnedHere = messages.filter((m) => m.pinned);
 
   return (
     <div className="pd-fade-in">
       <PageHead kicker="Team & group chat" title="Chat"
-        sub="General is everyone in this workspace; each group below gets its own channel." />
+        sub="General is everyone in this workspace; each group gets its own channel — plus private chats just between the people you pick."
+        action={<Btn ghost disabled={readOnly} onClick={() => setNewChatOpen(true)}><Plus size={14} /> New chat</Btn>} />
 
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 16 }}>
-        {channels.map((c) => {
-          const on = channelId === c.id;
+        {groupChannels.map((c) => {
+          const on = activeKey === c.key;
           return (
-            <button key={c.id ?? "general"} onClick={() => setChannelId(c.id)} className="pd-press" style={{
+            <button key={c.key} onClick={() => setActiveKey(c.key)} className="pd-press" style={{
               display: "inline-flex", alignItems: "center", gap: 6,
               minHeight: 32, padding: "0 13px", borderRadius: 99, cursor: "pointer",
               fontSize: 12, fontWeight: on ? 600 : 450,
@@ -5736,9 +6621,39 @@ const ChatView = ({ workspaceId, groups, members, myUserId, myMemberId, readOnly
             </button>
           );
         })}
+        {adHocChannels.map((c) => {
+          const on = activeKey === c.key;
+          return (
+            <button key={c.key} onClick={() => setActiveKey(c.key)} className="pd-press" style={{
+              display: "inline-flex", alignItems: "center", gap: 6,
+              minHeight: 32, padding: "0 13px", borderRadius: 99, cursor: "pointer",
+              fontSize: 12, fontWeight: on ? 600 : 450,
+              color: on ? "#291D52" : T.ink3,
+              background: on ? "#EEE9FD" : T.card,
+              border: `1px solid ${on ? "#D3C6F8" : T.line}`,
+            }}>
+              {c.isDm ? <UserCheck size={11} /> : <Users size={11} />} {c.name}
+            </button>
+          );
+        })}
       </div>
 
       <Card style={{ padding: 0, display: "flex", flexDirection: "column", height: 520 }}>
+        {pinnedHere.length > 0 && (
+          <div style={{ padding: "10px 16px", borderBottom: `1px solid ${T.lineSoft}`, background: T.cardSoft }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10.5, fontWeight: 600,
+              letterSpacing: "0.08em", textTransform: "uppercase", color: T.ink3, marginBottom: 6 }}>
+              <Pin size={10} /> Pinned
+            </div>
+            <div style={{ display: "grid", gap: 5 }}>
+              {pinnedHere.map((m) => (
+                <div key={m.id} style={{ fontSize: 12, color: T.ink2, lineHeight: 1.5 }}>
+                  {m.body}{m.pinNote ? <span style={{ color: T.ink3 }}> — {m.pinNote}</span> : null}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         <div ref={listRef} className="pd-scroll" style={{ flex: 1, overflowY: "auto", padding: 18, display: "flex", flexDirection: "column", gap: 12 }}>
           {loading ? (
             <div style={{ fontSize: 12, color: T.ink3 }}>Loading…</div>
@@ -5757,6 +6672,12 @@ const ChatView = ({ workspaceId, groups, members, myUserId, myMemberId, readOnly
                   <div style={{ display: "flex", alignItems: "baseline", gap: 7 }}>
                     <span style={{ fontSize: 12.5, fontWeight: 600, color: T.ink }}>{author?.name ?? "Someone"}</span>
                     <span className="pd-num" style={{ fontSize: 10.5, color: T.ink3 }}>{relativeTime(m.at)}</span>
+                    {!readOnly && (
+                      <button onClick={() => togglePin(m)} className="pd-press" title={m.pinned ? "Unpin" : "Pin for the team"} style={{
+                        background: "none", border: "none", cursor: "pointer", padding: 0,
+                        color: m.pinned ? T.limeDeep : T.ink3, display: "inline-flex",
+                      }}><Pin size={11} /></button>
+                    )}
                     {isMe && (
                       <button onClick={() => remove(m.id)} className="pd-msg-del" style={{
                         marginLeft: "auto", background: "none", border: "none",
@@ -5775,14 +6696,97 @@ const ChatView = ({ workspaceId, groups, members, myUserId, myMemberId, readOnly
         {!readOnly && (
           <div style={{ display: "flex", gap: 10, padding: 14, borderTop: `1px solid ${T.lineSoft}` }}>
             <input style={{ ...inputStyle, minHeight: 40 }} value={draft}
-              placeholder={`Message #${channels.find((c) => c.id === channelId)?.name ?? "General"}`}
+              placeholder={`Message ${activeName}`}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} />
             <Btn small disabled={!draft.trim()} onClick={send}><Send size={13} /></Btn>
           </div>
         )}
       </Card>
+
+      {newChatOpen && (
+        <NewChatModal members={members} memberships={memberships} myMemberId={myMemberId}
+          onSave={createChat} onClose={() => setNewChatOpen(false)} />
+      )}
     </div>
+  );
+};
+
+/* ------------------------------ NEW CHAT MODAL -----------------------------
+ * item 6 — an ad-hoc chat with a hand-picked subset of people, or (exactly
+ * one pick) a DM. Deliberately its own local modal rather than routed
+ * through the app's central `modal` state like every other form here — Chat
+ * already owns a meaningful amount of local state (messages, channel list,
+ * polling) independently of the rest of the app, and this keeps the whole
+ * "who can I even chat with" concern (account-linked members only) in one
+ * place rather than threading it up through the top-level component. */
+const NewChatModal = ({ members, memberships, myMemberId, onSave, onClose }) => {
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState([]);
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  /* Only people who can actually sign in and read a private channel are
+   * offerable — someone on the roster with no linked account could be
+   * "added" but would never be able to open it. */
+  const linkedUserIdByMember = new Map(memberships.filter((m) => m.userId).map((m) => [m.memberId, m.userId]));
+  const candidates = members.filter((m) => m.id !== myMemberId && linkedUserIdByMember.has(m.id));
+  const q = query.trim().toLowerCase();
+  const filtered = candidates.filter((m) => !q || m.name.toLowerCase().includes(q));
+
+  const toggle = (m) => setSelected((sel) => (sel.some((x) => x.id === m.id) ? sel.filter((x) => x.id !== m.id) : [...sel, m]));
+  const isDm = selected.length === 1;
+  const ready = selected.length > 0 && (isDm || name.trim());
+
+  const submit = async () => {
+    if (!ready || busy) return;
+    setBusy(true);
+    const participants = selected.map((m) => ({ memberId: m.id, userId: linkedUserIdByMember.get(m.id) }));
+    try { await onSave({ participants, name: isDm ? null : name.trim(), isDm }); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Modal title="New chat" onClose={onClose}
+      subtitle="Pick one person for a private message, or a few for a group chat only they can see.">
+      <div style={{ display: "grid", gap: 16 }}>
+        <div style={{ position: "relative" }}>
+          <Search size={13} style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: T.ink3, pointerEvents: "none" }} />
+          <input style={{ ...inputStyle, paddingLeft: 32 }} value={query} onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search people…" />
+        </div>
+        <div className="pd-scroll" style={{ display: "grid", gap: 7, maxHeight: 240, overflowY: "auto" }}>
+          {filtered.map((m) => {
+            const on = selected.some((x) => x.id === m.id);
+            return (
+              <button key={m.id} type="button" onClick={() => toggle(m)} className="pd-press" style={{
+                display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderRadius: 11,
+                cursor: "pointer", textAlign: "left",
+                background: on ? "#F4FBE3" : T.card, border: `1px solid ${on ? "#C9E88A" : T.line}`,
+              }}>
+                <span style={{ flex: 1, fontSize: 12.5, color: T.ink }}>{m.name}</span>
+                {on && <Check size={14} style={{ color: T.limeDeep }} />}
+              </button>
+            );
+          })}
+          {filtered.length === 0 && (
+            <span style={{ fontSize: 11.5, color: T.ink3 }}>
+              {candidates.length === 0 ? "Nobody else here has an account yet — invite them from People & access first." : "No matches."}
+            </span>
+          )}
+        </div>
+        {selected.length > 1 && (
+          <div><Label>Group name</Label>
+            <input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Site Leads" /></div>
+        )}
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+          <Btn ghost onClick={onClose}>Cancel</Btn>
+          <Btn disabled={!ready || busy} onClick={submit}>
+            <Send size={14} /> {isDm ? "Message privately" : "Create group chat"}
+          </Btn>
+        </div>
+      </div>
+    </Modal>
   );
 };
 
