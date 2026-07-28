@@ -501,6 +501,20 @@ export async function setGoogleAutoSync(id, on) {
     .eq("id", id).then(throwIfError);
 }
 
+/* Found already provisioned server-side (RPC + a 'google_access_requested'
+ * notification kind) with nothing in the client ever calling it — same
+ * "backend half built, never wired up" gap task_notes/deadline_extensions
+ * turned out to be. Google's OAuth consent screen only lets pre-registered
+ * "test users" complete the connect flow; this is the escape hatch for
+ * everyone else — it notifies the workspace's owners/admins (never the
+ * caller themselves) to add the requester in Google Cloud Console. Returns
+ * how many admins got notified, so the UI can say so honestly. */
+export async function requestGoogleCalendarAccess(workspaceId) {
+  const { data, error } = await supabase.rpc("request_google_calendar_access", { p_workspace_id: workspaceId });
+  if (error) throw new Error(error.message);
+  return data; // integer — number of admins/owners notified
+}
+
 /* ------------------------- clock automation tokens (v10) -------------------
  * item 1 — personal webhook tokens for phone-side clock-in/out automation
  * (Apple Shortcuts natively, Android via Tasker/Automate/IFTTT). The raw

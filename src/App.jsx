@@ -2107,6 +2107,20 @@ export default function PuroductiveApp({ session }) {
     try { await db.setGoogleAutoSync(googleConnection.id, on); }
     catch (e) { toast(`Sync failed: ${e.message}`, "error"); loadGoogleConnection(); }
   };
+  /* item 5 (found unwired) — for anyone who can't complete Google's consent
+   * screen because they're not a registered test user yet. Tells the
+   * workspace's own admins/owners to add them, rather than leaving them
+   * stuck on a Google error page with no path forward. */
+  const requestGoogleAccess = async () => {
+    try {
+      const notified = await db.requestGoogleCalendarAccess(workspaceId);
+      toast(notified > 0
+        ? `Asked ${notified} admin${notified > 1 ? "s" : ""} to add you as a Google test user`
+        : "No workspace admins to notify — you may already be one yourself");
+    } catch (e) {
+      toast(`Could not send the request: ${e.message}`, "error");
+    }
+  };
 
   /* -------------------- clock automation tokens (item 1) ------------------ */
   const generateAutomationToken = async (label) => {
@@ -3037,7 +3051,7 @@ export default function PuroductiveApp({ session }) {
             events={events} projects={projects} companies={companies} members={members} groups={groups}
             googleConnection={googleConnection} googleSyncing={googleSyncing}
             onConnectGoogle={connectGoogle} onDisconnectGoogle={disconnectGoogleHandler} onSyncGoogleNow={syncGoogleNow}
-            onToggleGoogleAutoSync={toggleGoogleAutoSync}
+            onToggleGoogleAutoSync={toggleGoogleAutoSync} onRequestGoogleAccess={requestGoogleAccess}
             automationTokens={automationTokens} freshAutomationToken={freshAutomationToken}
             onGenerateAutomationToken={generateAutomationToken} onRevokeAutomationToken={revokeAutomationToken}
             onDismissFreshToken={() => setFreshAutomationToken(null)}
@@ -5391,7 +5405,7 @@ const EVENT_TYPE_META = {
  * Connect is a full-page redirect to Google (no way around that — a consent
  * screen can't render in an iframe or a fetch response), so this card is
  * mostly status + a couple of buttons, not a form. */
-const GoogleCalendarCard = ({ connection, syncing, onConnect, onDisconnect, onSyncNow, onToggleAutoSync }) => (
+const GoogleCalendarCard = ({ connection, syncing, onConnect, onDisconnect, onSyncNow, onToggleAutoSync, onRequestAccess }) => (
   <Card style={{ padding: "16px 20px", marginBottom: 20 }}>
     <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
       <div style={{ width: 38, height: 38, borderRadius: 11, flexShrink: 0, display: "grid", placeItems: "center",
@@ -5419,6 +5433,22 @@ const GoogleCalendarCard = ({ connection, syncing, onConnect, onDisconnect, onSy
         <Btn small onClick={onConnect}><CalendarPlus size={14} /> Connect Google Calendar</Btn>
       )}
     </div>
+    {/* Found already wired up server-side (request_google_calendar_access,
+      * schema_v8/v11) with no client ever calling it — Google's OAuth
+      * consent screen only lets pre-registered "test users" through, so
+      * this is the escape hatch for someone who hits that wall with no
+      * way to fix it themselves. Shown regardless of role rather than
+      * threading myRole down here just for this: an admin clicking it
+      * simply notifies zero people (the RPC excludes the caller), which
+      * is a harmless no-op, not a confusing dead end. */}
+    {!connection && (
+      <button type="button" onClick={onRequestAccess} className="pd-press" style={{
+        display: "block", marginTop: 10, background: "none", border: "none", padding: 0,
+        cursor: "pointer", fontSize: 11.5, color: T.limeDeep, fontWeight: 600, textAlign: "left",
+      }}>
+        Can't connect? Ask an admin for access
+      </button>
+    )}
     {/* item 5 — background auto-sync is additive to the two mechanisms
       * that already exist: the manual "Sync now" above, and the while-the-
       * tab-is-open 3-minute poll. This toggle is the only one that keeps
@@ -5515,7 +5545,7 @@ const ClockAutomationCard = ({ tokens, freshToken, onGenerate, onRevoke, onDismi
 
 const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, tasks, alertsOn, enableAlerts,
   events, projects, companies, members, groups, googleConnection, googleSyncing,
-  onConnectGoogle, onDisconnectGoogle, onSyncGoogleNow, onToggleGoogleAutoSync,
+  onConnectGoogle, onDisconnectGoogle, onSyncGoogleNow, onToggleGoogleAutoSync, onRequestGoogleAccess,
   automationTokens, freshAutomationToken, onGenerateAutomationToken, onRevokeAutomationToken, onDismissFreshToken,
   onAddEvent, onEditEvent, onDeleteEvent, onMarkDay, onOpenDay, onOpenProject }) => {
   const isMobile = useIsMobile();
@@ -5543,7 +5573,7 @@ const CalendarView = ({ exceptions, sessions, activeSession, clockIn, clockOut, 
 
       <GoogleCalendarCard connection={googleConnection} syncing={googleSyncing}
         onConnect={onConnectGoogle} onDisconnect={onDisconnectGoogle} onSyncNow={onSyncGoogleNow}
-        onToggleAutoSync={onToggleGoogleAutoSync} />
+        onToggleAutoSync={onToggleGoogleAutoSync} onRequestAccess={onRequestGoogleAccess} />
 
       <ClockAutomationCard tokens={automationTokens} freshToken={freshAutomationToken}
         onGenerate={onGenerateAutomationToken} onRevoke={onRevokeAutomationToken} onDismissFresh={onDismissFreshToken} />
